@@ -1,0 +1,139 @@
+"""Pluggable subprocess CLI backend supporting Claude Code, Codex, Gemini CLI, and Antigravity."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import uuid
+from pathlib import Path
+
+from watchpost.bubbles import extract_sections, split_into_bubbles
+from watchpost.models import AgentResult, ChannelConfig, TriageMode
+
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+
+CLI_PRESETS: dict[str, dict[str, list[str]]] = {
+    "claude_code": {
+        "start": ["claude", "-p"],
+        "steer": ["claude", "-r", "{ref}", "-p"],
+    },
+    "codex": {
+        "start": ["codex", "exec"],
+        "steer": ["codex", "exec", "resume", "{ref}"],
+    },
+    "gemini_cli": {
+        "start": ["gemini", "-p"],
+        "steer": ["gemini", "-r", "{ref}", "-p"],
+    },
+    "antigravity": {
+        "start": ["agentapi", "new-conversation", "--"],
+        "steer": ["agentapi", "send-message", "--", "{ref}"],
+    },
+}
+
+
+class CLIAgentBackend:
+    """Runs any external agent CLI as an async subprocess using structured presets or custom commands."""
+
+    def __init__(
+        self,
+        preset: str = "claude_code",
+        *,
+        start_cmd: list[str] | None = None,
+        steer_cmd: list[str] | None = None,
+        timeout_s: float = 120.0,
+    ) -> None:
+        if preset not in CLI_PRESETS and (not start_cmd or not steer_cmd):
+            raise ValueError(f"Unknown CLI preset: {preset}")
+        self.name = preset
+        defaults = CLI_PRESETS.get(preset, {"start": [], "steer": []})
+        self._start_cmd = list(start_cmd or defaults["start"])
+        self._steer_cmd = list(steer_cmd or defaults["steer"])
+        self._timeout_s = float(timeout_s)
+
+    async def start_thread(
+        self,
+        title: str,
+        prompt: str,
+        *,
+        cwd: Path,
+        model: str = "",
+        channel: ChannelConfig | None = None,
+    ) -> tuple[str, AgentResult]:
+        del title, model, channel
+        cmd = [*self._start_cmd, prompt]
+        stdout, stderr, rc = await self._run(cmd, cwd=cwd)
+        if rc != 0:
+            msg = (stderr or stdout or f"CLI exited {rc}").strip()[-300:]
+            return "", AgentResult(raw_text=msg, error=msg)
+        ref = self._extract_ref(stdout) or f"{self.name}-{uuid.uuid4().hex[:10]}"
+        return ref, self._parse_output(stdout)
+
+    async def steer_thread(
+        self,
+        backend_thread_ref: str,
+        title: str,
+        message: str,
+        *,
+        cwd: Path,
+        channel: ChannelConfig | None = None,
+    ) -> AgentResult:
+        del title, channel
+        cmd = [part.format(ref=backend_thread_ref) for part in self._steer_cmd]
+        cmd.append(message)
+        stdout, stderr, rc = await self._run(cmd, cwd=cwd)
+        if rc != 0:
+            msg = (stderr or stdout or f"CLI steer exited {rc}").strip()[-300:]
+            return AgentResult(raw_text=msg, error=msg)
+        return self._parse_output(stdout)
+
+    async def _run(self, cmd: list[str], *, cwd: Path) -> tuple[str, str, int]:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=self._timeout_s)
+        return (
+            out_b.decode("utf-8", errors="replace").strip(),
+            err_b.decode("utf-8", errors="replace").strip(),
+            int(proc.returncode or 0),
+        )
+
+    @staticmethod
+    def _extract_ref(stdout: str) -> str:
+        decoder = json.JSONDecoder()
+        for line in stdout.splitlines():
+            idx = line.find("{")
+            if idx < 0:
+                continue
+            try:
+                payload, _end = decoder.raw_decode(line[idx:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                for key in ("session_id", "thread_id", "conversationId"):
+                    val = payload.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        m = _UUID_RE.search(stdout)
+        return m.group(0) if m else ""
+
+    @staticmethod
+    def _parse_output(raw_text: str) -> AgentResult:
+        sec = extract_sections(raw_text)
+        summary = sec.get("summary") or raw_text
+        att = sec.get("attention", "").strip()
+        if att.lower() in {"none", "n/a", "-", "无"}:
+            att = ""
+        mode = TriageMode.mode_4_bug if att else TriageMode.mode_1_qa
+        return AgentResult(
+            raw_text=raw_text,
+            summary_bubbles=split_into_bubbles(summary, max_bubbles=3),
+            suggested_reply=sec.get("suggested_reply", "").strip(),
+            needs_attention=att,
+            triage_mode=mode,
+        )
