@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "watchpost"
-version = "0.1.0"
+version = "0.2.0"
 description = "Headless local background bridge for your coding agent — zero-copy-paste head-starts delivered to your phone"
 readme = "README.md"
 license = "Apache-2.0"

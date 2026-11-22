@@ -7,8 +7,8 @@ Watchpost separates **ingestion**, **context/triage**, **coding-agent execution*
 ```mermaid
 flowchart LR
   subgraph IN["Channel Adapters"]
-    A1["Feishu Official API (Core)"]
-    A2["Slack Socket Mode (Core)"]
+    A1["Feishu Official API (Core Read-Only)"]
+    A2["Slack Socket Mode (Planned)"]
     A3["Offline Simulator (Core)"]
     A4["External Plugins via HTTP/CLI\n(e.g. wechat-mcp GPL-3.0 on :8300)"]
   end
@@ -17,8 +17,8 @@ flowchart LR
     B1["Noise Filters & Burst Debouncer"]
     B2["2-Bucket Group Context Engine"]
     B3["Local Media & Whisper ASR"]
-    B4["4-Mode Intent Triage & Personas"]
-    B5["SQLite WAL Store & JSON Control API (:8787)"]
+    B4["4-Mode Triage & Personas"]
+    B5["SQLite WAL Store & WatchpostDaemon"]
   end
 
   subgraph AGENT["Bring Your Own Coding Agent"]
@@ -29,13 +29,12 @@ flowchart LR
   subgraph PHONE["Familiar Phone Entrance (Draft-Only Default)"]
     D1["Telegram Bot"]
     D2["macOS iMessage"]
-    D3["Feishu Self-DM"]
   end
 
   A1 --> B1
-  A2 --> B1
+  A2 -.-> B1
   A3 --> B1
-  A4 --> B1
+  A4 -.-> B1
   B1 --> B2
   B2 --> B3
   B3 --> B4
@@ -44,26 +43,25 @@ flowchart LR
   B4 <--> C2
   B5 --> D1
   B5 --> D2
-  B5 --> D3
-  D1 -. "\"go\" / follow-up steer" .-> B5
-  D2 -. "\"go\" / follow-up steer" .-> B5
-  D3 -. "\"go\" / follow-up steer" .-> B5
+  D1 -. "\"go\" / /status / steer" .-> B5
+  D2 -. "\"go\" / /status / steer" .-> B5
 ```
 
-## Module Map
+## Module Map (`v0.2.0`)
 
+- `src/watchpost/config.py`: Pydantic v2 configuration schema (`WatchpostConfig`, `FeishuConfig`, `TelegramConfig`, `IMessageConfig`, `BackendConfig`, `WhisperConfig`), `${ENV_VAR}` expansion, env-var fallbacks, and `0600` JSON persistence.
 - `src/watchpost/models.py`: Pydantic v2 domain models (`ChannelConfig`, `NormalizedMessage`, `GroupContext`, `ThreadRecord`, `ThreadEvent`, `AgentResult`, `OwnerAction`).
 - `src/watchpost/ports.py`: `Protocol` interfaces (`ChannelAdapter`, `AgentBackend`, `NotifierAdapter`, `MediaProcessor`).
 - `src/watchpost/store.py`: Atomic **SQLite WAL** persistence across 5 normalized tables (`channels`, `messages`, `threads`, `thread_events`, `outbound_bindings`).
-- `src/watchpost/filters.py`: Trigger & noise suppression (`should_trigger`, `is_small_talk_only`), ignoring owner turns, system/call notices, recalled (`deleted`) events, `@all`, and isolated acks/stickers.
-- `src/watchpost/context.py`: 2-bucket `@me` group context assembly (`assemble_group_context`) and sender/reply-chain session matching (`match_group_thread`).
-- `src/watchpost/debouncer.py`: Keyed async `BurstDebouncer` coalescing screenshot + voice + text bursts up to `max_debounce_s`.
-- `src/watchpost/prompts.py`: Smart 4-Mode Intent Triage + autonomy gate (`assistant_only` / `diagnose_only` / `auto_fix`) + `UNTRUSTED EXTERNAL CHAT INPUT` framing.
-- `src/watchpost/bubbles.py`: Markdown stripper, bilingual heading extractor (`总结`/`Summary`, `建议回复`/`Suggested Reply`, `需要注意`/`Needs Attention`), and CJK/EN short sentence bubble splitter.
+- `src/watchpost/adapters/feishu.py`: Read-only official Feishu Open API adapter (`FeishuAdapter`) supporting tenant/user auth, paginated chat discovery, rich-post/mention/media normalization, recall skipping, and path-safe resource downloads.
+- `src/watchpost/notifiers/telegram.py` & `imessage.py`: Owner-authenticated phone entrances (`TelegramNotifier` via Bot API and `IMessageNotifier` via `argv` `osascript` + read-only `chat.db` polling with echo suppression and `attributedBody` decoding).
+- `src/watchpost/filters.py`, `context.py`, `debouncer.py`: Noise/recall filtering, 2-bucket group context assembly, and async burst debouncing.
+- `src/watchpost/prompts.py` & `bubbles.py`: Smart 4-Mode Intent Triage, autonomy gates, `UNTRUSTED EXTERNAL CHAT INPUT` isolation, Markdown stripping, and CJK/EN short sentence splitting.
 - `src/watchpost/media.py`: Local Whisper CLI processor (`ffmpeg` + `whisper-cli`) and media retention pruning.
-- `src/watchpost/backends/cli_agent.py`: Generic async subprocess wrapper (`CLIAgentBackend`) supporting headless CLI harnesses (`claude_code`, `codex`, `gemini_cli`, `antigravity`, or custom start/steer commands).
-- `src/watchpost/engine.py`: End-to-end orchestrator (`WatchpostEngine`).
-- `src/watchpost/server.py`: Headless FastAPI JSON control API (`127.0.0.1:8787`, no Web UI), managed locally via an installable Agent Skill or CLI/API calls.
+- `src/watchpost/backends/cli_agent.py`: Generic async subprocess wrapper (`CLIAgentBackend`) supporting `claude_code`, `codex`, `gemini_cli`, `antigravity`, or custom headless CLI commands.
+- `src/watchpost/engine.py` & `daemon.py`: Orchestrator (`WatchpostEngine`), owner-action dispatcher (`handle_owner_action`), continuous daemon (`WatchpostDaemon`), and environment checker (`run_doctor`).
+- `src/watchpost/skills/watchpost/SKILL.md` & `skill_installer.py`: Bundled cross-harness Agent Skill for guided setup, channel onboarding, and clean uninstall (`watchpost install-skill`).
+- `src/watchpost/server.py`: Headless FastAPI JSON control API (`127.0.0.1:8787`, zero Web UI).
 
 ## Security & Licensing Boundaries
 

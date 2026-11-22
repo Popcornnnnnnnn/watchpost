@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -19,6 +20,7 @@ from watchpost.models import (
     EngineConfig,
     GroupContext,
     NormalizedMessage,
+    OwnerAction,
     ThreadEvent,
     ThreadRecord,
     ThreadStatus,
@@ -27,6 +29,8 @@ from watchpost.models import (
 from watchpost.ports import AgentBackend, ChannelAdapter, MediaProcessor, NotifierAdapter
 from watchpost.prompts import build_new_thread_prompt, build_owner_steer_prompt, build_steer_prompt
 from watchpost.store import WatchpostStore
+
+logger = logging.getLogger("watchpost.engine")
 
 
 class WatchpostEngine:
@@ -58,6 +62,60 @@ class WatchpostEngine:
 
     def register_adapter(self, adapter: ChannelAdapter) -> None:
         self.adapters[adapter.name] = adapter
+
+    def register_notifier(self, notifier: NotifierAdapter) -> None:
+        self.notifiers = [n for n in self.notifiers if n.name != notifier.name]
+        self.notifiers.append(notifier)
+
+    def _bind_tokens(self, thread_id: str, pairs: list[tuple[str, str]]) -> None:
+        for ntf_name, tok in pairs:
+            if tok:
+                self.store.bind_outbound(ntf_name, tok, thread_id)
+
+    async def _notify_start_all(
+        self,
+        channel: ChannelConfig,
+        thread: ThreadRecord,
+        preview: str,
+        *,
+        is_steer: bool,
+    ) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for ntf in self.notifiers:
+            try:
+                tokens = await ntf.notify_start(channel, thread, preview, is_steer=is_steer)
+                pairs.extend((ntf.name, tok) for tok in tokens if tok)
+            except Exception as exc:
+                logger.warning("Notifier %s notify_start failed: %s", ntf.name, exc)
+        return pairs
+
+    async def _notify_completion_all(
+        self,
+        channel: ChannelConfig,
+        thread: ThreadRecord,
+        bubbles: list[str],
+    ) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for ntf in self.notifiers:
+            try:
+                tokens = await ntf.notify_completion(channel, thread, bubbles)
+                for tok in tokens:
+                    if tok:
+                        self.store.bind_outbound(ntf.name, tok, thread.id)
+                        pairs.append((ntf.name, tok))
+            except Exception as exc:
+                logger.warning("Notifier %s notify_completion failed: %s", ntf.name, exc)
+        return pairs
+
+    async def _send_owner_reply(self, notifier_name: str, text: str) -> None:
+        targets = [n for n in self.notifiers if n.name == notifier_name] or self.notifiers
+        for ntf in targets:
+            try:
+                sender_fn = getattr(ntf, "send_message", None)
+                if callable(sender_fn):
+                    await sender_fn(text)
+            except Exception as exc:
+                logger.warning("Notifier %s send_message failed: %s", ntf.name, exc)
 
     async def poll_channel(self, channel_id: str, *, debounced: bool = False) -> list[ThreadRecord]:
         channel = self.store.get_channel(channel_id)
@@ -235,6 +293,21 @@ class WatchpostEngine:
         )
         topic = (sender.clean_text or "[Media]")[:36].replace("\n", " ")
         title = f"[{channel.adapter}] {display_name}: {topic}"
+        preview_thread = matched_thread or ThreadRecord(
+            id="pending",
+            channel_id=channel.id,
+            backend=self.backend.name,
+            backend_thread_ref="",
+            sender_id=sender.sender_id,
+            sender_name=sender.sender_name,
+            title=topic,
+        )
+        start_tokens = await self._notify_start_all(
+            channel,
+            preview_thread,
+            sender.clean_text or f"[{sender.msg_type}]",
+            is_steer=(matched_thread is not None),
+        )
 
         if matched_thread is not None:
             steer_msg = build_steer_prompt(
@@ -314,6 +387,7 @@ class WatchpostEngine:
             updated_at=time.time(),
         )
         record = self.store.create_or_update_thread(record)
+        self._bind_tokens(record.id, start_tokens)
         self.store.add_thread_event(
             ThreadEvent(
                 thread_id=record.id,
@@ -332,10 +406,7 @@ class WatchpostEngine:
             )
         )
 
-        for ntf in self.notifiers:
-            tokens = await ntf.notify_completion(channel, record, all_bubbles)
-            for tok in tokens:
-                self.store.bind_outbound(ntf.name, tok, record.id)
+        await self._notify_completion_all(channel, record, all_bubbles)
 
         del is_steer
         return record
@@ -399,7 +470,106 @@ class WatchpostEngine:
                 raw_text=result.raw_text,
             )
         )
+        await self._notify_completion_all(channel, updated, all_bubbles)
         return updated
+
+    async def handle_owner_action(self, action: OwnerAction) -> ThreadRecord | None:
+        """Dispatch an owner command received from Telegram, iMessage, or another phone entrance."""
+        is_zh = self.config.language.lower().startswith("zh")
+        if action.kind == "status":
+            metrics = self.store.get_metrics()
+            pending = [t for t in self.store.list_threads(limit=20) if t.pending_go]
+            if is_zh:
+                msg = (
+                    f"Watchpost 运行中：监控 {metrics['channels']} 个通道，"
+                    f"累计 {metrics['threads']} 个会话，{metrics['awaiting_go']} 个待确认执行（go）。"
+                )
+                if pending:
+                    msg += f" 最新待确认：{pending[0].title}"
+            else:
+                msg = (
+                    f"Watchpost running: {metrics['channels']} channels, "
+                    f"{metrics['threads']} threads, {metrics['awaiting_go']} awaiting go."
+                )
+            await self._send_owner_reply(action.notifier, msg)
+            return None
+
+        if action.kind == "list":
+            threads = self.store.list_threads(limit=5)
+            if not threads:
+                await self._send_owner_reply(
+                    action.notifier,
+                    "当前暂无历史会话。" if is_zh else "No threads yet.",
+                )
+                return None
+            lines = ["最近会话：" if is_zh else "Recent threads:"]
+            for idx, th in enumerate(threads, start=1):
+                tag = "待go" if th.pending_go else th.status.value
+                lines.append(f"{idx}. [{tag}] {th.title}")
+            await self._send_owner_reply(action.notifier, "\n".join(lines))
+            return None
+
+        target_id = action.thread_id.strip()
+        if not target_id and action.reply_token:
+            target_id = self.store.resolve_outbound(action.notifier, action.reply_token)
+        if not target_id and action.kind == "approve_go":
+            for th in self.store.list_threads(limit=20):
+                if th.pending_go:
+                    target_id = th.id
+                    break
+        if not target_id:
+            recent = self.store.list_threads(limit=1)
+            target_id = recent[0].id if recent else ""
+
+        if not target_id:
+            await self._send_owner_reply(
+                action.notifier,
+                "当前没有可继续或批准的会话。" if is_zh else "No active thread to steer or approve.",
+            )
+            return None
+
+        approved_go = action.kind == "approve_go"
+        steer_text = action.text or ("go" if approved_go else "")
+        return await self.steer_from_owner(target_id, steer_text, approved_go=approved_go)
+
+    async def poll_all_channels(self, *, seed_if_empty: bool = False, debounced: bool = True) -> int:
+        """Poll every enabled channel whose adapter is registered; return channels polled cleanly."""
+        polled = 0
+        for ch in self.store.list_channels():
+            if not ch.enabled:
+                continue
+            adapter = self.adapters.get(ch.adapter)
+            if adapter is None:
+                continue
+            try:
+                fetched = await adapter.fetch_recent(ch)
+                await self.ingest_messages(
+                    ch.id,
+                    fetched,
+                    seed_if_empty=seed_if_empty,
+                    debounced=debounced,
+                )
+                polled += 1
+            except Exception as exc:
+                logger.warning("Channel poll failed (%s / %s): %s", ch.adapter, ch.id, exc)
+        return polled
+
+    async def poll_owner_actions_once(self) -> int:
+        """Poll all registered phone/desktop notifiers and dispatch any owner actions."""
+        handled = 0
+        for ntf in self.notifiers:
+            try:
+                actions = await ntf.poll_owner_actions()
+            except Exception as exc:
+                logger.warning("Notifier %s poll_owner_actions failed: %s", ntf.name, exc)
+                continue
+            for action in actions:
+                try:
+                    await self.handle_owner_action(action)
+                    handled += 1
+                except Exception as exc:
+                    logger.warning("Failed handling owner action %s: %s", action.kind, exc)
+        return handled
 
     async def run_demo_scenario(self) -> dict[str, Any]:
         """Populate SQLite with the built-in Field-Ops simulator channels & sample scenario."""
