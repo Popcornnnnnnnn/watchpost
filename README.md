@@ -52,14 +52,15 @@ uv run watchpost run
 
 ### Interactive Sandbox, API & Tests
 ```bash
-uv run watchpost sandbox --backend mock          # offline interactive loop (zero token cost)
-uv run watchpost sandbox --backend codex --cwd /path/to/repo
+uv run watchpost sandbox-ui --backend mock       # clean 2-column browser simulator (IME-safe + 5s debounce)
+uv run watchpost sandbox-ui --backend codex --cwd /path/to/repo --autonomy diagnose_only
+uv run watchpost sandbox --backend mock          # terminal REPL alternative
 uv run watchpost demo                            # scripted offline simulation
 uv run watchpost serve --host 127.0.0.1 --port 8787 --db ./data/watchpost.db
 uv run pytest -v
 ```
 
-> In `sandbox`, type messages as a colleague or use `/mode group`, `/as Boss`, `/at`, `/reply`, `/img`, `/recall`, `/autonomy`, and `/phone go|status|<steer>`.
+> Use `sandbox-ui` (<http://127.0.0.1:8799>) to chat on the left as an outside colleague and reply/approve `"go"` on the right as your phone. Or use `sandbox` in terminal with `/mode group`, `/as Boss`, `/at`, `/reply`, `/img`, `/recall`, `/autonomy`, and `/phone go|status|<steer>`.
 
 ## Architecture, License & Roadmap
 

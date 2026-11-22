@@ -30,6 +30,7 @@ from watchpost.engine import WatchpostEngine
 from watchpost.models import AutonomyMode, ChannelConfig, ChatType, EngineConfig, TriggerMode
 from watchpost.notifiers.telegram import detect_owner_chat_id
 from watchpost.sandbox import run_interactive_sandbox
+from watchpost.sandbox_ui import create_sandbox_ui_app
 from watchpost.server import create_app
 from watchpost.skill_installer import SKILL_TARGETS, install_skill, uninstall_skill
 from watchpost.store import WatchpostStore
@@ -264,6 +265,25 @@ def main(argv: list[str] | None = None) -> int:
     p_sbs.add_argument("--reply-to", default="")
     p_sbs.add_argument("--img", default="")
 
+    p_sbui = sub.add_parser("sandbox-ui", help="Start 2-column local Web Simulator UI (IME-safe + live debounce)")
+    p_sbui.add_argument(
+        "--backend",
+        default="mock",
+        choices=["mock", "codex", "claude_code", "gemini_cli", "antigravity"],
+        help="Agent backend ('mock' for offline demo, or real CLI like 'codex')",
+    )
+    p_sbui.add_argument("--cwd", default=".", help="Workspace directory the agent inspects")
+    p_sbui.add_argument("--dir", default="", help="Optional persistent sandbox directory (defaults to temporary)")
+    p_sbui.add_argument("--host", default="127.0.0.1")
+    p_sbui.add_argument("--port", type=int, default=8799)
+    p_sbui.add_argument(
+        "--autonomy",
+        default="diagnose_only",
+        choices=["assistant_only", "diagnose_only", "auto_fix"],
+    )
+    p_sbui.add_argument("--debounce", type=float, default=5.0, help="Burst debounce window in seconds")
+    p_sbui.add_argument("--lang", default="zh", help="Output language ('zh' or 'en')")
+
     p_demo = sub.add_parser("demo", help="Run offline head-start simulation scenario")
     p_demo.add_argument("--db", default="", help="Optional persistent DB path (defaults to temporary)")
     p_demo.add_argument("--lang", default="zh", help="Output language ('zh' or 'en')")
@@ -359,6 +379,30 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Appended {msg.message_id} into {chat_id} ({adapter.inbox_path})")
         return 0
+
+    if args.command == "sandbox-ui":
+        if args.dir:
+            app = create_sandbox_ui_app(
+                Path(args.dir).expanduser(),
+                backend_name=args.backend,
+                workspace_dir=args.cwd,
+                autonomy=AutonomyMode(args.autonomy),
+                debounce_s=args.debounce,
+                language=args.lang,
+            )
+            uvicorn.run(app, host=args.host, port=args.port)
+            return 0
+        with tempfile.TemporaryDirectory(prefix="watchpost-sandbox-ui-") as tmp:
+            app = create_sandbox_ui_app(
+                Path(tmp),
+                backend_name=args.backend,
+                workspace_dir=args.cwd,
+                autonomy=AutonomyMode(args.autonomy),
+                debounce_s=args.debounce,
+                language=args.lang,
+            )
+            uvicorn.run(app, host=args.host, port=args.port)
+            return 0
 
     if args.command == "demo":
         target = Path(args.db) if args.db else None

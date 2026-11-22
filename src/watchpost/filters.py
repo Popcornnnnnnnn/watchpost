@@ -120,12 +120,12 @@ def is_small_talk_only(
         text = _strip_mention_tokens(raw, msg)
         if msg.mentions_owner and not _PUNCT_STRIP_RE.sub("", text):
             return False
-        if "?" in text or "？" in text:
-            return False
         no_emoji = _BRACKET_EMOJI_RE.sub(" ", text).strip()
         normalized = _PUNCT_STRIP_RE.sub("", no_emoji).lower()
-        if not normalized and text:
+        if not normalized:
             continue
+        if "?" in text or "？" in text:
+            return False
         if normalized not in _ACK_PHRASES:
             return False
     return True

@@ -41,6 +41,7 @@ def test_trigger_and_small_talk_filters() -> None:
         [],
         False,
     )
+    assert is_small_talk_only([NormalizedMessage(message_id="a5", clean_text="？")], [], False)
 
     # Keep questions, bare @Lead pings, media, active sessions, or answers to recent owner question
     assert not is_small_talk_only([NormalizedMessage(message_id="q1", clean_text="Node 1 updated?")], [], False)

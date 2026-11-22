@@ -1,19 +1,23 @@
-"""Tests for Codex JSONL backend parsing, LocalSandboxAdapter, ConsoleNotifier, and SandboxSession."""
+"""Tests for Codex JSONL backend parsing, LocalSandboxAdapter, ConsoleNotifier, SandboxSession, and Sandbox UI."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import tempfile
 from pathlib import Path
 from unittest import mock
 
+from fastapi.testclient import TestClient
+
 from watchpost.adapters.local_sandbox import LocalSandboxAdapter
 from watchpost.backends.cli_agent import CLIAgentBackend
 from watchpost.models import AutonomyMode, ChannelConfig, ThreadRecord, ThreadStatus, TriageMode
 from watchpost.notifiers.console import ConsoleNotifier
 from watchpost.sandbox import SandboxSession
+from watchpost.sandbox_ui import create_sandbox_ui_app
 
 
 def test_codex_jsonl_parsing_and_readonly_sandbox_flag() -> None:
@@ -177,3 +181,65 @@ def test_interactive_sandbox_session_end_to_end() -> None:
             assert await session.handle_line("/quit") is False
 
         asyncio.run(_drive())
+
+
+def test_sandbox_ui_routes_ime_guidance_filter_and_phone_loop() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        app = create_sandbox_ui_app(
+            root / "ui",
+            backend_name="mock",
+            workspace_dir=root,
+            debounce_s=0.0,
+        )
+        client = TestClient(app)
+
+        # Verify security headers, modern guidance patterns, and zero innerHTML sinks
+        html_res = client.get("/")
+        assert html_res.status_code == 200
+        assert html_res.headers["X-Content-Type-Options"] == "nosniff"
+        assert html_res.headers["X-Frame-Options"] == "DENY"
+        assert "script-src 'nonce-" in html_res.headers["Content-Security-Policy"]
+        assert '<meta name="color-scheme" content="light dark">' in html_res.text
+        assert "event.isComposing || event.keyCode === 229" in html_res.text
+        assert 'command' in html_res.text and "'--copy'" in html_res.text
+        assert "field-sizing: content" in html_res.text
+        assert "innerHTML" not in html_res.text
+
+        # 1. Bare question mark filtered cleanly as small talk
+        bare = client.post("/api/colleague/send", json={"mode": "dm", "text": "？", "immediate": True})
+        assert bare.status_code == 200
+        st0 = client.get("/api/state").json()
+        assert len(st0["threads"]) == 0
+        assert st0["messages"][0]["status_label"] == "ignored (small talk)"
+
+        # 2. Switch to group, send screenshot + real question mentioning owner
+        assert client.post("/api/settings", json={"mode": "group"}).status_code == 200
+        tiny_png = base64.b64encode(b"\x89PNG\r\n\x1a\nFAKEPNG").decode("ascii")
+        real = client.post(
+            "/api/colleague/send",
+            json={
+                "mode": "group",
+                "sender_name": "Sam",
+                "text": "昨晚 Bay 2 报错超时麻烦看一下",
+                "mentions_owner": True,
+                "immediate": True,
+                "image_data_url": f"data:image/png;base64,{tiny_png}",
+                "image_name": "bay2.png",
+            },
+        )
+        assert real.status_code == 200
+        st1 = client.get("/api/state").json()
+        assert len(st1["threads"]) == 1
+        assert st1["has_pending_go"] is True
+        assert any(b["kind"] == "draft" for b in st1["phone_bubbles"])
+        img_url = next(m["image_url"] for m in st1["messages"] if m["image_url"])
+        assert client.get(img_url).status_code == 200
+
+        # 3. Phone status + "go" approval updates thread to completed
+        assert client.post("/api/phone/send", json={"text": "/status", "wait": True}).status_code == 200
+        assert client.post("/api/phone/send", json={"text": "go", "wait": True}).status_code == 200
+        st2 = client.get("/api/state").json()
+        assert st2["has_pending_go"] is False
+        assert st2["threads"][0]["status"] == "completed"
+        assert any(b["kind"] == "status" and "Watchpost 运行中" in b["text"] for b in st2["phone_bubbles"])
