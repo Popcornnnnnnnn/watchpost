@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from watchpost.models import OwnerAction
 
 _APPROVE_TOKENS = {"go", "approve", "执行", "改吧", "批准", "同意", "可以改", "继续执行"}
@@ -100,16 +102,103 @@ def classify_owner_command(
     )
 
 
-def format_start_notice(channel_name: str, preview: str, *, is_steer: bool = False, language: str = "zh") -> str:
-    """Format a brief non-intrusive phone status notice when Watchpost starts/steers a task."""
-    snippet = (preview or "").strip().replace("\n", " ")[:120]
+_PLATFORM_ZH = {
+    "feishu": "飞书",
+    "wechat": "微信",
+    "simulator": "模拟",
+    "local_sandbox": "沙盒",
+    "owner_direct": "",
+}
+_PLATFORM_EN = {
+    "feishu": "Feishu",
+    "wechat": "WeChat",
+    "simulator": "Sim",
+    "local_sandbox": "Sandbox",
+    "owner_direct": "",
+}
+_PURE_MEDIA_LINE_RE = re.compile(
+    r"^(?:\[(?:Image|Voice|Audio|File|Media|Video|Sticker|图片|语音|文件)(?:\s*:[^\]]*)?\])$",
+    re.IGNORECASE,
+)
+
+
+def format_platform_label(adapter: str, *, language: str = "zh") -> str:
+    """Return a concise human-readable platform badge for phone notifications."""
+    key = (adapter or "").strip().lower()
     if language.lower().startswith("zh"):
+        return _PLATFORM_ZH.get(key, adapter or "")
+    return _PLATFORM_EN.get(key, adapter.title() if adapter else "")
+
+
+def _clean_quote_preview(preview: str) -> str:
+    lines = []
+    for raw_line in (preview or "").splitlines():
+        line = raw_line.strip()
+        if not line or _PURE_MEDIA_LINE_RE.fullmatch(line):
+            continue
+        lines.append(line)
+    return " ".join(lines).strip()
+
+
+def format_start_bubbles(
+    channel_name: str,
+    preview: str,
+    *,
+    adapter: str = "",
+    is_steer: bool = False,
+    has_images: bool = False,
+    language: str = "zh",
+) -> list[str]:
+    """Return 1–2 concise bubbles: status header plus quoted original message (never `Name: msg`)."""
+    is_zh = language.lower().startswith("zh")
+    plat = format_platform_label(adapter, language=language)
+    tag = f"{plat} · {channel_name}" if plat else channel_name
+    quote = _clean_quote_preview(preview)
+
+    if is_zh:
         if is_steer:
-            return f"{channel_name} 有新补充消息，继续处理：{snippet}" if snippet else f"{channel_name} 有新补充消息。"
-        return f"收到来自 {channel_name} 的新消息：{snippet}，正在查看。"
-    if is_steer:
-        return f"Follow-up in {channel_name}: {snippet}" if snippet else f"Follow-up in {channel_name}."
-    return f"New message in {channel_name}: {snippet} — checking."
+            header = f"【{tag}】发来补充消息，继续处理"
+        elif has_images and not quote:
+            header = f"【{tag}】发来图片，正在查看"
+        elif quote:
+            header = f"【{tag}】发来新消息，正在查看"
+        else:
+            header = f"【{tag}】发来新消息，正在查看"
+    else:
+        if is_steer:
+            header = f"[{tag}] Follow-up — checking"
+        elif has_images and not quote:
+            header = f"[{tag}] Photo received — checking"
+        else:
+            header = f"[{tag}] New message — checking"
+
+    bubbles = [header]
+    if quote:
+        clipped = quote[:357].rstrip() + "..." if len(quote) > 360 else quote
+        bubbles.append(f'"{clipped}"')
+    return bubbles
+
+
+def format_start_notice(
+    channel_name: str,
+    preview: str,
+    *,
+    adapter: str = "",
+    is_steer: bool = False,
+    has_images: bool = False,
+    language: str = "zh",
+) -> str:
+    """Single-string start notice helper for plain consoles and compact previews."""
+    return "\n".join(
+        format_start_bubbles(
+            channel_name,
+            preview,
+            adapter=adapter,
+            is_steer=is_steer,
+            has_images=has_images,
+            language=language,
+        )
+    )
 
 
 from watchpost.notifiers.console import ConsoleNotifier
@@ -121,5 +210,7 @@ __all__ = [
     "IMessageNotifier",
     "TelegramNotifier",
     "classify_owner_command",
+    "format_platform_label",
+    "format_start_bubbles",
     "format_start_notice",
 ]

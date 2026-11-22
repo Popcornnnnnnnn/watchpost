@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 
 from watchpost.config import TelegramConfig
-from watchpost.models import ChannelConfig, OwnerAction, ThreadRecord
+from watchpost.models import ChatType, ChannelConfig, OwnerAction, ThreadRecord
 from watchpost.notifiers import classify_owner_command, format_start_notice
 
 
@@ -105,9 +105,21 @@ class TelegramNotifier:
         preview: str,
         *,
         is_steer: bool = False,
+        attachments: list[str] | None = None,
     ) -> list[str]:
-        del thread
-        tok = await self.send_message(format_start_notice(channel.name, preview, is_steer=is_steer))
+        label = (
+            f"{channel.name} · {thread.sender_name}"
+            if (channel.chat_type == ChatType.group and thread.sender_name and thread.sender_name != "Owner")
+            else channel.name
+        )
+        msg = format_start_notice(
+            label,
+            preview,
+            adapter=channel.adapter,
+            is_steer=is_steer,
+            has_images=bool(attachments),
+        )
+        tok = await self.send_message(msg)
         return [tok] if tok else []
 
     async def notify_completion(

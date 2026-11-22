@@ -87,6 +87,7 @@ class NotifierAdapter(Protocol):
         preview: str,
         *,
         is_steer: bool = False,
+        attachments: list[str] | None = None,
     ) -> list[str]:
         ...
 

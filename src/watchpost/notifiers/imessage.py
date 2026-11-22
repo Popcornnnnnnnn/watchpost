@@ -6,16 +6,20 @@ import asyncio
 import inspect
 import logging
 import re
+import shutil
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from watchpost.config import IMessageConfig
-from watchpost.models import ChannelConfig, OwnerAction, ThreadRecord
-from watchpost.notifiers import classify_owner_command, format_start_notice
+from watchpost.models import ChannelConfig, ChatType, OwnerAction, ThreadRecord
+from watchpost.notifiers import classify_owner_command, format_start_bubbles
 
 logger = logging.getLogger("watchpost.notifiers.imessage")
+
+_OUTBOX_PREFIX = "wp_out_"
 
 _APPLESCRIPT_SEND = """on run argv
     set targetHandle to item 1 of argv
@@ -24,6 +28,18 @@ _APPLESCRIPT_SEND = """on run argv
         set targetService to 1st account whose service type = iMessage
         set targetBuddy to participant targetHandle of targetService
         send targetText to targetBuddy
+    end tell
+end run
+"""
+
+_APPLESCRIPT_SEND_FILE = """on run argv
+    set targetHandle to item 1 of argv
+    set targetPath to item 2 of argv
+    tell application "Messages"
+        set targetService to 1st account whose service type = iMessage
+        set targetBuddy to participant targetHandle of targetService
+        set targetFile to POSIX file targetPath
+        send targetFile to targetBuddy
     end tell
 end run
 """
@@ -92,6 +108,26 @@ async def _default_send_applescript(handle: str, text: str) -> bool:
     return True
 
 
+async def _default_send_file_applescript(handle: str, file_path: str) -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        "osascript",
+        "-e",
+        _APPLESCRIPT_SEND_FILE,
+        "--",
+        handle,
+        file_path,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _out, err = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+    if proc.returncode != 0:
+        err_msg = err.decode("utf-8", errors="replace").strip()
+        logger.error("iMessage file osascript failed (rc=%s): %s", proc.returncode, err_msg)
+        raise RuntimeError(f"osascript file send failed (rc={proc.returncode}): {err_msg}")
+    return True
+
+
 class IMessageNotifier:
     """macOS iMessage entrance using safe argv AppleScript and read-only chat.db polling."""
 
@@ -132,14 +168,17 @@ class IMessageNotifier:
         config: IMessageConfig,
         *,
         send_fn: Callable[[str, str], Awaitable[bool] | bool] | None = None,
+        send_file_fn: Callable[[str, str], Awaitable[bool] | bool] | None = None,
     ) -> None:
         self._config = config
         self._handle = config.owner_handle.strip()
         self._allowed_handles = self._build_allowed_handles(config)
         self._db_path = Path(config.chat_db_path).expanduser()
         self._send_fn = send_fn or _default_send_applescript
+        self._send_file_fn = send_file_fn or _default_send_file_applescript
         self._last_rowid: int | None = None
         self._recent_sent: list[tuple[str, float]] = []
+        self._recent_sent_files: list[tuple[str, float]] = []
         self._dry_seq: int = 0
         self._db_error_logged: bool = False
 
@@ -164,6 +203,53 @@ class IMessageNotifier:
             kept.append((t, exp))
         self._recent_sent = kept
         return matched
+
+    def _record_sent_file(self, filename: str) -> None:
+        now = time.monotonic()
+        self._recent_sent_files = [(f, exp) for (f, exp) in self._recent_sent_files if exp > now]
+        if filename:
+            self._recent_sent_files.append((filename, now + 120.0))
+
+    def _consume_sent_file_echo(self, attachments: list[dict[str, str]]) -> bool:
+        now = time.monotonic()
+        names = {
+            Path(str(att.get("path") or "")).name
+            for att in attachments
+            if att.get("path")
+        } | {str(att.get("name") or "") for att in attachments if att.get("name")}
+        names.discard("")
+        if any(n.startswith(_OUTBOX_PREFIX) for n in names):
+            return True
+        kept: list[tuple[str, float]] = []
+        matched = False
+        for fn, exp in self._recent_sent_files:
+            if exp <= now:
+                continue
+            if not matched and fn in names:
+                matched = True
+                continue
+            kept.append((fn, exp))
+        self._recent_sent_files = kept
+        return matched
+
+    @staticmethod
+    def _stage_file_for_messages(src: Path) -> Path:
+        outbox = Path.home() / "Library" / "Caches" / "com.apple.MobileSMS" / "watchpost_outbox"
+        try:
+            outbox.mkdir(parents=True, exist_ok=True)
+            cutoff = time.time() - 3600.0
+            for old in outbox.glob(f"{_OUTBOX_PREFIX}*"):
+                try:
+                    if old.is_file() and old.stat().st_mtime < cutoff:
+                        old.unlink()
+                except OSError:
+                    pass
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", src.name).strip("._") or "image.png"
+            dst = outbox / f"{_OUTBOX_PREFIX}{uuid.uuid4().hex[:8]}_{safe_name}"
+            shutil.copy2(src, dst)
+            return dst
+        except OSError:
+            return src
 
     def _open_chat_db_ro(self) -> sqlite3.Connection | None:
         if not self._db_path.is_file():
@@ -210,10 +296,11 @@ class IMessageNotifier:
                 (after_rowid, self._handle, self._handle),
             ).fetchall()
             target = (text or "").strip()
-            for r in rows:
-                body = (r["text"] or "").strip() or extract_attributed_body_text(r["attributedBody"])
-                if body == target and r["guid"]:
-                    return str(r["guid"])
+            if target:
+                for r in rows:
+                    body = (r["text"] or "").strip() or extract_attributed_body_text(r["attributedBody"])
+                    if body == target and r["guid"]:
+                        return str(r["guid"])
             if rows and rows[0]["guid"]:
                 return str(rows[0]["guid"])
             return ""
@@ -248,6 +335,21 @@ class IMessageNotifier:
             await res
         return self._lookup_recent_outbound_guid(clean, after_rowid=before_max)
 
+    async def send_file(self, file_path: str | Path) -> str:
+        src = Path(file_path).expanduser()
+        if not self._handle or not src.is_file():
+            return ""
+        before_max = self._current_max_rowid()
+        staged = self._stage_file_for_messages(src)
+        self._record_sent_file(staged.name)
+        if self._config.dry_run:
+            self._dry_seq += 1
+            return f"imsg-file-dry-{self._dry_seq}"
+        res = self._send_file_fn(self._handle, str(staged))
+        if inspect.isawaitable(res):
+            await res
+        return self._lookup_recent_outbound_guid("", after_rowid=before_max)
+
     async def notify_start(
         self,
         channel: ChannelConfig,
@@ -255,10 +357,34 @@ class IMessageNotifier:
         preview: str,
         *,
         is_steer: bool = False,
+        attachments: list[str] | None = None,
     ) -> list[str]:
-        del thread
-        tok = await self.send_message(format_start_notice(channel.name, preview, is_steer=is_steer))
-        return [tok] if tok else []
+        label = (
+            f"{channel.name} · {thread.sender_name}"
+            if (channel.chat_type == ChatType.group and thread.sender_name and thread.sender_name != "Owner")
+            else channel.name
+        )
+        img_list = [p for p in (attachments or []) if p and Path(p).expanduser().is_file()][:4]
+        bubbles = format_start_bubbles(
+            label,
+            preview,
+            adapter=channel.adapter,
+            is_steer=is_steer,
+            has_images=bool(img_list),
+        )
+        tokens: list[str] = []
+        for bubble in bubbles:
+            tok = await self.send_message(bubble)
+            if tok:
+                tokens.append(tok)
+        for img in img_list:
+            try:
+                tok = await self.send_file(img)
+                if tok:
+                    tokens.append(tok)
+            except Exception as exc:
+                logger.warning("iMessage send_file failed (%s): %s", img, exc)
+        return tokens
 
     async def notify_completion(
         self,
@@ -423,8 +549,11 @@ class IMessageNotifier:
                 )
                 if not body and not attachments:
                     continue
-                if body and not attachments and bool(r["is_from_me"]) and self._consume_echo(body):
-                    continue
+                if bool(r["is_from_me"]):
+                    if body and not attachments and self._consume_echo(body):
+                        continue
+                    if attachments and not body and self._consume_sent_file_echo(attachments):
+                        continue
                 reply_token = (
                     str(r["thread_originator_guid"] or "").strip()
                     or str(r["reply_to_guid"] or "").strip()

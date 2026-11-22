@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -27,6 +29,7 @@ from watchpost.models import (
     TriageMode,
     TriggerMode,
 )
+from watchpost.notifiers import format_platform_label
 from watchpost.ports import AgentBackend, ChannelAdapter, MediaProcessor, NotifierAdapter
 from watchpost.prompts import build_new_thread_prompt, build_owner_steer_prompt, build_steer_prompt
 from watchpost.store import WatchpostStore
@@ -80,15 +83,67 @@ class WatchpostEngine:
         preview: str,
         *,
         is_steer: bool,
+        attachments: list[str] | None = None,
     ) -> list[tuple[str, str]]:
         pairs: list[tuple[str, str]] = []
         for ntf in self.notifiers:
             try:
-                tokens = await ntf.notify_start(channel, thread, preview, is_steer=is_steer)
+                sig = inspect.signature(ntf.notify_start)
+                if "attachments" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    tokens = await ntf.notify_start(
+                        channel,
+                        thread,
+                        preview,
+                        is_steer=is_steer,
+                        attachments=attachments,
+                    )
+                else:
+                    tokens = await ntf.notify_start(channel, thread, preview, is_steer=is_steer)
                 pairs.extend((ntf.name, tok) for tok in tokens if tok)
             except Exception as exc:
                 logger.warning("Notifier %s notify_start failed: %s", ntf.name, exc)
         return pairs
+
+    _MEDIA_ONLY_TEXT_RE = re.compile(
+        r"^(?:\[(?:Image|Voice|Audio|File|Media|Video|Sticker|图片|语音|文件|Recalled)(?:\s*:[^\]]*)?\])$",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _summarize_batch_for_notice(cls, batch: list[NormalizedMessage]) -> tuple[str, list[str], str]:
+        text_parts: list[str] = []
+        image_paths: list[str] = []
+        seen_imgs: set[str] = set()
+        for m in batch:
+            txt = (m.clean_text or "").strip()
+            if txt and not cls._MEDIA_ONLY_TEXT_RE.fullmatch(txt):
+                text_parts.append(txt)
+            for art in m.artifacts:
+                if art.kind == "audio" and art.transcript.strip():
+                    text_parts.append(f"[语音] {art.transcript.strip()}")
+                elif art.kind in {"image", "video_cover"} and art.path:
+                    p = str(art.path).strip()
+                    if p and p not in seen_imgs:
+                        seen_imgs.add(p)
+                        image_paths.append(p)
+        original_text = "\n".join(text_parts).strip()
+        first_line = original_text.splitlines()[0].strip() if original_text else ""
+        topic = (first_line[:36] if first_line else ("[图片]" if image_paths else "[Media]")).replace("\n", " ")
+        return original_text, image_paths, topic
+
+    def _completion_channel_label(self, channel: ChannelConfig, *, sender_name: str = "") -> str:
+        is_zh = self.config.language.lower().startswith("zh")
+        if channel.adapter == "owner_direct":
+            return "个人直聊" if is_zh else "Personal"
+        base = (
+            f"{channel.name} · {sender_name}"
+            if (channel.chat_type == ChatType.group and sender_name and sender_name != "Owner")
+            else channel.name
+        )
+        plat = format_platform_label(channel.adapter, language=self.config.language)
+        return f"{plat} · {base}" if plat else base
 
     async def _notify_completion_all(
         self,
@@ -292,7 +347,7 @@ class WatchpostEngine:
             if channel.chat_type == ChatType.group
             else channel.name
         )
-        topic = (sender.clean_text or "[Media]")[:36].replace("\n", " ")
+        original_preview, image_paths, topic = self._summarize_batch_for_notice(batch)
         title = f"[{channel.adapter}] {display_name}: {topic}"
         preview_thread = matched_thread or ThreadRecord(
             id="pending",
@@ -306,8 +361,9 @@ class WatchpostEngine:
         start_tokens = await self._notify_start_all(
             channel,
             preview_thread,
-            sender.clean_text or f"[{sender.msg_type}]",
+            original_preview,
             is_steer=(matched_thread is not None),
+            attachments=image_paths,
         )
 
         target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
@@ -352,8 +408,12 @@ class WatchpostEngine:
             created_at = now_ts
             is_steer = False
 
+        completion_label = self._completion_channel_label(
+            channel,
+            sender_name=matched_thread.sender_name if matched_thread else sender.sender_name,
+        )
         all_bubbles, draft_reply = format_completion_bubbles(
-            display_name,
+            completion_label,
             result.raw_text,
             error=result.error,
             language=self.config.language,
@@ -448,7 +508,7 @@ class WatchpostEngine:
             channel=channel,
         )
         all_bubbles, draft_reply = format_completion_bubbles(
-            channel.name,
+            self._completion_channel_label(channel, sender_name=thread.sender_name),
             result.raw_text,
             error=result.error,
             language=self.config.language,
@@ -636,7 +696,7 @@ class WatchpostEngine:
             channel=ch,
         )
         all_bubbles, draft_reply = format_completion_bubbles(
-            ch.name,
+            self._completion_channel_label(ch),
             result.raw_text,
             error=result.error,
             language=self.config.language,

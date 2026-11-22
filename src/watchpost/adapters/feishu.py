@@ -34,6 +34,7 @@ _HTML_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _HTML_P_RE = re.compile(r"</?p\s*>", re.IGNORECASE)
 _HTML_AT_TAG_RE = re.compile(r"<at\b[^>]*>(.*?)</at>", re.IGNORECASE | re.DOTALL)
 _HTML_MEDIA_TAG_RE = re.compile(r"<(?:image|audio|file|video)\b[^>]*/?>", re.IGNORECASE)
+_BRACKET_MEDIA_RE = re.compile(r"\[(?:Image|Audio|File|Media|Video)\s*:\s*(?:img_|file_)[A-Za-z0-9_-]+\]", re.IGNORECASE)
 
 
 def _parse_create_ms(raw_val: Any) -> int:
@@ -585,6 +586,7 @@ class FeishuAdapter:
         text = _HTML_P_RE.sub("\n", text)
         text = _HTML_AT_TAG_RE.sub(lambda m: f"@{m.group(1).strip()}" if m.group(1).strip() else "", text)
         text = _HTML_MEDIA_TAG_RE.sub("", text)
+        text = _BRACKET_MEDIA_RE.sub("", text)
         if mention_by_key:
             text = _MENTION_KEY_RE.sub(
                 lambda m: f"@{mention_by_key[m.group(0)]}" if m.group(0) in mention_by_key else m.group(0),

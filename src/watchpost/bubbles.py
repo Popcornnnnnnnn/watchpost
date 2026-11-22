@@ -153,16 +153,31 @@ def format_completion_bubbles(
 ) -> tuple[list[str], str]:
     """Format agent output into short delivery bubbles plus the pure standalone reply draft."""
     is_zh = language.lower().startswith("zh")
-    sep = "：" if is_zh else ": "
-    err_tag = f"{channel_name}（出错）：" if is_zh else f"{channel_name} (error): "
     err_prefix = "处理出错：" if is_zh else "Error: "
     empty_msg = "已完成，暂无输出。" if is_zh else "Done, no output returned."
     lead_in = "下面这条可直接复制回复：" if is_zh else "Suggested reply to copy:"
 
+    header = (
+        f"【{channel_name} · 出错】" if error else f"【{channel_name}】"
+    ) if is_zh else (
+        f"[{channel_name} · Error]" if error else f"[{channel_name}]"
+    )
+    tail_name = channel_name.split("·")[-1].strip()
+    redundant_colon_re = (
+        re.compile(rf"^{re.escape(tail_name)}\s*[:：]\s*")
+        if tail_name
+        else None
+    )
+
     def _prefix(bubble: str) -> str:
-        if bubble.startswith(channel_name):
-            return bubble
-        return f"{err_tag if error else f'{channel_name}{sep}'}{bubble}"
+        clean_b = bubble.strip()
+        if clean_b.startswith(f"【{channel_name}") or clean_b.startswith(f"[{channel_name}"):
+            return clean_b
+        if redundant_colon_re is not None:
+            stripped = redundant_colon_re.sub("", clean_b, count=1).strip()
+            if stripped:
+                clean_b = stripped
+        return f"{header}\n{clean_b}" if clean_b else header
 
     sections = extract_sections(response_text)
     reply = sections.get("suggested_reply", "").strip()

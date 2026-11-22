@@ -116,7 +116,9 @@ class SimulatorStateNotifier:
         preview: str,
         *,
         is_steer: bool = False,
+        attachments: list[str] | None = None,
     ) -> list[str]:
+        del attachments
         self.activity = "thinking"
         self.mark_messages(list(thread.message_ids), "thinking")
         tok = self._next_token()
@@ -124,7 +126,13 @@ class SimulatorStateNotifier:
             {
                 "id": tok,
                 "kind": "start",
-                "text": format_start_notice(channel.name, preview, is_steer=is_steer, language=self.language),
+                "text": format_start_notice(
+                    channel.name,
+                    preview,
+                    adapter=channel.adapter,
+                    is_steer=is_steer,
+                    language=self.language,
+                ),
                 "thread_id": "" if thread.id == "pending" else thread.id,
                 "channel_name": channel.name,
                 "triage_mode": thread.triage_mode.value,

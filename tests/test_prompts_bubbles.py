@@ -34,7 +34,7 @@ def test_markdown_strip_and_bilingual_bubble_splitting() -> None:
         language="zh",
     )
     assert len(bubbles) == 2
-    assert bubbles[0].startswith("Alex：已定位 超时 问题。")
+    assert bubbles[0].startswith("【Alex】\n已定位 超时 问题。")
     assert "下面这条可直接复制回复：" in bubbles[0]
     assert bubbles[1] == "我刚调整了超时参数，等空闲确认。"
     assert draft == "我刚调整了超时参数，等空闲确认。"

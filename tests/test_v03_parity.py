@@ -668,3 +668,189 @@ def test_build_engine_from_config_fallback_and_doctor(tmp_path: Path) -> None:
     assert report["ok"] is True
     assert report["checks"]["adapter:wechat"]["ok"] is True
     assert report["checks"]["feishu"]["ok"] is True
+
+
+def test_imessage_photo_forwarding_quotes_and_echo_suppression(tmp_path: Path, monkeypatch: Any) -> None:
+    from watchpost.bubbles import format_completion_bubbles
+    from watchpost.models import MediaArtifact, MediaRef
+
+    # 1. Lark-cli content strips raw `[Image: img_v3_...]` keys cleanly
+    feishu = FeishuAdapter(FeishuConfig(enabled=True, auth_mode="lark_cli", owner_open_id="ou_owner"))
+    ch = ChannelConfig(
+        id="feishu_zhang",
+        adapter="feishu",
+        external_chat_id="oc_1",
+        name="Peer X",
+        chat_type=ChatType.p2p,
+        trigger_mode=TriggerMode.all,
+    )
+    norm_img = feishu._normalize_item(
+        ch,
+        {
+            "message_id": "om_img_1",
+            "message_position": 10,
+            "create_time": str(int(time.time())),
+            "msg_type": "image",
+            "content": "[Image: img_v3_0217m_218779d2]",
+            "sender": {"id": "ou_peer", "name": "Peer X", "sender_type": "user"},
+            "deleted": False,
+        },
+    )
+    assert norm_img.clean_text == "[Image]"
+    assert norm_img.media_refs and norm_img.media_refs[0].key == "img_v3_0217m_218779d2"
+
+    # 2. Completion bubble header avoids `Name:` confusion & strips redundant colon tag only
+    b1, _ = format_completion_bubbles(
+        "飞书 · Peer X",
+        "总结：\nPeer X: 现场换电正常进行中。\n\n需要注意：\n无",
+        language="zh",
+    )
+    assert b1[0] == "【飞书 · Peer X】\n现场换电正常进行中。"
+    b2, _ = format_completion_bubbles(
+        "飞书 · Peer X",
+        "总结：\nPeer X说先观察一下。\n\n需要注意：\n无",
+        language="zh",
+    )
+    assert b2[0] == "【飞书 · Peer X】\nPeer X说先观察一下。"
+
+    # 3. IMessageNotifier sends separate header + quoted original + real photo, suppressing wp_out_ echo
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    photo_path = tmp_path / "sample.png"
+    photo_path.write_bytes(b"PNGDATA")
+
+    db_path = tmp_path / "chat.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+        CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT);
+        CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, filename TEXT, mime_type TEXT, uti TEXT, transfer_name TEXT, is_sticker INTEGER DEFAULT 0);
+        CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT, attributedBody BLOB, is_from_me INTEGER DEFAULT 0, handle_id INTEGER, thread_originator_guid TEXT DEFAULT '', reply_to_guid TEXT DEFAULT '', associated_message_type INTEGER DEFAULT 0, item_type INTEGER DEFAULT 0, date_retracted INTEGER DEFAULT 0, is_audio_message INTEGER DEFAULT 0);
+        CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+        CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
+        INSERT INTO handle VALUES (1, '+15550100');
+        INSERT INTO chat VALUES (1, '+15550100');
+        INSERT INTO message (ROWID, guid, text, is_from_me, handle_id) VALUES (1, 'g0', 'seed', 0, 1);
+        INSERT INTO chat_message_join VALUES (1, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    sent_texts: list[str] = []
+    sent_files: list[str] = []
+
+    def fake_send_txt(_h: str, body: str) -> bool:
+        sent_texts.append(body)
+        c = sqlite3.connect(db_path)
+        rid = 10 + len(sent_texts) + len(sent_files)
+        c.execute("INSERT INTO message (ROWID, guid, text, is_from_me, handle_id) VALUES (?, ?, ?, 1, 1)", (rid, f"g-txt-{rid}", body))
+        c.execute("INSERT INTO chat_message_join VALUES (1, ?)", (rid,))
+        c.commit()
+        c.close()
+        return True
+
+    def fake_send_file(_h: str, fpath: str) -> bool:
+        sent_files.append(fpath)
+        c = sqlite3.connect(db_path)
+        rid = 10 + len(sent_texts) + len(sent_files)
+        c.execute("INSERT INTO attachment (ROWID, filename, mime_type, uti, transfer_name, is_sticker) VALUES (?, ?, 'image/png', 'public.png', ?, 0)", (rid, fpath, Path(fpath).name))
+        c.execute("INSERT INTO message (ROWID, guid, text, is_from_me, handle_id) VALUES (?, ?, '', 1, 1)", (rid, f"g-file-{rid}"))
+        c.execute("INSERT INTO chat_message_join VALUES (1, ?)", (rid,))
+        c.execute("INSERT INTO message_attachment_join VALUES (?, ?)", (rid, rid))
+        c.commit()
+        c.close()
+        return True
+
+    async def _run() -> None:
+        ntf = IMessageNotifier(
+            IMessageConfig(enabled=True, owner_handle="+15550100", chat_db_path=str(db_path)),
+            send_fn=fake_send_txt,
+            send_file_fn=fake_send_file,
+        )
+        assert await ntf.poll_owner_actions() == []
+
+        class _FakeAdapter:
+            name = "feishu"
+
+            async def list_available_chats(self) -> list[dict[str, str]]:
+                return []
+
+            async def fetch_recent(self, channel: ChannelConfig, *, limit: int = 50) -> list[NormalizedMessage]:
+                del channel, limit
+                return []
+
+            async def fetch_by_ids(self, channel: ChannelConfig, message_ids: list[str]) -> list[NormalizedMessage]:
+                del channel, message_ids
+                return []
+
+            async def download_media(self, channel: ChannelConfig, message: NormalizedMessage, dest_dir: Path) -> list[MediaArtifact]:
+                del channel, dest_dir
+                return [MediaArtifact(kind="image", key=message.media_refs[0].key, path=str(photo_path))]
+
+        store = WatchpostStore(tmp_path / "wp.db")
+        backend = _RecordingBackend("antigravity")
+        engine = WatchpostEngine(
+            store,
+            backend,
+            config=EngineConfig(workspace_dir=tmp_path, language="zh"),
+            adapters={"feishu": _FakeAdapter()},
+            notifiers=[ntf],
+        )
+        store.upsert_channel(ch)
+
+        now_ms = int(time.time() * 1000)
+        created = await engine.ingest_messages(
+            ch.id,
+            [
+                NormalizedMessage(
+                    message_id="m_img",
+                    channel_id=ch.id,
+                    position=1,
+                    create_ms=now_ms,
+                    sender_id="ou_peer",
+                    sender_name="Peer X",
+                    msg_type="image",
+                    clean_text="[Image]",
+                    media_refs=[MediaRef(kind="image", key="img_v3_xyz")],
+                ),
+                NormalizedMessage(
+                    message_id="m_txt",
+                    channel_id=ch.id,
+                    position=2,
+                    create_ms=now_ms + 100,
+                    sender_id="ou_peer",
+                    sender_name="Peer X",
+                    msg_type="text",
+                    clean_text="这个告警影响吗，现场正常在换电",
+                ),
+            ],
+        )
+        assert len(created) == 1
+        assert created[0].title == "这个告警影响吗，现场正常在换电"
+        assert any(t == "【飞书 · Peer X】发来新消息，正在查看" for t in sent_texts)
+        assert any(t == '"这个告警影响吗，现场正常在换电"' for t in sent_texts)
+        assert any(t.startswith("【飞书 · Peer X】\n") for t in sent_texts)
+        assert len(sent_files) == 1 and "watchpost_outbox/wp_out_" in sent_files[0]
+
+        # Outbound wp_out_ photo and outbound text must NOT re-trigger poll_owner_actions
+        assert await ntf.poll_owner_actions() == []
+
+        # Real photo sent by owner (NOT wp_out_) still triggers owner action
+        owner_photo = tmp_path / "owner_shot.png"
+        owner_photo.write_bytes(b"OWNPNG")
+        c = sqlite3.connect(db_path)
+        c.execute("INSERT INTO attachment (ROWID, filename, mime_type, uti, transfer_name, is_sticker) VALUES (99, ?, 'image/png', 'public.png', 'owner_shot.png', 0)", (str(owner_photo),))
+        c.execute("INSERT INTO message (ROWID, guid, text, is_from_me, handle_id) VALUES (99, 'g-own-99', '', 1, 1)")
+        c.execute("INSERT INTO chat_message_join VALUES (1, 99)")
+        c.execute("INSERT INTO message_attachment_join VALUES (99, 99)")
+        c.commit()
+        c.close()
+
+        owner_acts = await ntf.poll_owner_actions()
+        assert len(owner_acts) == 1 and owner_acts[0].attachments[0]["name"] == "owner_shot.png"
+
+    asyncio.run(_run())

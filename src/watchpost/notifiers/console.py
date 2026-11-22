@@ -53,9 +53,16 @@ class ConsoleNotifier:
         preview: str,
         *,
         is_steer: bool = False,
+        attachments: list[str] | None = None,
     ) -> list[str]:
-        del thread
-        msg = format_start_notice(channel.name, preview, is_steer=is_steer, language=self._language)
+        del thread, attachments
+        msg = format_start_notice(
+            channel.name,
+            preview,
+            adapter=channel.adapter,
+            is_steer=is_steer,
+            language=self._language,
+        )
         tok = await self.send_message(msg)
         return [tok] if tok else []
 
