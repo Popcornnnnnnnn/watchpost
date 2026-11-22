@@ -35,10 +35,10 @@ end run
 _APPLESCRIPT_SEND_FILE = """on run argv
     set targetHandle to item 1 of argv
     set targetPath to item 2 of argv
+    set targetFile to (POSIX file targetPath) as alias
     tell application "Messages"
         set targetService to 1st account whose service type = iMessage
         set targetBuddy to participant targetHandle of targetService
-        set targetFile to POSIX file targetPath
         send targetFile to targetBuddy
     end tell
 end run
