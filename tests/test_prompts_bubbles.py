@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from watchpost.bubbles import extract_sections, format_completion_bubbles, split_into_bubbles, strip_markdown
 from watchpost.models import AutonomyMode, ChannelConfig, ChatType, NormalizedMessage
-from watchpost.prompts import build_new_thread_prompt, build_owner_steer_prompt
+from watchpost.prompts import build_new_thread_prompt, build_owner_steer_prompt, build_personal_direct_prompt
 
 
 def test_markdown_strip_and_bilingual_bubble_splitting() -> None:
@@ -65,9 +65,55 @@ def test_prompts_enforce_autonomy_gates_and_untrusted_boundary() -> None:
         assert "Intent-First 4-Mode Triage" in prompt
         assert "UNTRUSTED EXTERNAL CHAT INPUT" in prompt
         assert "STRICTLY FORBIDDEN (Draft-Only)" in prompt
+        assert "EXPLICIT LANGUAGE REQUEST" in prompt and "简体中文" in prompt
         assert "总结：" in prompt and "建议回复：" in prompt
         assert expected in prompt
 
     go_prompt = build_owner_steer_prompt("go ahead", approved_go=True, language="en")
     assert "APPROVED execution" in go_prompt
     assert "Summary:" in go_prompt
+
+    go_prompt_zh = build_owner_steer_prompt("go ahead", approved_go=True, language="zh")
+    assert "EXPLICIT LANGUAGE REQUEST" in go_prompt_zh
+    assert "简体中文" in go_prompt_zh
+
+
+def test_personal_direct_prompt_enforces_chinese_override_and_english_fallback() -> None:
+    zh_new = build_personal_direct_prompt(
+        "看看这张图",
+        notifier="imessage",
+        workspace_dir="/tmp/ws",
+        is_steer=False,
+        language="zh",
+    )
+    assert "EXPLICIT LANGUAGE REQUEST" in zh_new
+    assert "简体中文" in zh_new
+    assert "禁止使用任何 Markdown" in zh_new
+    assert "不需要附带对外回复草稿" in zh_new
+    assert "当前工作区：/tmp/ws" in zh_new
+
+    zh_steer = build_personal_direct_prompt(
+        "换个角度查一下",
+        notifier="imessage",
+        workspace_dir="/tmp/ws",
+        is_steer=True,
+        language="zh",
+    )
+    assert "EXPLICIT LANGUAGE REQUEST" in zh_steer
+    assert "简体中文" in zh_steer
+    assert "禁止使用任何 Markdown" in zh_steer
+    assert "不需要附带对外回复草稿" in zh_steer
+    assert "个人直聊跟进" in zh_steer
+    assert "当前工作区" not in zh_steer
+
+    en_new = build_personal_direct_prompt(
+        "check this photo",
+        notifier="imessage",
+        workspace_dir="/tmp/ws",
+        is_steer=False,
+        language="en",
+    )
+    assert "EXPLICIT LANGUAGE REQUEST" not in en_new
+    assert "简体中文" not in en_new
+    assert "Do NOT use any Markdown formatting symbols" in en_new
+    assert "Workspace: /tmp/ws" in en_new

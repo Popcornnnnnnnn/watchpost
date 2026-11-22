@@ -31,7 +31,12 @@ from watchpost.models import (
 )
 from watchpost.notifiers import format_platform_label
 from watchpost.ports import AgentBackend, ChannelAdapter, MediaProcessor, NotifierAdapter
-from watchpost.prompts import build_new_thread_prompt, build_owner_steer_prompt, build_steer_prompt
+from watchpost.prompts import (
+    build_new_thread_prompt,
+    build_owner_steer_prompt,
+    build_personal_direct_prompt,
+    build_steer_prompt,
+)
 from watchpost.store import WatchpostStore
 
 logger = logging.getLogger("watchpost.engine")
@@ -623,12 +628,12 @@ class WatchpostEngine:
             self.store.add_thread_event(
                 ThreadEvent(thread_id=active_thread.id, kind="owner_steer", raw_text=owner_message)
             )
-            prompt = (
-                f"主人通过 {action.notifier} 发来后续直聊消息：\n{owner_message}\n\n"
-                "请直接、简洁地回答或处理，适合手机端阅读；无需替外部同事拟定回复草稿。"
-                if is_zh
-                else f"The owner sent a follow-up direct message via {action.notifier}:\n{owner_message}\n\n"
-                "Reply concisely and directly for mobile reading; no external colleague draft reply is needed."
+            prompt = build_personal_direct_prompt(
+                owner_message,
+                notifier=action.notifier,
+                workspace_dir=target_cwd,
+                is_steer=True,
+                language=self.config.language,
             )
             result = await self.backend.steer_thread(
                 active_thread.backend_thread_ref,
@@ -638,7 +643,7 @@ class WatchpostEngine:
                 channel=ch,
             )
             all_bubbles, draft_reply = format_completion_bubbles(
-                ch.name,
+                self._completion_channel_label(ch),
                 result.raw_text,
                 error=result.error,
                 language=self.config.language,
@@ -679,15 +684,12 @@ class WatchpostEngine:
         if self.config.ack_on_receive:
             start_tokens = await self._notify_start_all(ch, preview, topic, is_steer=False)
 
-        prompt = (
-            f"主人通过 {action.notifier} 发来直聊消息：\n{owner_message}\n\n"
-            f"当前工作区：{target_cwd}\n"
-            "请直接检查并简洁回答（适合手机端阅读，多段控制在短句内）；"
-            "这是主人自己的直聊会话，不需要替外部同事拟定回复草稿。"
-            if is_zh
-            else f"The owner sent a direct message via {action.notifier}:\n{owner_message}\n\n"
-            f"Workspace: {target_cwd}\n"
-            "Investigate and reply concisely for mobile reading; this is a direct owner chat so no external colleague draft reply is needed."
+        prompt = build_personal_direct_prompt(
+            owner_message,
+            notifier=action.notifier,
+            workspace_dir=target_cwd,
+            is_steer=False,
+            language=self.config.language,
         )
         backend_ref, result = await self.backend.start_thread(
             title,
