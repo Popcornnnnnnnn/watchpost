@@ -1,109 +1,68 @@
 # Watchpost
 
-**Headless local background bridge for your coding agent — zero-copy-paste head-starts delivered to your phone (`Apache-2.0`, `v0.2.0`).**
+**Headless local background bridge for your coding agent (`Apache-2.0`, `v0.2.0`).**
+Watches selected chat channels, runs local triage + your own CLI coding agent (`Claude Code`, `Codex`, `Gemini CLI`, `Antigravity`), and delivers concise diagnoses and **1-tap-copy draft replies** strictly to your phone (`Telegram` or macOS `iMessage`)—never auto-sending to external senders.
 
-Watchpost removes the manual copy-paste loop when urgent work or deliverables arrive in chat. It runs silently on your laptop, Mac mini, or bastion host, watches selected DMs and `@me` mentions (`Feishu` read-only with zero read receipts, plus offline simulation), applies your rules and autonomy gates, injects text, photos, and local **Whisper** voice transcripts directly into **your own coding agent** (`Claude Code`, `Codex`, `Gemini CLI`, `Antigravity`, or any custom CLI runner), and sends concise mobile bubbles + **1-tap-copy draft replies** strictly to *you* on your familiar phone chat (`Telegram` or macOS `iMessage`).
+## How It Works
 
-## Why Watchpost?
-
-- **No Copy-Paste Bottleneck:** Start debugging or preparing a deliverable the instant a message lands — whether it is a 2-minute live incident or a 2-hour spec/report review.
-- **No Heavy Platform UI:** No standalone web inbox or extra chat app to babysit. Install the bundled **Agent Skill** inside your existing coding agent and receive handoffs on your phone.
-- **Bring Your Own Coding Agent:** Runs headless CLI agents against your private repos, local files, internal LAN tools, and read-only SSH — nothing sensitive leaves your perimeter to a third-party cloud SaaS.
-- **Human-Only Handoff (Draft-Only Default):** External senders never talk directly to your AI. You review the short diagnosis or 70–80% draft on your phone, steer with follow-up replies, or approve `"go"` when ready.
+```mermaid
+flowchart LR
+    A["Feishu DM / @me (Read-Only) or Sandbox"] --> B["Watchpost Daemon (Debouncer · Whisper ASR · 4-Mode Triage)"]
+    B --> C["Local CLI Agent (Claude · Codex · Gemini · Antigravity)"]
+    C --> D["Your Phone (Telegram / iMessage: Diagnosis + Draft)"]
+    D -->|"'go' / /status / reply steer"| B
+```
 
 ## Key Capabilities (`v0.2.0`)
 
-- **Read-Only Official Feishu Adapter (`adapters/feishu.py`):** Polls selected DMs and groups with **zero read-receipt leaks**, parses mentions/rich posts/files/images/audio, skips recalled (`deleted`) messages cleanly, and discovers chats via `watchpost channels list-remote`.
-- **Familiar Phone Entrances (`notifiers/telegram.py`, `notifiers/imessage.py`):**
-  - **Telegram Bot (Cross-platform):** Owner-locked `chat_id` verification, `"go"` approval, `/status`, `/list`, and reply-thread steering (`watchpost telegram-whoami` helps discover your `chat_id`).
-  - **macOS iMessage:** Safe `argv` AppleScript delivery + read-only `~/Library/Messages/chat.db` polling with echo suppression, anti-backlog ROWID seeding, `attributedBody` fallback decoding, and swipe-reply binding.
-- **Guided Setup via Installable Agent Skill (`install-skill`):** Install/remove `SKILL.md` directly into Claude Code, Codex, or Antigravity (`watchpost install-skill --target claude|codex|antigravity`).
-- **2-Bucket Group Context + Burst Debouncing:** Separates Bucket-1 linked clues/media (recursive reply chains + overnight handoffs) from Bucket-2 text-only background chatter while coalescing multi-bubble bursts.
-- **Offline Whisper ASR & 4-Mode Intent Triage:** Distinguishes quick status/estimate/doc questions (`Mode 1`), advice (`Mode 2`), and FYI (`Mode 3`) from deep investigations (`Mode 4`), enforcing `assistant_only`, `diagnose_only`, or `auto_fix` + `UNTRUSTED EXTERNAL CHAT INPUT` isolation.
+- **Zero copy-paste bottleneck:** Starts debugging or drafting immediately while keeping private repos and credentials on your machine.
+- **Read-only Feishu adapter:** Polls DMs/groups with zero read-receipt leaks, handles media/voice/recalls, and discovers chats (`watchpost channels list-remote`).
+- **Phone-only handoff:** Owner-locked Telegram bot or macOS iMessage (`~/Library/Messages/chat.db`) with `"go"` approval, `/status`, `/list`, and reply steering.
+- **2-bucket context & Whisper ASR:** Separates linked clues/media from chatter, transcribes audio locally, and triages across 4 modes under `assistant_only`, `diagnose_only`, or `auto_fix`.
+- **Guided Agent Skill:** Install directly into Claude Code, Codex, or Antigravity via `watchpost install-skill`.
 
-## Quickstart (`v0.2.0`)
+## Quickstart
 
-Requirements: Python `3.11+` and [`uv`](https://docs.astral.sh/uv/).
+Requires Python `3.11+` and [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-cd watchpost
-uv sync --all-extras
+cd watchpost && uv sync --all-extras
 ```
 
-### Option 1 — Guided Agent Skill Setup (Recommended)
-Install the bundled skill into your agent harness (`claude`, `codex`, or `antigravity`), then ask your agent *"Set up Watchpost"*:
+### Option 1 — Guided Agent Skill (Recommended)
 ```bash
-uv run watchpost install-skill --target claude
+uv run watchpost install-skill --target claude   # or codex | antigravity
+# Then ask your agent: "Set up Watchpost"
 ```
 
 ### Option 2 — Direct CLI Setup
-1. **Create starter config (`~/.config/watchpost/config.json`, `0600`):**
-   ```bash
-   uv run watchpost init-config
-   ```
-2. **Set credentials via env vars (or edit `config.json`) & discover Telegram `chat_id`:**
-   ```bash
-   export TELEGRAM_BOT_TOKEN="..."
-   uv run watchpost telegram-whoami
-   ```
-3. **Discover Feishu chats and enroll a channel:**
-   ```bash
-   export FEISHU_APP_ID="..."
-   export FEISHU_APP_SECRET="..."
-   export FEISHU_OWNER_OPEN_ID="ou_..."
-   uv run watchpost channels list-remote --adapter feishu
-   uv run watchpost channels add \
-     --adapter feishu \
-     --chat-id "oc_..." \
-     --name "Support Group" \
-     --chat-type group \
-     --trigger mention_owner \
-     --autonomy diagnose_only
-   ```
-4. **Verify health and run the headless daemon:**
-   ```bash
-   uv run watchpost doctor
-   uv run watchpost run --once --seed
-   uv run watchpost run
-   ```
-
-### Try It Interactively (`watchpost sandbox`)
-Act as external colleagues sending messages into an isolated DM or `@me` group and drive owner replies from the same terminal — zero impact on live apps:
-
 ```bash
-# Instant offline loop (MockAgentBackend, zero token cost)
-uv run watchpost sandbox --backend mock
+uv run watchpost init-config                     # ~/.config/watchpost/config.json (0600)
+export TELEGRAM_BOT_TOKEN="..."
+uv run watchpost telegram-whoami                 # find your owner chat_id
 
-# Or point a real local CLI coding agent at any repository in read-only mode
-uv run watchpost sandbox --backend codex --cwd /path/to/your/repo
+export FEISHU_APP_ID="..." FEISHU_APP_SECRET="..." FEISHU_OWNER_OPEN_ID="ou_..."
+uv run watchpost channels list-remote --adapter feishu
+uv run watchpost channels add --adapter feishu --chat-id "oc_..." --name "Support" \
+  --chat-type group --trigger mention_owner --autonomy diagnose_only
+
+uv run watchpost doctor && uv run watchpost run --once --seed
+uv run watchpost run
 ```
 
-Inside the sandbox, type messages directly to act as a colleague, or use `/mode group`, `/as Boss`, `/at <msg>`, `/reply <sb_id> <msg>`, `/img <path> [caption]`, `/recall <sb_id>`, `/autonomy ...`, and `/phone go` / `/phone status` / `/phone <steer>` to act as yourself on the phone.
-
-### Offline Demo, JSON Control API & Tests
+### Interactive Sandbox, API & Tests
 ```bash
-# Run offline simulation scenario
-uv run watchpost demo
-
-# Start headless JSON control API (:8787, zero Web UI)
+uv run watchpost sandbox --backend mock          # offline interactive loop (zero token cost)
+uv run watchpost sandbox --backend codex --cwd /path/to/repo
+uv run watchpost demo                            # scripted offline simulation
 uv run watchpost serve --host 127.0.0.1 --port 8787 --db ./data/watchpost.db
-
-# Run fast offline test suite
 uv run pytest -v
 ```
 
-## External Adapter & License Boundary
+> In `sandbox`, type messages as a colleague or use `/mode group`, `/as Boss`, `/at`, `/reply`, `/img`, `/recall`, `/autonomy`, and `/phone go|status|<steer>`.
 
-Watchpost core is **`Apache-2.0`** and ships only official-API adapters and phone entrances (`Feishu`, `Telegram`, macOS `iMessage`). Unofficial or copyleft desktop bridges—such as macOS local WeChat bridges like [`wechat-mcp`](https://github.com/Popcornnnnnnnn/wechat-mcp) (`GPL-3.0`)—remain separate out-of-process services integrated only over local HTTP (`:8300`) or CLI boundaries, never imported into the Watchpost Python package.
+## Architecture, License & Roadmap
 
-## Roadmap
-
-- **Phase 1 — Headless Core Engine (`v0.1.0`, Done):** Protocol contracts, 5-table SQLite WAL store, noise/recall filters, 2-bucket context, debouncer, 4-mode triage, CJK/EN bubble splitter, Whisper ASR, generic `CLIAgentBackend`, offline simulator, and headless JSON control API.
-- **Phase 2 — Real End-to-End Loop & Guided Skill (`v0.2.0`, Done):** Official read-only **Feishu** adapter, **Telegram** & macOS **iMessage** phone entrances, owner `"go"` / `/status` / `/list` / steer loop, continuous **`watchpost run`** daemon + **`doctor`** + **`channels`** CLI, and bundled **`watchpost` Agent Skill**.
-- **Phase 3 — Breadth & Bastion Packaging (Planned):** **Slack** Socket Mode adapter, automated `Auto-Draft Persona` from chat history, optional `mode: digest` channel trigger for quiet groups, optional `wechat-mcp` (`:8300`) external plugin guide, and headless `Dockerfile` / `docker-compose.yml`.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system architecture.
-
-## License
-
-Apache License 2.0 — see [LICENSE](LICENSE).
+- **License boundary:** Core is `Apache-2.0` (official APIs only). Copyleft desktop bridges like [`wechat-mcp`](https://github.com/Popcornnnnnnnn/wechat-mcp) (`GPL-3.0`) stay separate out-of-process services over local HTTP (`:8300`) or CLI.
+- **Roadmap:** Phase 1 Core Engine (`v0.1.0`, Done) → Phase 2 Feishu + Telegram/iMessage + Skill (`v0.2.0`, Done) → Phase 3 Slack Socket Mode, auto-persona, digest mode, Docker (Planned).
+- Full architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · License: [LICENSE](LICENSE)
