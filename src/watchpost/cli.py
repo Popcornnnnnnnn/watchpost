@@ -81,12 +81,24 @@ async def _run_demo_into(db_path: Path, *, language: str) -> int:
     return 0
 
 
-async def _run_daemon_cli(config_path: Path, *, once: bool, seed: bool, api_port: int = 0) -> int:
+async def _run_daemon_cli(
+    config_path: Path,
+    *,
+    once: bool,
+    seed: bool,
+    api_port: int = 0,
+    log_file: str = "",
+) -> int:
     if not once:
+        handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+        if log_file.strip():
+            log_path = Path(log_file).expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-            stream=sys.stdout,
+            handlers=handlers,
             force=True,
         )
     cfg = load_config(config_path)
@@ -245,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--once", action="store_true", help="Run a single poll + owner-action cycle and exit")
     p_run.add_argument("--seed", action="store_true", help="Seed uninitialized cursors without triggering old backlog")
     p_run.add_argument("--api-port", type=int, default=0, help="Optional localhost JSON API port override")
+    p_run.add_argument("--log-file", default="", help="Optional log file path in addition to stdout")
 
     p_hook = sub.add_parser("hook-stop", help="Consume Antigravity Stop hook JSON on stdin into SQLite")
     p_hook.add_argument("--config", default="", help="Path to config.json")
@@ -377,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
                 once=args.once,
                 seed=args.seed,
                 api_port=args.api_port,
+                log_file=args.log_file,
             )
         )
 
