@@ -20,9 +20,15 @@ DEFAULT_MEDIA_DIR = "~/.local/share/watchpost/media"
 
 class BackendConfig(BaseModel):
     preset: str = "claude_code"
+    backup_preset: str = ""
     start_cmd: list[str] = Field(default_factory=list)
     steer_cmd: list[str] = Field(default_factory=list)
     timeout_s: float = 300.0
+    backup_timeout_s: float = 300.0
+    antigravity_bin: str = "agentapi"
+    antigravity_model: str = ""
+    antigravity_profile: str = ""
+    codex_sandbox: str = ""
 
 
 class WhisperConfig(BaseModel):
@@ -34,10 +40,11 @@ class WhisperConfig(BaseModel):
 
 class FeishuConfig(BaseModel):
     enabled: bool = False
-    auth_mode: Literal["tenant", "user"] = "tenant"
+    auth_mode: Literal["tenant", "user", "lark_cli"] = "tenant"
     app_id: str = ""
     app_secret: str = ""
     user_access_token: str = ""
+    lark_bin: str = "lark-cli"
     owner_open_id: str = ""
     owner_name: str = ""
     base_url: str = "https://open.feishu.cn/open-apis"
@@ -54,8 +61,19 @@ class TelegramConfig(BaseModel):
 class IMessageConfig(BaseModel):
     enabled: bool = False
     owner_handle: str = ""
+    allowed_handles: list[str] = Field(default_factory=list)
     chat_db_path: str = "~/Library/Messages/chat.db"
+    personal_workspace_dir: str = ""
+    personal_session_ttl_s: int = 3600
+    ack_on_receive: bool = True
     dry_run: bool = False
+
+
+class ExternalAdapterConfig(BaseModel):
+    name: str
+    command: list[str] = Field(default_factory=list)
+    timeout_s: float = 45.0
+    env: dict[str, str] = Field(default_factory=dict)
 
 
 class WatchpostConfig(BaseModel):
@@ -67,11 +85,13 @@ class WatchpostConfig(BaseModel):
     owner_poll_interval_s: float = 3.0
     debounce_s: float = 25.0
     max_debounce_s: float = 60.0
+    api_port: int = 0
     backend: BackendConfig = Field(default_factory=BackendConfig)
     whisper: WhisperConfig = Field(default_factory=WhisperConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     imessage: IMessageConfig = Field(default_factory=IMessageConfig)
+    external_adapters: list[ExternalAdapterConfig] = Field(default_factory=list)
     channels: list[ChannelConfig] = Field(default_factory=list)
 
 
@@ -131,6 +151,9 @@ def resolve_config(cfg: WatchpostConfig, *, env: Mapping[str, str] | None = None
                 update={
                     **imsg_updates,
                     "chat_db_path": str(Path(resolved.imessage.chat_db_path).expanduser()),
+                    "personal_workspace_dir": str(Path(resolved.imessage.personal_workspace_dir).expanduser())
+                    if resolved.imessage.personal_workspace_dir
+                    else "",
                 }
             ),
             "whisper": resolved.whisper.model_copy(
@@ -140,6 +163,37 @@ def resolve_config(cfg: WatchpostConfig, *, env: Mapping[str, str] | None = None
                     else "",
                 }
             ),
+            "external_adapters": [
+                ext.model_copy(
+                    update={
+                        "command": [
+                            str(Path(part).expanduser()) if part.startswith("~/") else part for part in ext.command
+                        ]
+                    }
+                )
+                for ext in resolved.external_adapters
+            ],
+            "channels": [
+                _resolve_channel_entry(ch)
+                for ch in resolved.channels
+            ],
+        }
+    )
+
+
+def _resolve_channel_entry(ch: ChannelConfig) -> ChannelConfig:
+    ws_dir = str(Path(ch.workspace_dir).expanduser()) if ch.workspace_dir else ""
+    p_file = str(Path(ch.persona_file).expanduser()) if ch.persona_file else ""
+    p_text = ch.persona_text
+    if p_file and not p_text.strip():
+        p_path = Path(p_file)
+        if p_path.is_file():
+            p_text = p_path.read_text(encoding="utf-8", errors="replace").strip()
+    return ch.model_copy(
+        update={
+            "workspace_dir": ws_dir,
+            "persona_file": p_file,
+            "persona_text": p_text,
         }
     )
 

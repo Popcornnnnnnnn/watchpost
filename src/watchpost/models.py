@@ -93,6 +93,7 @@ class ChannelConfig(BaseModel):
     trigger_mode: TriggerMode = TriggerMode.all
     autonomy_mode: AutonomyMode = AutonomyMode.diagnose_only
     ignore_bots: bool = True
+    persona_file: str = ""
     persona_text: str = ""
     whisper_prompt: str = ""
     same_sender_window_s: int = 300
@@ -104,6 +105,7 @@ class ChannelConfig(BaseModel):
     max_catchup_age_s: int = 7200
     cursor_pos: int = 0
     cursor_ms: int = 0
+    workspace_dir: str = ""
     enabled: bool = True
 
 
@@ -155,10 +157,12 @@ class ThreadEvent(BaseModel):
 
 class OwnerAction(BaseModel):
     notifier: str
-    kind: str  # "steer" | "approve_go" | "status" | "list"
+    kind: str  # "steer" | "approve_go" | "status" | "list" | "help" | "new_personal" | "reset_personal"
     thread_id: str = ""
     text: str = ""
     reply_token: str = ""
+    list_index: int = 0
+    attachments: list[dict[str, str]] = Field(default_factory=list)
 
 
 class EngineConfig(BaseModel):
@@ -167,3 +171,6 @@ class EngineConfig(BaseModel):
     debounce_s: float = 25.0
     max_debounce_s: float = 60.0
     media_retention_days: int = 14
+    personal_workspace_dir: Path | None = None
+    personal_session_ttl_s: int = 3600
+    ack_on_receive: bool = True

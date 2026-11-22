@@ -1,0 +1,670 @@
+"""Tests for Watchpost v0.3.0 parity features: Antigravity, Fallback, lark-cli, plugins, iMessage & commands."""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import os
+import sqlite3
+import stat
+import sys
+import tempfile
+import textwrap
+import time
+from pathlib import Path
+from typing import Any
+
+from watchpost.adapters.external_plugin import ExternalCommandAdapter
+from watchpost.adapters.feishu import FeishuAdapter
+from watchpost.backends.antigravity import (
+    AntigravityBackend,
+    extract_latest_assistant_response,
+    handle_stop_hook_payload,
+)
+from watchpost.backends.cli_agent import CLIAgentBackend
+from watchpost.backends.fallback import FallbackBackend
+from watchpost.cli import main as cli_main
+from watchpost.config import (
+    BackendConfig,
+    ExternalAdapterConfig,
+    FeishuConfig,
+    IMessageConfig,
+    WatchpostConfig,
+    resolve_config,
+    save_config,
+)
+from watchpost.daemon import build_engine_from_config, run_doctor
+from watchpost.engine import WatchpostEngine
+from watchpost.models import (
+    AgentResult,
+    AutonomyMode,
+    ChannelConfig,
+    ChatType,
+    EngineConfig,
+    NormalizedMessage,
+    OwnerAction,
+    ThreadRecord,
+    TriggerMode,
+)
+from watchpost.notifiers import classify_owner_command
+from watchpost.notifiers.imessage import IMessageNotifier
+from watchpost.store import WatchpostStore
+
+
+class _RecordingBackend:
+    def __init__(self, name: str = "rec", *, fail_start: bool = False, fail_steer: bool = False) -> None:
+        self.name = name
+        self.fail_start = fail_start
+        self.fail_steer = fail_steer
+        self.starts: list[tuple[str, str, Path]] = []
+        self.steers: list[tuple[str, str, str, Path]] = []
+
+    async def start_thread(
+        self,
+        title: str,
+        prompt: str,
+        *,
+        cwd: Path,
+        model: str = "",
+        channel: ChannelConfig | None = None,
+    ) -> tuple[str, AgentResult]:
+        del model, channel
+        self.starts.append((title, prompt, Path(cwd)))
+        if self.fail_start:
+            return "", AgentResult(raw_text="primary start boom", error="primary start boom")
+        raw = (
+            "[问题结论]\n1. 已定位服务重启原因。\n"
+            "[是否需要介入]\n否 — 只读排查完成\n"
+            "[建议回复]\n请核对配置文件后再试。\n"
+            "[待办状态]\n无需改动代码。"
+        )
+        return f"ref_{len(self.starts)}", AgentResult(
+            raw_text=raw,
+            summary_bubbles=[f"[{self.name}] 已定位服务重启原因。"],
+            suggested_reply="请核对配置文件后再试。",
+        )
+
+    async def steer_thread(
+        self,
+        backend_thread_ref: str,
+        title: str,
+        message: str,
+        *,
+        cwd: Path,
+        channel: ChannelConfig | None = None,
+    ) -> AgentResult:
+        del channel
+        self.steers.append((backend_thread_ref, title, message, Path(cwd)))
+        if self.fail_steer:
+            return AgentResult(raw_text="primary steer boom", error="primary steer boom")
+        raw = f"[问题结论]\n1. [{self.name}] 跟进完成。\n[是否需要介入]\n否\n[建议回复]\n收到。\n[待办状态]\n已完成。"
+        return AgentResult(raw_text=raw, summary_bubbles=[f"[{self.name}] 跟进完成。"], suggested_reply="收到。")
+
+
+class _RecordingNotifier:
+    name = "imessage"
+
+    def __init__(self) -> None:
+        self.starts: list[tuple[str, str]] = []
+        self.completions: list[tuple[str, list[str]]] = []
+        self.direct_replies: list[str] = []
+
+    async def notify_start(
+        self,
+        channel: ChannelConfig,
+        thread: ThreadRecord,
+        preview: str,
+        *,
+        is_steer: bool = False,
+    ) -> list[str]:
+        del thread, is_steer
+        self.starts.append((channel.id, preview))
+        return ["tok-start-1"]
+
+    async def notify_completion(
+        self,
+        channel: ChannelConfig,
+        thread: ThreadRecord,
+        bubbles: list[str],
+    ) -> list[str]:
+        self.completions.append((thread.id, list(bubbles)))
+        return [f"tok-{thread.id}-{i}" for i in range(len(bubbles))]
+
+    async def poll_owner_actions(self) -> list[OwnerAction]:
+        return []
+
+    async def send_message(self, text: str) -> bool:
+        self.direct_replies.append(text)
+        return True
+
+
+class _FakeWhisper:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Path, str]] = []
+
+    def transcribe_audio(self, audio_path: Path, *, prompt: str = "", language: str = "zh") -> tuple[str, str]:
+        del language
+        self.calls.append((audio_path, prompt))
+        return "帮我查一下四号站日志", ""
+
+
+def test_antigravity_stop_hook_and_backend_roundtrip(tmp_path: Path, monkeypatch: Any) -> None:
+    db_path = tmp_path / "watchpost.db"
+    store = WatchpostStore(db_path)
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "USER_INPUT", "content": "hi"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "content": "Initial draft"}),
+                json.dumps(
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "content": (
+                            "[问题结论]\n1. 接口超时。\n"
+                            "[是否需要介入]\n否\n"
+                            "[建议回复]\n请检查网络。\n"
+                            "[待办状态]\n无需改动。"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert "接口超时" in extract_latest_assistant_response(transcript)
+
+    conv_id = "11111111-2222-3333-4444-555555555555"
+    # Untracked conversationId is ignored cleanly
+    assert handle_stop_hook_payload({"conversationId": conv_id, "transcriptPath": str(transcript)}, store=store) is False
+
+    # Registered ref with fullyIdle=False is skipped
+    store.register_backend_ref("antigravity", conv_id)
+    assert (
+        handle_stop_hook_payload(
+            {"conversationId": conv_id, "transcriptPath": str(transcript), "fullyIdle": False},
+            store=store,
+        )
+        is False
+    )
+
+    # Invoke `watchpost hook-stop` CLI via stdin JSON
+    hook_payload = json.dumps({"conversationId": conv_id, "transcriptPath": str(transcript), "fullyIdle": True})
+    monkeypatch.setattr(sys, "stdin", io.StringIO(hook_payload))
+    assert cli_main(["hook-stop", "--db", str(db_path)]) == 0
+    comp = store.get_new_completion("antigravity", conv_id, after_id=0)
+    assert comp is not None and "接口超时" in comp["raw_text"]
+
+    # Duplicate digest is deduplicated
+    assert handle_stop_hook_payload({"conversationId": conv_id, "transcriptPath": str(transcript)}, store=store) is False
+
+    # Mock `agentapi` script that returns newConversation JSON and spawns a delayed completion update
+    mock_agentapi = tmp_path / "agentapi"
+    mock_conv = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    steer_transcript = tmp_path / "steer_transcript.jsonl"
+    steer_transcript.write_text(
+        json.dumps({"type": "PLANNER_RESPONSE", "content": "[问题结论]\n1. AGY 追问回复。\n[是否需要介入]\n否\n[建议回复]\n好的。\n[待办状态]\n完成。"})
+        + "\n",
+        encoding="utf-8",
+    )
+    mock_agentapi.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import json, subprocess, sys
+            cmd = sys.argv[1]
+            if cmd == "new-conversation":
+                print(json.dumps({{"response": {{"newConversation": {{"conversationId": "{mock_conv}"}}}}}}))
+                t_path = {str(transcript)!r}
+            else:
+                t_path = {str(steer_transcript)!r}
+
+            payload = json.dumps({{"conversationId": "{mock_conv}", "transcriptPath": t_path}})
+            runner = (
+                "import json, sys, time; from pathlib import Path; "
+                "from watchpost.store import WatchpostStore; "
+                "from watchpost.backends.antigravity import handle_stop_hook_payload; "
+                "time.sleep(0.15); "
+                "handle_stop_hook_payload(json.loads(sys.argv[1]), store=WatchpostStore(Path(sys.argv[2])))"
+            )
+            subprocess.Popen(
+                [sys.executable, "-c", runner, payload, {str(db_path)!r}],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+    mock_agentapi.chmod(mock_agentapi.stat().st_mode | stat.S_IEXEC)
+
+    async def _run() -> None:
+        backend = AntigravityBackend(store, agentapi_bin=str(mock_agentapi), poll_interval_s=0.05, timeout_s=10.0)
+        ref, res1 = await backend.start_thread("Test", "Check status", cwd=tmp_path)
+        assert ref == mock_conv
+        assert not res1.error
+        assert "接口超时" in res1.raw_text
+
+        res2 = await backend.steer_thread(ref, "Test", "Follow up", cwd=tmp_path)
+        assert not res2.error
+        assert "AGY 追问回复" in res2.raw_text
+
+    asyncio.run(_run())
+
+
+def test_fallback_backend_failover_and_recovery(tmp_path: Path) -> None:
+    async def _run() -> None:
+        # 1. Start failover: primary fails -> backup runs and gets tagged ref
+        p1 = _RecordingBackend("antigravity", fail_start=True)
+        b1 = _RecordingBackend("codex")
+        fb1 = FallbackBackend(p1, b1)
+        assert fb1.name == "antigravity+codex"
+        ref, res = await fb1.start_thread("Bug", "Investigate", cwd=tmp_path)
+        assert ref.startswith("codex:")
+        assert not res.error
+        assert len(b1.starts) == 1
+
+        # 2. Steer failover: thread started on primary, steer fails -> backup recovery turn
+        p2 = _RecordingBackend("antigravity", fail_steer=True)
+        b2 = _RecordingBackend("codex")
+        fb2 = FallbackBackend(p2, b2)
+        pref, pres = await fb2.start_thread("Bug", "Investigate", cwd=tmp_path)
+        assert pref.startswith("antigravity:")
+        assert not pres.error
+        sres = await fb2.steer_thread(pref, "Bug", "Need details", cwd=tmp_path)
+        assert not sres.error
+        assert len(b2.starts) == 1
+        assert "Backup recovery" in b2.starts[0][1]
+
+    asyncio.run(_run())
+
+
+def test_feishu_lark_cli_and_external_command_adapter(tmp_path: Path) -> None:
+    fake_lark = tmp_path / "lark-cli"
+    downloaded_dir = tmp_path / "downloads"
+    fake_lark.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import json, sys
+            from pathlib import Path
+            args = sys.argv[1:]
+            sub = args[1] if len(args) > 1 else ""
+            if sub == "+chat-list":
+                ctype = args[args.index("--types") + 1]
+                chat = {{"chat_id": f"oc_{{ctype}}_1", "name": f"Chat {{ctype}}"}}
+                print(json.dumps({{"ok": True, "data": {{"chats": [chat]}}}}))
+            elif sub == "+chat-messages-list":
+                print(json.dumps({{"ok": True, "data": {{"messages": [{{
+                    "message_id": "om_lark_1",
+                    "message_position": 42,
+                    "create_time": "1730000000",
+                    "msg_type": "text",
+                    "content": '<at id="ou_owner">@Lead</at> 检查网关日志',
+                    "sender": {{"id": "ou_colleague", "name": "Dev", "sender_type": "user"}},
+                    "mentions": [],
+                    "deleted": False,
+                }}]}}}}))
+            elif sub == "+messages-mget":
+                print(json.dumps({{"ok": True, "data": {{"messages": [{{
+                    "message_id": "om_lark_0",
+                    "message_position": 41,
+                    "create_time": "1729999900",
+                    "msg_type": "image",
+                    "content": '<image key="img_abc123"/>',
+                    "sender": {{"id": "ou_colleague", "name": "Dev", "sender_type": "user"}},
+                }}]}}}}))
+            elif sub == "+messages-resources-download":
+                out_name = args[args.index("--output") + 1]
+                p = Path.cwd() / out_name
+                p.write_bytes(b"PNGDATA")
+                print(json.dumps({{"ok": True, "data": {{"saved_path": str(p)}}}}))
+            else:
+                print(json.dumps({{"ok": False, "error": {{"message": "unknown cmd"}}}}))
+                sys.exit(1)
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_lark.chmod(fake_lark.stat().st_mode | stat.S_IEXEC)
+
+    fake_ext = tmp_path / "ext_plugin.py"
+    fake_ext.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import json, sys
+            from pathlib import Path
+            action = sys.argv[1]
+            payload = json.loads(sys.stdin.read() or "{{}}")
+            if action == "list-chats":
+                print(json.dumps([{{"external_chat_id": "room_1", "name": "Ops Room", "chat_type": "group"}}]))
+            elif action == "fetch-recent":
+                print(json.dumps([{{
+                    "message_id": "m_ext_1",
+                    "channel_id": payload["channel"]["id"],
+                    "position": 100,
+                    "create_ms": 1730000000000,
+                    "sender_id": "u_ext",
+                    "sender_name": "Peer",
+                    "clean_text": "check sensor 2",
+                    "msg_type": "text",
+                }}]))
+            elif action == "fetch-by-ids":
+                print(json.dumps([]))
+            elif action == "download-media":
+                dest = Path(payload["dest_dir"])
+                dest.mkdir(parents=True, exist_ok=True)
+                out = dest / "sample.png"
+                out.write_bytes(b"IMG")
+                print(json.dumps([{{"kind": "image", "key": "k1", "path": str(out)}}]))
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_ext.chmod(fake_ext.stat().st_mode | stat.S_IEXEC)
+
+    async def _run() -> None:
+        feishu = FeishuAdapter(
+            FeishuConfig(enabled=True, auth_mode="lark_cli", lark_bin=str(fake_lark), owner_open_id="ou_owner")
+        )
+        chats = await feishu.list_available_chats()
+        assert {c["external_chat_id"] for c in chats} == {"oc_p2p_1", "oc_group_1"}
+
+        ch = ChannelConfig(id="ch_lark", adapter="feishu", external_chat_id="oc_group_1", name="LarkGrp")
+        msgs = await feishu.fetch_recent(ch)
+        assert len(msgs) == 1
+        assert msgs[0].mentions_owner is True
+        assert msgs[0].position == 42
+        assert "@Lead" in msgs[0].clean_text
+
+        by_id = await feishu.fetch_by_ids(ch, ["om_lark_0"])
+        assert len(by_id) == 1 and by_id[0].media_refs[0].key == "img_abc123"
+        arts = await feishu.download_media(ch, by_id[0], downloaded_dir)
+        assert len(arts) == 1 and Path(arts[0].path).read_bytes() == b"PNGDATA"
+
+        ext = ExternalCommandAdapter(ExternalAdapterConfig(name="custom_chat", command=[str(fake_ext)]))
+        ext_chats = await ext.list_available_chats()
+        assert ext_chats[0]["external_chat_id"] == "room_1"
+        ext_ch = ChannelConfig(id="ch_ext", adapter="custom_chat", external_chat_id="room_1", name="Room")
+        ext_msgs = await ext.fetch_recent(ext_ch)
+        assert len(ext_msgs) == 1 and ext_msgs[0].message_id == "m_ext_1"
+        ext_arts = await ext.download_media(ext_ch, ext_msgs[0], downloaded_dir)
+        assert len(ext_arts) == 1 and Path(ext_arts[0].path).read_bytes() == b"IMG"
+
+    asyncio.run(_run())
+
+
+def test_imessage_allowed_handles_filters_and_attachments(tmp_path: Path) -> None:
+    db_path = tmp_path / "chat.db"
+    audio_file = tmp_path / "voice_note.caf"
+    audio_file.write_bytes(b"CAF")
+    img_file = tmp_path / "photo.png"
+    img_file.write_bytes(b"PNG")
+    sticker_file = tmp_path / "sticker.heic"
+    sticker_file.write_bytes(b"HEIC")
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+        CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT);
+        CREATE TABLE attachment (
+            ROWID INTEGER PRIMARY KEY,
+            filename TEXT,
+            mime_type TEXT,
+            uti TEXT,
+            transfer_name TEXT,
+            is_sticker INTEGER DEFAULT 0
+        );
+        CREATE TABLE message (
+            ROWID INTEGER PRIMARY KEY,
+            guid TEXT,
+            text TEXT,
+            attributedBody BLOB,
+            is_from_me INTEGER DEFAULT 0,
+            handle_id INTEGER,
+            thread_originator_guid TEXT DEFAULT '',
+            reply_to_guid TEXT DEFAULT '',
+            associated_message_type INTEGER DEFAULT 0,
+            item_type INTEGER DEFAULT 0,
+            date_retracted INTEGER DEFAULT 0,
+            is_audio_message INTEGER DEFAULT 0
+        );
+        CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+        CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
+
+        INSERT INTO handle VALUES (1, '15550100222'), (2, '15559990000');
+        INSERT INTO chat VALUES (1, '15550100222'), (2, '15559990000');
+        INSERT INTO message (ROWID, guid, text, is_from_me, handle_id) VALUES (1, 'g0', 'seed', 0, 1);
+        INSERT INTO chat_message_join VALUES (1, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    async def _run() -> None:
+        ntf = IMessageNotifier(
+            IMessageConfig(
+                enabled=True,
+                owner_handle="+1 555-010-0001",
+                allowed_handles=["+86 155-5010-0222", "15550100222"],
+                chat_db_path=str(db_path),
+            ),
+            send_fn=lambda _h, _t: True,
+        )
+        assert await ntf.poll_owner_actions() == []
+
+        c = sqlite3.connect(db_path)
+        c.execute("INSERT INTO attachment VALUES (1, ?, 'audio/x-caf', 'com.apple.coreaudio-format', 'voice.caf', 0)", (str(audio_file),))
+        c.execute("INSERT INTO attachment VALUES (2, ?, 'image/png', 'public.png', 'photo.png', 0)", (str(img_file),))
+        c.execute("INSERT INTO attachment VALUES (3, ?, 'image/heic', 'public.heic', 'sticker.heic', 1)", (str(sticker_file),))
+        # Row 2: reaction -> skipped
+        c.execute("INSERT INTO message (ROWID, guid, text, handle_id, associated_message_type) VALUES (2, 'g2', 'Loved \"hi\"', 1, 2000)")
+        c.execute("INSERT INTO chat_message_join VALUES (1, 2)")
+        # Row 3: retracted -> skipped
+        c.execute("INSERT INTO message (ROWID, guid, text, handle_id, date_retracted) VALUES (3, 'g3', 'oops', 1, 999)")
+        c.execute("INSERT INTO chat_message_join VALUES (1, 3)")
+        # Row 4: audio-only message from allowed_handles with \ufffc char
+        c.execute("INSERT INTO message (ROWID, guid, text, handle_id, is_audio_message) VALUES (4, 'g4', '\ufffc', 1, 1)")
+        c.execute("INSERT INTO chat_message_join VALUES (1, 4)")
+        c.execute("INSERT INTO message_attachment_join VALUES (4, 1)")
+        # Row 5: text + image + sticker (sticker filtered out)
+        c.execute("INSERT INTO message (ROWID, guid, text, handle_id, reply_to_guid) VALUES (5, 'g5', '\ufffc #1 检查图片', 1, '')")
+        c.execute("INSERT INTO chat_message_join VALUES (1, 5)")
+        c.execute("INSERT INTO message_attachment_join VALUES (5, 2), (5, 3)")
+        c.commit()
+        c.close()
+
+        actions = await ntf.poll_owner_actions()
+        assert len(actions) == 2
+        assert actions[0].kind == "steer" and actions[0].text == ""
+        assert len(actions[0].attachments) == 1 and actions[0].attachments[0]["is_audio"] == "true"
+
+        assert actions[1].kind == "steer" and actions[1].list_index == 1 and actions[1].text == "检查图片"
+        assert len(actions[1].attachments) == 1 and actions[1].attachments[0]["name"] == "photo.png"
+
+    asyncio.run(_run())
+
+
+def test_command_classifier_and_engine_v03_parity(tmp_path: Path) -> None:
+    assert classify_owner_command("/help", notifier="imessage").kind == "help"  # type: ignore[union-attr]
+    assert classify_owner_command("帮助", notifier="imessage").kind == "help"  # type: ignore[union-attr]
+    assert classify_owner_command("/reset", notifier="imessage").kind == "reset_personal"  # type: ignore[union-attr]
+    np = classify_owner_command("/new check logs", notifier="imessage")
+    assert np is not None and np.kind == "new_personal" and np.text == "check logs"
+    idx_go = classify_owner_command("#2 go", notifier="imessage")
+    assert idx_go is not None and idx_go.kind == "approve_go" and idx_go.list_index == 2
+
+    persona_path = tmp_path / "ops_persona.md"
+    persona_path.write_text("Monitor critical gateway alarms calmly.", encoding="utf-8")
+    ch_ws = tmp_path / "ch_repo"
+    personal_ws = tmp_path / "personal_repo"
+    ch_ws.mkdir()
+    personal_ws.mkdir()
+
+    raw_cfg = WatchpostConfig(
+        workspace_dir=str(tmp_path),
+        channels=[
+            ChannelConfig(
+                id="ch_ops",
+                adapter="custom_chat",
+                external_chat_id="room_ops",
+                name="Ops",
+                chat_type=ChatType.p2p,
+                trigger_mode=TriggerMode.all,
+                autonomy_mode=AutonomyMode.diagnose_only,
+                persona_file=str(persona_path),
+                workspace_dir=str(ch_ws),
+            )
+        ],
+    )
+    resolved = resolve_config(raw_cfg)
+    assert "Monitor critical gateway alarms calmly." in resolved.channels[0].persona_text
+
+    async def _run() -> None:
+        store = WatchpostStore(tmp_path / "eng.db")
+        backend = _RecordingBackend("antigravity")
+        notifier = _RecordingNotifier()
+        whisper = _FakeWhisper()
+        engine = WatchpostEngine(
+            store,
+            backend,
+            config=EngineConfig(
+                workspace_dir=tmp_path,
+                language="zh",
+                personal_workspace_dir=personal_ws,
+                personal_session_ttl_s=3600,
+                ack_on_receive=True,
+            ),
+            notifiers=[notifier],
+            media_processor=whisper,
+        )
+        store.upsert_channel(resolved.channels[0])
+
+        # Trigger channel message -> uses channel.workspace_dir as cwd
+        created = await engine.ingest_messages(
+            "ch_ops",
+            [
+                NormalizedMessage(
+                    message_id="msg_1",
+                    channel_id="ch_ops",
+                    position=1,
+                    create_ms=int(time.time() * 1000),
+                    sender_id="u1",
+                    sender_name="Peer",
+                    clean_text="站控进程退出了",
+                )
+            ],
+        )
+        assert len(created) == 1
+        assert backend.starts[0][2] == ch_ws.resolve() or backend.starts[0][2] == ch_ws
+
+        # /help, status, list -> #1 follow-up
+        await engine.handle_owner_action(classify_owner_command("/help", notifier="imessage"))  # type: ignore[arg-type]
+        assert any("指令说明" in txt for txt in notifier.direct_replies)
+
+        await engine.handle_owner_action(classify_owner_command("status", notifier="imessage"))  # type: ignore[arg-type]
+        assert any("Watchpost 运行中" in txt for txt in notifier.direct_replies)
+
+        await engine.handle_owner_action(classify_owner_command("list", notifier="imessage"))  # type: ignore[arg-type]
+        assert store.get_kv("last_listed_thread_ids") == [created[0].id]
+
+        steered = await engine.handle_owner_action(
+            classify_owner_command("#1 再看一下配置", notifier="imessage")  # type: ignore[arg-type]
+        )
+        assert steered is not None and steered.id == created[0].id
+        assert backend.steers[-1][3] == ch_ws
+
+        # Audio attachment unquoted steer -> routes to Personal Direct Chat + Whisper transcribes audio
+        audio_path = tmp_path / "cmd.caf"
+        audio_path.write_bytes(b"AUDIO")
+        p1 = await engine.handle_owner_action(
+            classify_owner_command(
+                "",
+                notifier="imessage",
+                attachments=[{"path": str(audio_path), "name": "cmd.caf", "is_audio": "true"}],
+            )  # type: ignore[arg-type]
+        )
+        assert p1 is not None and p1.channel_id == "personal_direct"
+        assert len(whisper.calls) == 1
+        assert "四号站日志" in backend.starts[-1][1]
+        assert backend.starts[-1][2] == personal_ws
+
+        # Follow-up unquoted message within TTL steers the same personal thread
+        p2 = await engine.handle_owner_action(classify_owner_command("顺便看下磁盘空间", notifier="imessage"))  # type: ignore[arg-type]
+        assert p2 is not None and p2.id == p1.id
+
+        # personal_direct must not inflate channel metrics or fail poll_all_channels
+        assert store.get_metrics()["channels"] == 1
+        assert await engine.poll_all_channels() == 0
+
+        # /reset then unquoted message starts a brand-new personal thread
+        await engine.handle_owner_action(classify_owner_command("/reset", notifier="imessage"))  # type: ignore[arg-type]
+        p3 = await engine.handle_owner_action(classify_owner_command("新的问题", notifier="imessage"))  # type: ignore[arg-type]
+        assert p3 is not None and p3.id != p1.id
+
+        # /new <body?> starts a brand-new personal thread immediately
+        p4 = await engine.handle_owner_action(classify_owner_command("/new 检查分支", notifier="imessage"))  # type: ignore[arg-type]
+        assert p4 is not None and p4.id != p3.id
+
+    asyncio.run(_run())
+
+
+def test_build_engine_from_config_fallback_and_doctor(tmp_path: Path) -> None:
+    ext_script = tmp_path / "mock_plugin.py"
+    ext_script.write_text("#!/usr/bin/env python3\nimport sys; print('[]')\n", encoding="utf-8")
+    ext_script.chmod(ext_script.stat().st_mode | stat.S_IEXEC)
+
+    cfg_path = tmp_path / "config.json"
+    cfg = WatchpostConfig(
+        db_path=str(tmp_path / "wp.db"),
+        media_dir=str(tmp_path / "media"),
+        workspace_dir=str(tmp_path),
+        backend=BackendConfig(
+            preset="codex",
+            backup_preset="claude_code",
+            codex_sandbox="read-only",
+        ),
+        feishu=FeishuConfig(enabled=True, auth_mode="lark_cli", lark_bin=sys.executable),
+        imessage=IMessageConfig(
+            enabled=True,
+            owner_handle="+15550100",
+            personal_workspace_dir=str(tmp_path),
+            dry_run=True,
+        ),
+        external_adapters=[ExternalAdapterConfig(name="wechat", command=[str(ext_script)])],
+        channels=[
+            ChannelConfig(
+                id="wx_1",
+                adapter="wechat",
+                external_chat_id="peer_1",
+                name="Peer 1",
+                chat_type=ChatType.p2p,
+                trigger_mode=TriggerMode.all,
+            )
+        ],
+    )
+    save_config(cfg, cfg_path)
+    resolved = resolve_config(cfg)
+    engine = build_engine_from_config(resolved)
+    assert isinstance(engine.backend, FallbackBackend)
+    assert engine.backend.name == "codex+claude_code"
+    assert isinstance(engine.backend.primary, CLIAgentBackend)
+    assert engine.backend.primary._sandbox_mode == "read-only"
+    assert "wechat" in engine.adapters and "feishu" in engine.adapters
+    assert engine.config.personal_workspace_dir == tmp_path
+
+    # Check run_doctor with mock backend so PATH availability doesn't fail on CI
+    doc_cfg_path = tmp_path / "doc_config.json"
+    save_config(
+        cfg.model_copy(update={"backend": BackendConfig(preset="mock", backup_preset="")}),
+        doc_cfg_path,
+    )
+    report = run_doctor(doc_cfg_path)
+    assert report["ok"] is True
+    assert report["checks"]["adapter:wechat"]["ok"] is True
+    assert report["checks"]["feishu"]["ok"] is True

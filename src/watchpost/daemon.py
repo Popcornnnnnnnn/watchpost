@@ -13,8 +13,11 @@ from typing import Any
 
 import httpx
 
+from watchpost.adapters.external_plugin import ExternalCommandAdapter
 from watchpost.adapters.feishu import FeishuAdapter
+from watchpost.backends.antigravity import AntigravityBackend
 from watchpost.backends.cli_agent import CLI_PRESETS, CLIAgentBackend
+from watchpost.backends.fallback import FallbackBackend
 from watchpost.backends.mock import MockAgentBackend
 from watchpost.config import WatchpostConfig, default_config_path, load_config
 from watchpost.engine import WatchpostEngine
@@ -26,6 +29,46 @@ from watchpost.ports import AgentBackend, MediaProcessor
 from watchpost.store import WatchpostStore
 
 logger = logging.getLogger("watchpost.daemon")
+
+
+def _find_antigravity_bin(bin_name: str) -> str | None:
+    found = shutil.which(bin_name)
+    if found:
+        return found
+    candidate = Path.home() / ".gemini" / "antigravity" / "bin" / bin_name
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return None
+
+
+def _build_single_backend(
+    preset: str,
+    cfg: WatchpostConfig,
+    store: WatchpostStore,
+    *,
+    timeout_s: float,
+    use_custom_cmd: bool,
+) -> AgentBackend:
+    if preset == "mock":
+        return MockAgentBackend(language=cfg.language)
+    if preset == "antigravity":
+        return AntigravityBackend(
+            store,
+            agentapi_bin=cfg.backend.antigravity_bin,
+            model=cfg.backend.antigravity_model,
+            profile=cfg.backend.antigravity_profile,
+            timeout_s=timeout_s,
+        )
+    start_cmd = cfg.backend.start_cmd or None if use_custom_cmd else None
+    steer_cmd = cfg.backend.steer_cmd or None if use_custom_cmd else None
+    sandbox_mode = cfg.backend.codex_sandbox if preset == "codex" else ""
+    return CLIAgentBackend(
+        preset,
+        start_cmd=start_cmd,
+        steer_cmd=steer_cmd,
+        timeout_s=timeout_s,
+        sandbox_mode=sandbox_mode,
+    )
 
 
 def build_engine_from_config(
@@ -45,17 +88,31 @@ def build_engine_from_config(
             ffmpeg_bin=cfg.whisper.ffmpeg_bin,
         )
 
-    backend: AgentBackend
-    if cfg.backend.preset == "mock":
-        backend = MockAgentBackend(language=cfg.language)
-    else:
-        backend = CLIAgentBackend(
-            cfg.backend.preset,
-            start_cmd=cfg.backend.start_cmd or None,
-            steer_cmd=cfg.backend.steer_cmd or None,
-            timeout_s=cfg.backend.timeout_s,
+    primary = _build_single_backend(
+        cfg.backend.preset,
+        cfg,
+        store,
+        timeout_s=cfg.backend.timeout_s,
+        use_custom_cmd=True,
+    )
+    backup_name = cfg.backend.backup_preset.strip()
+    if backup_name and backup_name != cfg.backend.preset:
+        backup = _build_single_backend(
+            backup_name,
+            cfg,
+            store,
+            timeout_s=cfg.backend.backup_timeout_s,
+            use_custom_cmd=False,
         )
+        backend: AgentBackend = FallbackBackend(primary, backup)
+    else:
+        backend = primary
 
+    personal_ws = (
+        Path(cfg.imessage.personal_workspace_dir).expanduser()
+        if cfg.imessage.personal_workspace_dir
+        else None
+    )
     engine = WatchpostEngine(
         store,
         backend,
@@ -64,6 +121,9 @@ def build_engine_from_config(
             language=cfg.language,
             debounce_s=cfg.debounce_s,
             max_debounce_s=cfg.max_debounce_s,
+            personal_workspace_dir=personal_ws,
+            personal_session_ttl_s=cfg.imessage.personal_session_ttl_s,
+            ack_on_receive=cfg.imessage.ack_on_receive,
         ),
         media_processor=media_proc,
         media_dir=Path(cfg.media_dir).expanduser(),
@@ -72,14 +132,22 @@ def build_engine_from_config(
     has_feishu_channel = any(c.adapter == "feishu" and c.enabled for c in cfg.channels)
     if cfg.feishu.enabled or (
         has_feishu_channel
-        and ((cfg.feishu.app_id and cfg.feishu.app_secret) or cfg.feishu.user_access_token)
+        and (
+            cfg.feishu.auth_mode == "lark_cli"
+            or (cfg.feishu.app_id and cfg.feishu.app_secret)
+            or cfg.feishu.user_access_token
+        )
     ):
         engine.register_adapter(FeishuAdapter(cfg.feishu, client=feishu_client))
+
+    for ext_cfg in cfg.external_adapters:
+        if ext_cfg.name and ext_cfg.command:
+            engine.register_adapter(ExternalCommandAdapter(ext_cfg))
 
     if cfg.telegram.enabled and cfg.telegram.bot_token and cfg.telegram.owner_chat_id:
         engine.register_notifier(TelegramNotifier(cfg.telegram, client=telegram_client))
 
-    if cfg.imessage.enabled and cfg.imessage.owner_handle:
+    if cfg.imessage.enabled and (cfg.imessage.owner_handle or cfg.imessage.allowed_handles):
         engine.register_notifier(IMessageNotifier(cfg.imessage, send_fn=imessage_send_fn))
 
     for ch in cfg.channels:
@@ -115,6 +183,29 @@ class WatchpostDaemon:
         if seed_on_start:
             await self.engine.poll_all_channels(seed_if_empty=True, debounced=False)
 
+        api_server: Any = None
+        api_task: asyncio.Task[None] | None = None
+        if int(getattr(self.config, "api_port", 0) or 0) > 0:
+            import uvicorn
+
+            from watchpost.server import create_app
+
+            app = create_app(
+                self.engine.store.db_path,
+                backend=self.engine.backend,
+                config=self.engine.config,
+            )
+            uv_cfg = uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=int(self.config.api_port),
+                log_level="warning",
+                access_log=False,
+            )
+            api_server = uvicorn.Server(uv_cfg)
+            api_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+            api_task = asyncio.create_task(api_server.serve())
+
         chan_interval = max(1.0, float(self.config.poll_interval_s))
         owner_interval = max(0.5, float(self.config.owner_poll_interval_s))
         next_chan_at = 0.0
@@ -136,6 +227,13 @@ class WatchpostDaemon:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            if api_server is not None:
+                api_server.should_exit = True
+            if api_task is not None:
+                try:
+                    await asyncio.wait_for(api_task, timeout=3.0)
+                except Exception:
+                    api_task.cancel()
             await self.engine.flush_all()
             await self.close_resources()
 
@@ -147,6 +245,40 @@ class WatchpostDaemon:
                     await aclose()
                 except Exception:
                     pass
+
+
+def _check_backend_binary(
+    preset: str,
+    cfg: WatchpostConfig,
+    *,
+    is_primary: bool,
+) -> dict[str, Any]:
+    if preset == "mock":
+        return {"ok": True, "detail": "mock (offline testing)"}
+    if preset == "antigravity":
+        found = _find_antigravity_bin(cfg.backend.antigravity_bin)
+        hooks_file = Path.home() / ".gemini" / "config" / "hooks.json"
+        hook_wired = False
+        if hooks_file.is_file():
+            try:
+                hook_wired = "hook-stop" in hooks_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                hook_wired = False
+        hook_note = "stop_hook=registered" if hook_wired else "stop_hook=not_yet_wired"
+        return {
+            "ok": bool(found),
+            "detail": f"antigravity ({found or f'{cfg.backend.antigravity_bin} not found'}, {hook_note})",
+        }
+    cmd0 = (
+        cfg.backend.start_cmd[0]
+        if (is_primary and cfg.backend.start_cmd)
+        else (CLI_PRESETS.get(preset, {}).get("start") or [""])[0]
+    )
+    found = shutil.which(cmd0) if cmd0 else None
+    return {
+        "ok": bool(found),
+        "detail": f"{preset} ({found or f'{cmd0} not found on PATH'})",
+    }
 
 
 def run_doctor(cfg_path: Path | str | None = None) -> dict[str, Any]:
@@ -186,38 +318,48 @@ def run_doctor(cfg_path: Path | str | None = None) -> dict[str, Any]:
     ws = Path(cfg.workspace_dir).expanduser()
     checks["workspace"] = {"ok": ws.is_dir(), "detail": str(ws)}
 
-    # Agent CLI backend
-    if cfg.backend.preset == "mock":
-        checks["backend"] = {"ok": True, "detail": "mock (offline testing)"}
-    else:
-        cmd0 = (
-            cfg.backend.start_cmd[0]
-            if cfg.backend.start_cmd
-            else (CLI_PRESETS.get(cfg.backend.preset, {}).get("start") or [""])[0]
-        )
-        found = shutil.which(cmd0) if cmd0 else None
-        checks["backend"] = {
-            "ok": bool(found),
-            "detail": f"{cfg.backend.preset} ({found or f'{cmd0} not found on PATH'})",
-        }
+    # Agent CLI backend (+ optional backup backend)
+    checks["backend"] = _check_backend_binary(cfg.backend.preset, cfg, is_primary=True)
+    if cfg.backend.backup_preset.strip() and cfg.backend.backup_preset.strip() != cfg.backend.preset:
+        checks["backup_backend"] = _check_backend_binary(cfg.backend.backup_preset.strip(), cfg, is_primary=False)
 
     # Feishu adapter
     if cfg.feishu.enabled:
-        has_auth = bool(
-            (cfg.feishu.auth_mode == "user" and cfg.feishu.user_access_token)
-            or (cfg.feishu.app_id and cfg.feishu.app_secret)
-            or cfg.feishu.user_access_token
-        )
-        checks["feishu"] = {
-            "ok": has_auth,
-            "detail": (
-                f"configured (auth_mode={cfg.feishu.auth_mode}, owner_open_id={'set' if cfg.feishu.owner_open_id else 'unset'})"
-                if has_auth
-                else "enabled but missing app_id/app_secret or user_access_token"
-            ),
-        }
+        if cfg.feishu.auth_mode == "lark_cli":
+            lark_found = shutil.which(cfg.feishu.lark_bin)
+            checks["feishu"] = {
+                "ok": bool(lark_found),
+                "detail": (
+                    f"configured (auth_mode=lark_cli, bin={lark_found})"
+                    if lark_found
+                    else f"enabled with auth_mode=lark_cli but {cfg.feishu.lark_bin!r} not found on PATH"
+                ),
+            }
+        else:
+            has_auth = bool(
+                (cfg.feishu.auth_mode == "user" and cfg.feishu.user_access_token)
+                or (cfg.feishu.app_id and cfg.feishu.app_secret)
+                or cfg.feishu.user_access_token
+            )
+            checks["feishu"] = {
+                "ok": has_auth,
+                "detail": (
+                    f"configured (auth_mode={cfg.feishu.auth_mode}, owner_open_id={'set' if cfg.feishu.owner_open_id else 'unset'})"
+                    if has_auth
+                    else "enabled but missing app_id/app_secret or user_access_token"
+                ),
+            }
     else:
         checks["feishu"] = {"ok": True, "detail": "disabled"}
+
+    # External out-of-process adapters
+    for ext in cfg.external_adapters:
+        cmd0 = ext.command[0] if ext.command else ""
+        ext_ok = bool(cmd0 and (Path(cmd0).is_file() or shutil.which(cmd0)))
+        checks[f"adapter:{ext.name}"] = {
+            "ok": ext_ok,
+            "detail": f"command={cmd0}" if ext_ok else f"executable not found: {cmd0 or '<empty>'}",
+        }
 
     # Phone entrances
     if cfg.telegram.enabled:
@@ -232,11 +374,12 @@ def run_doctor(cfg_path: Path | str | None = None) -> dict[str, Any]:
     if cfg.imessage.enabled:
         chat_db = Path(cfg.imessage.chat_db_path).expanduser()
         is_mac = sys.platform == "darwin"
-        imsg_ok = bool(cfg.imessage.owner_handle and (cfg.imessage.dry_run or (is_mac and chat_db.is_file())))
+        has_handles = bool(cfg.imessage.owner_handle or cfg.imessage.allowed_handles)
+        imsg_ok = bool(has_handles and (cfg.imessage.dry_run or (is_mac and chat_db.is_file())))
         detail = (
-            f"configured (handle set, chat_db={'found' if chat_db.is_file() else 'missing'})"
-            if cfg.imessage.owner_handle
-            else "enabled but missing owner_handle"
+            f"configured (handles set, chat_db={'found' if chat_db.is_file() else 'missing'})"
+            if has_handles
+            else "enabled but missing owner_handle or allowed_handles"
         )
         checks["imessage"] = {"ok": imsg_ok, "detail": detail}
     else:

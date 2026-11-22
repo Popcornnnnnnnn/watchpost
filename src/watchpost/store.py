@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS channels (
     max_catchup_age_s INTEGER NOT NULL DEFAULT 7200,
     cursor_pos INTEGER NOT NULL DEFAULT 0,
     cursor_ms INTEGER NOT NULL DEFAULT 0,
+    workspace_dir TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
     updated_at REAL NOT NULL DEFAULT 0
 );
@@ -122,10 +123,36 @@ CREATE TABLE IF NOT EXISTS outbound_bindings (
     PRIMARY KEY(notifier, external_reply_token),
     FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS tracked_backend_refs (
+    backend TEXT NOT NULL,
+    backend_thread_ref TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(backend, backend_thread_ref)
+);
+
+CREATE TABLE IF NOT EXISTS backend_completions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backend TEXT NOT NULL,
+    backend_thread_ref TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    raw_text TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_backend_completions_ref_id ON backend_completions(backend, backend_thread_ref, id DESC);
+
+CREATE TABLE IF NOT EXISTS kv_state (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
 def _row_to_channel(row: sqlite3.Row) -> ChannelConfig:
+    ws_dir = row["workspace_dir"] if "workspace_dir" in row.keys() else ""
     return ChannelConfig(
         id=row["id"],
         adapter=row["adapter"],
@@ -146,6 +173,7 @@ def _row_to_channel(row: sqlite3.Row) -> ChannelConfig:
         max_catchup_age_s=int(row["max_catchup_age_s"]),
         cursor_pos=int(row["cursor_pos"]),
         cursor_ms=int(row["cursor_ms"]),
+        workspace_dir=str(ws_dir or ""),
         enabled=bool(row["enabled"]),
     )
 
@@ -203,6 +231,9 @@ class WatchpostStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
+            if "workspace_dir" not in cols:
+                conn.execute("ALTER TABLE channels ADD COLUMN workspace_dir TEXT NOT NULL DEFAULT ''")
 
     @contextlib.contextmanager
     def _connect(self):
@@ -228,8 +259,8 @@ class WatchpostStore:
                     id, adapter, external_chat_id, name, chat_type, trigger_mode, autonomy_mode,
                     ignore_bots, persona_text, whisper_prompt, same_sender_window_s, handoff_window_s,
                     background_window_s, group_sender_ttl_s, group_reply_ttl_s, session_ttl_s,
-                    max_catchup_age_s, cursor_pos, cursor_ms, enabled, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_catchup_age_s, cursor_pos, cursor_ms, workspace_dir, enabled, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     adapter=excluded.adapter,
                     external_chat_id=excluded.external_chat_id,
@@ -247,6 +278,7 @@ class WatchpostStore:
                     group_reply_ttl_s=excluded.group_reply_ttl_s,
                     session_ttl_s=excluded.session_ttl_s,
                     max_catchup_age_s=excluded.max_catchup_age_s,
+                    workspace_dir=excluded.workspace_dir,
                     enabled=excluded.enabled,
                     updated_at=excluded.updated_at
                 """,
@@ -270,6 +302,7 @@ class WatchpostStore:
                     channel.max_catchup_age_s,
                     channel.cursor_pos,
                     channel.cursor_ms,
+                    channel.workspace_dir,
                     int(channel.enabled),
                     now,
                 ),
@@ -566,7 +599,7 @@ class WatchpostStore:
 
     def get_metrics(self) -> dict[str, int]:
         with self._connect() as conn:
-            ch_count = int(conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0])
+            ch_count = int(conn.execute("SELECT COUNT(*) FROM channels WHERE adapter != 'owner_direct'").fetchone()[0])
             msg_count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
             th_count = int(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
             go_count = int(conn.execute("SELECT COUNT(*) FROM threads WHERE pending_go = 1").fetchone()[0])
@@ -578,3 +611,108 @@ class WatchpostStore:
             "awaiting_go": go_count,
             "drafts_copied": copied_count,
         }
+
+    def register_backend_ref(self, backend: str, ref: str) -> None:
+        if not backend or not ref:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tracked_backend_refs (backend, backend_thread_ref, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(backend, backend_thread_ref) DO NOTHING
+                """,
+                (backend, ref, time.time()),
+            )
+
+    def is_tracked_backend_ref(self, backend: str, ref: str) -> bool:
+        if not backend or not ref:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM tracked_backend_refs WHERE backend = ? AND backend_thread_ref = ? LIMIT 1",
+                (backend, ref),
+            ).fetchone()
+        return row is not None
+
+    def record_backend_completion(
+        self,
+        backend: str,
+        ref: str,
+        *,
+        raw_text: str,
+        error: str = "",
+        digest: str = "",
+    ) -> int:
+        import hashlib
+
+        eff_digest = digest or hashlib.sha256(f"{raw_text}\n--ERR--\n{error}".encode("utf-8")).hexdigest()
+        with self._connect() as conn:
+            prev = conn.execute(
+                """
+                SELECT id, digest FROM backend_completions
+                WHERE backend = ? AND backend_thread_ref = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (backend, ref),
+            ).fetchone()
+            if prev and prev["digest"] == eff_digest:
+                return 0
+            cur = conn.execute(
+                """
+                INSERT INTO backend_completions (backend, backend_thread_ref, digest, raw_text, error, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (backend, ref, eff_digest, raw_text, error, time.time()),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_latest_completion_id(self, backend: str, ref: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM backend_completions WHERE backend = ? AND backend_thread_ref = ?",
+                (backend, ref),
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def get_new_completion(self, backend: str, ref: str, *, after_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, raw_text, error, digest, created_at
+                FROM backend_completions
+                WHERE backend = ? AND backend_thread_ref = ? AND id > ?
+                ORDER BY id ASC LIMIT 1
+                """,
+                (backend, ref, int(after_id)),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row["id"]),
+            "raw_text": str(row["raw_text"] or ""),
+            "error": str(row["error"] or ""),
+            "digest": str(row["digest"] or ""),
+            "created_at": float(row["created_at"] or 0.0),
+        }
+
+    def get_kv(self, key: str, default: Any = None) -> Any:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value_json FROM kv_state WHERE key = ? LIMIT 1", (key,)).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row["value_json"])
+        except Exception:
+            return default
+
+    def set_kv(self, key: str, value: Any) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO kv_state (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+                """,
+                (key, json.dumps(value, ensure_ascii=False), time.time()),
+            )

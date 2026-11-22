@@ -25,6 +25,7 @@ from watchpost.models import (
     ThreadRecord,
     ThreadStatus,
     TriageMode,
+    TriggerMode,
 )
 from watchpost.ports import AgentBackend, ChannelAdapter, MediaProcessor, NotifierAdapter
 from watchpost.prompts import build_new_thread_prompt, build_owner_steer_prompt, build_steer_prompt
@@ -309,6 +310,7 @@ class WatchpostEngine:
             is_steer=(matched_thread is not None),
         )
 
+        target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
         if matched_thread is not None:
             steer_msg = build_steer_prompt(
                 channel,
@@ -321,7 +323,7 @@ class WatchpostEngine:
                 matched_thread.backend_thread_ref,
                 title,
                 steer_msg,
-                cwd=self.config.workspace_dir,
+                cwd=target_cwd,
                 channel=channel,
             )
             thread_id = matched_thread.id
@@ -341,7 +343,7 @@ class WatchpostEngine:
             backend_ref, result = await self.backend.start_thread(
                 title,
                 prompt,
-                cwd=self.config.workspace_dir,
+                cwd=target_cwd,
                 channel=channel,
             )
             thread_id = f"th_{uuid.uuid4().hex[:12]}"
@@ -432,6 +434,7 @@ class WatchpostEngine:
                 raw_text=owner_message,
             )
         )
+        target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
         steer_prompt = build_owner_steer_prompt(
             owner_message,
             approved_go=approved_go,
@@ -441,7 +444,7 @@ class WatchpostEngine:
             thread.backend_thread_ref,
             f"[{channel.adapter}] {channel.name}: {thread.title}",
             steer_prompt,
-            cwd=self.config.workspace_dir,
+            cwd=target_cwd,
             channel=channel,
         )
         all_bubbles, draft_reply = format_completion_bubbles(
@@ -473,24 +476,251 @@ class WatchpostEngine:
         await self._notify_completion_all(channel, updated, all_bubbles)
         return updated
 
+    def _format_owner_action_message(
+        self,
+        action: OwnerAction,
+        *,
+        channel: ChannelConfig | None = None,
+    ) -> str:
+        parts: list[str] = [action.text.strip()] if action.text.strip() else []
+        prompt_hint = channel.whisper_prompt if channel else ""
+        for att in action.attachments:
+            att_path = str(att.get("path") or "").strip()
+            name = str(att.get("name") or (Path(att_path).name if att_path else "attachment"))
+            is_audio = att.get("is_audio") == "true"
+            if is_audio and att_path:
+                if self.media_processor is not None and Path(att_path).is_file():
+                    transcript, err = self.media_processor.transcribe_audio(
+                        Path(att_path),
+                        prompt=prompt_hint,
+                        language=self.config.language,
+                    )
+                    if transcript.strip():
+                        parts.append(f"[Voice transcript ({name})]: {transcript.strip()}")
+                    else:
+                        parts.append(f"[Audio attachment ({name}): {att_path} (transcription unavailable: {err})]")
+                else:
+                    parts.append(f"[Audio attachment ({name}): {att_path}]")
+            elif att_path:
+                parts.append(f"[Image/File attachment ({name}): {att_path}]")
+        return "\n".join(p for p in parts if p).strip()
+
+    def _ensure_personal_channel(self) -> ChannelConfig:
+        ws = (
+            str(self.config.personal_workspace_dir.expanduser())
+            if self.config.personal_workspace_dir is not None
+            else str(self.config.workspace_dir)
+        )
+        existing = self.store.get_channel("personal_direct")
+        if existing is not None and existing.workspace_dir == ws:
+            return existing
+        is_zh = self.config.language.lower().startswith("zh")
+        ch = ChannelConfig(
+            id="personal_direct",
+            adapter="owner_direct",
+            external_chat_id="owner",
+            name="个人直聊" if is_zh else "Personal Assistant",
+            chat_type=ChatType.p2p,
+            trigger_mode=TriggerMode.all,
+            autonomy_mode=AutonomyMode.auto_fix,
+            workspace_dir=ws,
+            session_ttl_s=self.config.personal_session_ttl_s,
+            enabled=False,
+        )
+        return self.store.upsert_channel(ch)
+
+    async def _handle_personal_direct(
+        self,
+        action: OwnerAction,
+        owner_message: str,
+        *,
+        force_new: bool = False,
+    ) -> ThreadRecord | None:
+        is_zh = self.config.language.lower().startswith("zh")
+        ch = self._ensure_personal_channel()
+        target_cwd = Path(ch.workspace_dir).expanduser() if ch.workspace_dir else self.config.workspace_dir
+        ttl_s = max(60, int(self.config.personal_session_ttl_s))
+        active_id = str(self.store.get_kv("personal_direct_active_thread_id", "") or "")
+        reset_at = float(self.store.get_kv("personal_direct_reset_at", 0.0) or 0.0)
+        now_ts = time.time()
+
+        active_thread: ThreadRecord | None = None
+        if not force_new and active_id:
+            candidate = self.store.get_thread(active_id)
+            if (
+                candidate is not None
+                and candidate.channel_id == ch.id
+                and candidate.status != ThreadStatus.error
+                and candidate.updated_at >= reset_at
+                and (now_ts - candidate.updated_at) <= ttl_s
+            ):
+                active_thread = candidate
+
+        topic = (owner_message.splitlines()[0] if owner_message else "Personal chat")[:36]
+        title = f"[direct] {ch.name}: {topic}"
+
+        if active_thread is not None:
+            self.store.add_thread_event(
+                ThreadEvent(thread_id=active_thread.id, kind="owner_steer", raw_text=owner_message)
+            )
+            prompt = (
+                f"主人通过 {action.notifier} 发来后续直聊消息：\n{owner_message}\n\n"
+                "请直接、简洁地回答或处理，适合手机端阅读；无需替外部同事拟定回复草稿。"
+                if is_zh
+                else f"The owner sent a follow-up direct message via {action.notifier}:\n{owner_message}\n\n"
+                "Reply concisely and directly for mobile reading; no external colleague draft reply is needed."
+            )
+            result = await self.backend.steer_thread(
+                active_thread.backend_thread_ref,
+                f"[direct] {ch.name}: {active_thread.title}",
+                prompt,
+                cwd=target_cwd,
+                channel=ch,
+            )
+            all_bubbles, draft_reply = format_completion_bubbles(
+                ch.name,
+                result.raw_text,
+                error=result.error,
+                language=self.config.language,
+            )
+            updated = self.store.create_or_update_thread(
+                active_thread.model_copy(
+                    update={
+                        "status": ThreadStatus.error if result.error else ThreadStatus.completed,
+                        "pending_go": False,
+                        "updated_at": time.time(),
+                    }
+                )
+            )
+            self.store.add_thread_event(
+                ThreadEvent(
+                    thread_id=updated.id,
+                    kind="error" if result.error else "agent_reply",
+                    summary_bubbles=result.summary_bubbles or all_bubbles[:1],
+                    suggested_reply=draft_reply or result.suggested_reply,
+                    needs_attention=result.needs_attention,
+                    raw_text=result.raw_text,
+                )
+            )
+            self.store.set_kv("personal_direct_active_thread_id", updated.id)
+            await self._notify_completion_all(ch, updated, all_bubbles)
+            return updated
+
+        preview = ThreadRecord(
+            id="pending",
+            channel_id=ch.id,
+            backend=self.backend.name,
+            backend_thread_ref="",
+            sender_id=action.notifier,
+            sender_name="Owner",
+            title=topic,
+        )
+        start_tokens: list[tuple[str, str]] = []
+        if self.config.ack_on_receive:
+            start_tokens = await self._notify_start_all(ch, preview, topic, is_steer=False)
+
+        prompt = (
+            f"主人通过 {action.notifier} 发来直聊消息：\n{owner_message}\n\n"
+            f"当前工作区：{target_cwd}\n"
+            "请直接检查并简洁回答（适合手机端阅读，多段控制在短句内）；"
+            "这是主人自己的直聊会话，不需要替外部同事拟定回复草稿。"
+            if is_zh
+            else f"The owner sent a direct message via {action.notifier}:\n{owner_message}\n\n"
+            f"Workspace: {target_cwd}\n"
+            "Investigate and reply concisely for mobile reading; this is a direct owner chat so no external colleague draft reply is needed."
+        )
+        backend_ref, result = await self.backend.start_thread(
+            title,
+            prompt,
+            cwd=target_cwd,
+            channel=ch,
+        )
+        all_bubbles, draft_reply = format_completion_bubbles(
+            ch.name,
+            result.raw_text,
+            error=result.error,
+            language=self.config.language,
+        )
+        record = ThreadRecord(
+            id=f"th_{uuid.uuid4().hex[:12]}",
+            channel_id=ch.id,
+            backend=self.backend.name,
+            backend_thread_ref=backend_ref or f"personal_{uuid.uuid4().hex[:8]}",
+            sender_id=action.notifier,
+            sender_name="Owner",
+            title=topic,
+            status=ThreadStatus.error if result.error else ThreadStatus.completed,
+            triage_mode=result.triage_mode,
+            pending_go=False,
+            created_at=now_ts,
+            updated_at=time.time(),
+        )
+        record = self.store.create_or_update_thread(record)
+        self._bind_tokens(record.id, start_tokens)
+        self.store.add_thread_event(ThreadEvent(thread_id=record.id, kind="inbound", raw_text=owner_message))
+        self.store.add_thread_event(
+            ThreadEvent(
+                thread_id=record.id,
+                kind="error" if result.error else "agent_reply",
+                summary_bubbles=result.summary_bubbles or all_bubbles[:1],
+                suggested_reply=draft_reply or result.suggested_reply,
+                needs_attention=result.needs_attention,
+                raw_text=result.raw_text,
+            )
+        )
+        self.store.set_kv("personal_direct_active_thread_id", record.id)
+        await self._notify_completion_all(ch, record, all_bubbles)
+        return record
+
     async def handle_owner_action(self, action: OwnerAction) -> ThreadRecord | None:
         """Dispatch an owner command received from Telegram, iMessage, or another phone entrance."""
         is_zh = self.config.language.lower().startswith("zh")
+        if action.kind == "help":
+            msg = (
+                "Watchpost 指令说明：\n"
+                "- status / 状态：查看运行状态与待确认会话\n"
+                "- list / 列表：查看最近 5 条会话（支持 #1 / #2 引用）\n"
+                "- #N 内容 或 #N go：追问或批准列表第 N 条会话\n"
+                "- go / 执行：批准最近一条待确认会话执行修复\n"
+                "- /new [内容]：开启新的个人直聊会话\n"
+                "- /reset：重置个人直聊上下文\n"
+                "- 直接发文字/语音/图片：自动进行个人直聊或按回复引用追问"
+                if is_zh
+                else "Watchpost commands:\n"
+                "- status: view running status & pending approvals\n"
+                "- list: show recent threads (#1..#5)\n"
+                "- #N <text> or #N go: steer or approve listed thread N\n"
+                "- go / approve: approve latest pending thread\n"
+                "- /new [text]: start a fresh personal direct chat\n"
+                "- /reset: clear personal direct chat context\n"
+                "- direct text/voice/image: personal chat or quote-reply steer"
+            )
+            await self._send_owner_reply(action.notifier, msg)
+            return None
+
         if action.kind == "status":
             metrics = self.store.get_metrics()
             pending = [t for t in self.store.list_threads(limit=20) if t.pending_go]
+            personal_id = str(self.store.get_kv("personal_direct_active_thread_id", "") or "")
+            personal_th = self.store.get_thread(personal_id) if personal_id else None
             if is_zh:
                 msg = (
-                    f"Watchpost 运行中：监控 {metrics['channels']} 个通道，"
+                    f"Watchpost 运行中（{self.backend.name}）：监控 {metrics['channels']} 个通道，"
                     f"累计 {metrics['threads']} 个会话，{metrics['awaiting_go']} 个待确认执行（go）。"
                 )
                 if pending:
-                    msg += f" 最新待确认：{pending[0].title}"
+                    msg += "\n待确认：" + "；".join(t.title for t in pending[:3])
+                if personal_th is not None:
+                    msg += f"\n个人直聊：{personal_th.title} [{personal_th.status.value}]"
             else:
                 msg = (
-                    f"Watchpost running: {metrics['channels']} channels, "
+                    f"Watchpost running ({self.backend.name}): {metrics['channels']} channels, "
                     f"{metrics['threads']} threads, {metrics['awaiting_go']} awaiting go."
                 )
+                if pending:
+                    msg += "\nPending go: " + "; ".join(t.title for t in pending[:3])
+                if personal_th is not None:
+                    msg += f"\nPersonal chat: {personal_th.title} [{personal_th.status.value}]"
             await self._send_owner_reply(action.notifier, msg)
             return None
 
@@ -502,6 +732,7 @@ class WatchpostEngine:
                     "当前暂无历史会话。" if is_zh else "No threads yet.",
                 )
                 return None
+            self.store.set_kv("last_listed_thread_ids", [th.id for th in threads])
             lines = ["最近会话：" if is_zh else "Recent threads:"]
             for idx, th in enumerate(threads, start=1):
                 tag = "待go" if th.pending_go else th.status.value
@@ -509,17 +740,72 @@ class WatchpostEngine:
             await self._send_owner_reply(action.notifier, "\n".join(lines))
             return None
 
+        if action.kind == "reset_personal":
+            self.store.set_kv("personal_direct_active_thread_id", "")
+            self.store.set_kv("personal_direct_reset_at", time.time())
+            await self._send_owner_reply(
+                action.notifier,
+                "已重置个人直聊上下文，下条消息将开启新会话。"
+                if is_zh
+                else "Reset personal direct chat context; next message starts fresh.",
+            )
+            return None
+
+        if action.kind == "new_personal":
+            self.store.set_kv("personal_direct_active_thread_id", "")
+            self.store.set_kv("personal_direct_reset_at", time.time())
+            formatted = self._format_owner_action_message(action)
+            if not formatted:
+                await self._send_owner_reply(
+                    action.notifier,
+                    "已开启新的个人直聊会话，请发送问题。"
+                    if is_zh
+                    else "Started a new personal direct chat; send your prompt.",
+                )
+                return None
+            return await self._handle_personal_direct(action, formatted, force_new=True)
+
         target_id = action.thread_id.strip()
+        if not target_id and action.list_index > 0:
+            listed = self.store.get_kv("last_listed_thread_ids", [])
+            if isinstance(listed, list) and 1 <= action.list_index <= len(listed):
+                target_id = str(listed[action.list_index - 1])
+            elif not listed:
+                threads = self.store.list_threads(limit=max(5, action.list_index))
+                if 1 <= action.list_index <= len(threads):
+                    target_id = threads[action.list_index - 1].id
+            if not target_id:
+                await self._send_owner_reply(
+                    action.notifier,
+                    (
+                        f"未找到列表第 {action.list_index} 条会话，请先发送 list 查看。"
+                        if is_zh
+                        else f"No thread #{action.list_index} found; send list first."
+                    ),
+                )
+                return None
+
         if not target_id and action.reply_token:
             target_id = self.store.resolve_outbound(action.notifier, action.reply_token)
+
         if not target_id and action.kind == "approve_go":
             for th in self.store.list_threads(limit=20):
                 if th.pending_go:
                     target_id = th.id
                     break
-        if not target_id:
+            if not target_id:
+                recent = self.store.list_threads(limit=1)
+                target_id = recent[0].id if recent else ""
+
+        if not target_id and action.kind == "steer":
+            has_personal_ws = self.config.personal_workspace_dir is not None
             recent = self.store.list_threads(limit=1)
-            target_id = recent[0].id if recent else ""
+            if has_personal_ws or not recent:
+                formatted = self._format_owner_action_message(action)
+                if not formatted:
+                    return None
+                return await self._handle_personal_direct(action, formatted, force_new=False)
+            target_id = recent[0].id
 
         if not target_id:
             await self._send_owner_reply(
@@ -528,15 +814,17 @@ class WatchpostEngine:
             )
             return None
 
+        target_thread = self.store.get_thread(target_id)
+        target_ch = self.store.get_channel(target_thread.channel_id) if target_thread else None
         approved_go = action.kind == "approve_go"
-        steer_text = action.text or ("go" if approved_go else "")
+        steer_text = self._format_owner_action_message(action, channel=target_ch) or ("go" if approved_go else "")
         return await self.steer_from_owner(target_id, steer_text, approved_go=approved_go)
 
     async def poll_all_channels(self, *, seed_if_empty: bool = False, debounced: bool = True) -> int:
         """Poll every enabled channel whose adapter is registered; return channels polled cleanly."""
         polled = 0
         for ch in self.store.list_channels():
-            if not ch.enabled:
+            if not ch.enabled or ch.adapter == "owner_direct":
                 continue
             adapter = self.adapters.get(ch.adapter)
             if adapter is None:

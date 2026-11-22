@@ -92,6 +92,36 @@ class IMessageNotifier:
 
     name = "imessage"
 
+    @staticmethod
+    def _handle_variants(handle: str) -> set[str]:
+        raw = (handle or "").strip()
+        if not raw:
+            return set()
+        variants = {raw.lower()}
+        if "@" in raw:
+            return variants
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if digits:
+            variants.add(digits)
+            variants.add(f"+{digits}")
+            if len(digits) == 13 and digits.startswith("86"):
+                variants.add(digits[2:])
+                variants.add(f"+{digits[2:]}")
+        return variants
+
+    @classmethod
+    def _build_allowed_handles(cls, config: IMessageConfig) -> set[str]:
+        allowed: set[str] = set()
+        for item in [config.owner_handle, *getattr(config, "allowed_handles", [])]:
+            allowed.update(cls._handle_variants(item))
+        return allowed
+
+    def _row_matches_allowed(self, handle_id: str | None, chat_identifier: str | None) -> bool:
+        if not self._allowed_handles:
+            return False
+        candidates = self._handle_variants(handle_id or "") | self._handle_variants(chat_identifier or "")
+        return bool(candidates & self._allowed_handles)
+
     def __init__(
         self,
         config: IMessageConfig,
@@ -100,6 +130,7 @@ class IMessageNotifier:
     ) -> None:
         self._config = config
         self._handle = config.owner_handle.strip()
+        self._allowed_handles = self._build_allowed_handles(config)
         self._db_path = Path(config.chat_db_path).expanduser()
         self._send_fn = send_fn or _default_send_applescript
         self._last_rowid: int | None = None
@@ -229,8 +260,74 @@ class IMessageNotifier:
                 tokens.append(tok)
         return tokens
 
+    @staticmethod
+    def _has_table(conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(r[1]) for r in rows}
+
+    def _fetch_message_attachments(
+        self,
+        conn: sqlite3.Connection,
+        message_rowid: int,
+        *,
+        is_audio_message: bool = False,
+        att_cols: set[str] | None = None,
+    ) -> list[dict[str, str]]:
+        if not att_cols or "filename" not in att_cols:
+            return []
+        mime_expr = "a.mime_type" if "mime_type" in att_cols else "'' AS mime_type"
+        uti_expr = "a.uti" if "uti" in att_cols else "'' AS uti"
+        name_expr = "a.transfer_name" if "transfer_name" in att_cols else "'' AS transfer_name"
+        sticker_expr = "a.is_sticker" if "is_sticker" in att_cols else "0 AS is_sticker"
+        rows = conn.execute(
+            f"""
+            SELECT a.filename, {mime_expr}, {uti_expr}, {name_expr}, {sticker_expr}
+            FROM message_attachment_join maj
+            JOIN attachment a ON a.ROWID = maj.attachment_id
+            WHERE maj.message_id = ?
+            ORDER BY a.ROWID ASC
+            """,
+            (message_rowid,),
+        ).fetchall()
+        out: list[dict[str, str]] = []
+        audio_exts = {".caf", ".m4a", ".aac", ".amr", ".wav", ".mp3", ".ogg"}
+        for r in rows:
+            if int(r["is_sticker"] or 0) != 0:
+                continue
+            raw_path = str(r["filename"] or "").strip()
+            if not raw_path:
+                continue
+            resolved = str(Path(raw_path).expanduser()) if raw_path.startswith("~") else raw_path
+            mime_type = str(r["mime_type"] or "").strip()
+            uti = str(r["uti"] or "").strip()
+            name = str(r["transfer_name"] or "").strip() or Path(resolved).name
+            is_audio = (
+                is_audio_message
+                or mime_type.startswith("audio/")
+                or "audio" in uti.lower()
+                or Path(resolved).suffix.lower() in audio_exts
+            )
+            out.append(
+                {
+                    "path": resolved,
+                    "mime_type": mime_type,
+                    "uti": uti,
+                    "name": name,
+                    "is_audio": "true" if is_audio else "false",
+                }
+            )
+        return out
+
     async def poll_owner_actions(self) -> list[OwnerAction]:
-        if not self._handle:
+        if not self._allowed_handles:
             return []
         conn = self._open_chat_db_ro()
         if conn is None:
@@ -244,36 +341,85 @@ class IMessageNotifier:
             cols = self._message_columns(conn)
             has_attr = "attributedBody" in cols
             has_thread_guid = "thread_originator_guid" in cols
+            has_reply_to = "reply_to_guid" in cols
+            has_assoc = "associated_message_type" in cols
+            has_item_type = "item_type" in cols
+            has_retracted = "date_retracted" in cols
+            has_is_audio = "is_audio_message" in cols
+
             attr_expr = "m.attributedBody" if has_attr else "NULL AS attributedBody"
-            reply_expr = "m.thread_originator_guid" if has_thread_guid else "'' AS thread_originator_guid"
+            thread_expr = "m.thread_originator_guid" if has_thread_guid else "'' AS thread_originator_guid"
+            reply_expr = "m.reply_to_guid" if has_reply_to else "'' AS reply_to_guid"
+            audio_expr = "m.is_audio_message" if has_is_audio else "0 AS is_audio_message"
+
+            filters = ["m.ROWID > ?"]
+            if has_assoc:
+                filters.append("COALESCE(m.associated_message_type, 0) = 0")
+            if has_item_type:
+                filters.append("COALESCE(m.item_type, 0) = 0")
+            if has_retracted:
+                filters.append("COALESCE(m.date_retracted, 0) = 0")
+            where_sql = " AND ".join(filters)
+
+            has_attachments = (
+                self._has_table(conn, "message_attachment_join")
+                and self._has_table(conn, "attachment")
+            )
+            att_cols = self._table_columns(conn, "attachment") if has_attachments else set()
 
             rows = conn.execute(
                 f"""
-                SELECT m.ROWID, m.text, m.is_from_me, {attr_expr}, {reply_expr}
+                SELECT m.ROWID, m.text, m.is_from_me, {attr_expr}, {thread_expr}, {reply_expr},
+                       {audio_expr}, h.id AS handle_id, c.chat_identifier AS chat_identifier
                 FROM message m
                 LEFT JOIN handle h ON m.handle_id = h.ROWID
                 LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
                 LEFT JOIN chat c ON c.ROWID = cmj.chat_id
-                WHERE m.ROWID > ?
-                  AND (LOWER(COALESCE(h.id, '')) = LOWER(?) OR LOWER(COALESCE(c.chat_identifier, '')) = LOWER(?))
+                WHERE {where_sql}
                 ORDER BY m.ROWID ASC
                 """,
-                (self._last_rowid, self._handle, self._handle),
+                (self._last_rowid,),
             ).fetchall()
 
             actions: list[OwnerAction] = []
             max_seen = self._last_rowid
+            seen_rowids: set[int] = set()
             for r in rows:
                 rowid = int(r["ROWID"])
                 if rowid > max_seen:
                     max_seen = rowid
-                body = (r["text"] or "").strip() or extract_attributed_body_text(r["attributedBody"])
-                if not body:
+                if rowid in seen_rowids:
                     continue
-                if bool(r["is_from_me"]) and self._consume_echo(body):
+                if not self._row_matches_allowed(r["handle_id"], r["chat_identifier"]):
                     continue
-                reply_token = str(r["thread_originator_guid"] or "").strip()
-                action = classify_owner_command(body, notifier=self.name, reply_token=reply_token)
+                seen_rowids.add(rowid)
+
+                raw_body = (r["text"] or "").strip() or extract_attributed_body_text(r["attributedBody"])
+                body = raw_body.replace("\ufffc", "").strip()
+                attachments = (
+                    self._fetch_message_attachments(
+                        conn,
+                        rowid,
+                        is_audio_message=bool(r["is_audio_message"]),
+                        att_cols=att_cols,
+                    )
+                    if has_attachments
+                    else []
+                )
+                if not body and not attachments:
+                    continue
+                if body and not attachments and bool(r["is_from_me"]) and self._consume_echo(body):
+                    continue
+                reply_token = (
+                    str(r["thread_originator_guid"] or "").strip()
+                    or str(r["reply_to_guid"] or "").strip()
+                )
+                action = classify_owner_command(
+                    body,
+                    notifier=self.name,
+                    reply_token=reply_token,
+                    attachments=attachments,
+                )
                 if action is not None:
                     actions.append(action)
             self._last_rowid = max_seen

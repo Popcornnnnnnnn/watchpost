@@ -7,6 +7,7 @@ import asyncio
 import json
 import re
 import signal
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -14,10 +15,13 @@ from typing import Any
 import uvicorn
 
 from watchpost import __version__
+from watchpost.adapters.external_plugin import ExternalCommandAdapter
 from watchpost.adapters.feishu import FeishuAdapter
 from watchpost.adapters.local_sandbox import LocalSandboxAdapter
+from watchpost.backends.antigravity import handle_stop_hook_payload
 from watchpost.backends.mock import MockAgentBackend
 from watchpost.config import (
+    DEFAULT_DB_PATH,
     WatchpostConfig,
     default_config_path,
     init_config_file,
@@ -76,8 +80,10 @@ async def _run_demo_into(db_path: Path, *, language: str) -> int:
     return 0
 
 
-async def _run_daemon_cli(config_path: Path, *, once: bool, seed: bool) -> int:
+async def _run_daemon_cli(config_path: Path, *, once: bool, seed: bool, api_port: int = 0) -> int:
     cfg = load_config(config_path)
+    if api_port > 0:
+        cfg = cfg.model_copy(update={"api_port": api_port})
     engine = build_engine_from_config(cfg)
     daemon = WatchpostDaemon(engine, cfg)
     if once:
@@ -99,6 +105,35 @@ async def _run_daemon_cli(config_path: Path, *, once: bool, seed: bool) -> int:
     return 0
 
 
+def _handle_hook_stop(args: argparse.Namespace) -> int:
+    raw = sys.stdin.read().strip()
+    if not raw:
+        return 0
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+
+    db_arg = str(getattr(args, "db", "") or "").strip()
+    cfg_arg = str(getattr(args, "config", "") or "").strip()
+    if db_arg:
+        db_path = Path(db_arg).expanduser()
+    elif cfg_arg:
+        db_path = Path(load_config(Path(cfg_arg).expanduser()).db_path).expanduser()
+    else:
+        default_cfg = default_config_path()
+        if default_cfg.is_file():
+            db_path = Path(load_config(default_cfg).db_path).expanduser()
+        else:
+            db_path = Path(DEFAULT_DB_PATH).expanduser()
+
+    store = WatchpostStore(db_path)
+    handle_stop_hook_payload(payload, store=store)
+    return 0
+
+
 def _handle_channels(args: argparse.Namespace) -> int:
     cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
     action = args.channels_cmd
@@ -116,22 +151,30 @@ def _handle_channels(args: argparse.Namespace) -> int:
 
     if action == "list-remote":
         cfg = load_config(cfg_path)
-        if args.adapter != "feishu":
-            print(f"Remote chat discovery is currently supported for 'feishu' (got {args.adapter!r}).")
+        adapter_obj: Any = None
+        if args.adapter == "feishu":
+            adapter_obj = FeishuAdapter(cfg.feishu)
+        else:
+            ext_cfg = next((e for e in cfg.external_adapters if e.name == args.adapter), None)
+            if ext_cfg is not None:
+                adapter_obj = ExternalCommandAdapter(ext_cfg)
+        if adapter_obj is None:
+            print(f"Unsupported or unconfigured adapter for remote discovery: {args.adapter!r}.")
             return 2
 
         async def _discover() -> list[dict[str, str]]:
-            adapter = FeishuAdapter(cfg.feishu)
             try:
-                return await adapter.list_available_chats()
+                return await adapter_obj.list_available_chats()
             finally:
-                await adapter.aclose()
+                aclose = getattr(adapter_obj, "aclose", None)
+                if callable(aclose):
+                    await aclose()
 
         chats = asyncio.run(_discover())
         if args.json:
             print(json.dumps(chats, indent=2, ensure_ascii=False))
         elif not chats:
-            print("No chats returned by Feishu.")
+            print(f"No chats returned by {args.adapter}.")
         else:
             for item in chats:
                 print(f"- {item['external_chat_id']} [{item['chat_type']}] {item['name']}")
@@ -150,6 +193,7 @@ def _handle_channels(args: argparse.Namespace) -> int:
             autonomy_mode=AutonomyMode(args.autonomy),
             persona_text=args.persona,
             whisper_prompt=args.whisper_prompt,
+            workspace_dir=args.workspace,
         )
         updated = [c for c in cfg.channels if c.id != cid]
         updated.append(new_ch)
@@ -192,6 +236,11 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--config", default="", help="Path to config.json")
     p_run.add_argument("--once", action="store_true", help="Run a single poll + owner-action cycle and exit")
     p_run.add_argument("--seed", action="store_true", help="Seed uninitialized cursors without triggering old backlog")
+    p_run.add_argument("--api-port", type=int, default=0, help="Optional localhost JSON API port override")
+
+    p_hook = sub.add_parser("hook-stop", help="Consume Antigravity Stop hook JSON on stdin into SQLite")
+    p_hook.add_argument("--config", default="", help="Path to config.json")
+    p_hook.add_argument("--db", default="", help="Direct path to Watchpost SQLite DB")
 
     p_doc = sub.add_parser("doctor", help="Verify config, storage, agent CLI, and phone/chat setup")
     p_doc.add_argument("--config", default="", help="Path to config.json")
@@ -224,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_ch_add.add_argument("--persona", default="")
     p_ch_add.add_argument("--whisper-prompt", default="")
+    p_ch_add.add_argument("--workspace", default="", help="Optional per-channel workspace directory")
 
     p_ch_rm = ch_sub.add_parser("remove", help="Remove an enrolled channel from config.json")
     p_ch_rm.add_argument("--config", default="", help="Path to config.json")
@@ -313,7 +363,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
-        return asyncio.run(_run_daemon_cli(cfg_path, once=args.once, seed=args.seed))
+        return asyncio.run(
+            _run_daemon_cli(
+                cfg_path,
+                once=args.once,
+                seed=args.seed,
+                api_port=args.api_port,
+            )
+        )
+
+    if args.command == "hook-stop":
+        return _handle_hook_stop(args)
 
     if args.command == "doctor":
         cfg_path = Path(args.config).expanduser() if args.config else default_config_path()

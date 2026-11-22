@@ -1,66 +1,68 @@
 # Watchpost Architecture
 
-Watchpost separates **ingestion**, **context/triage**, **coding-agent execution**, and **phone delivery** behind narrow Python `Protocol` contracts so every channel, agent CLI harness, and phone entrance stays swappable without any Web UI or standalone chat frontend.
+Watchpost separates **ingestion**, **context/triage**, **coding-agent execution**, and **phone delivery** behind narrow Python `Protocol` contracts so every channel, agent backend, and phone entrance stays swappable without any Web UI or standalone production chat frontend.
 
 ## System Topology
 
 ```mermaid
 flowchart LR
   subgraph IN["Channel Adapters"]
-    A1["Feishu Official API (Core Read-Only)"]
-    A2["Slack Socket Mode (Planned)"]
-    A3["Offline Simulator (Core)"]
-    A4["External Plugins via HTTP/CLI\n(e.g. wechat-mcp GPL-3.0 on :8300)"]
+    A1["FeishuAdapter (API or Read-Only lark-cli)"]
+    A2["ExternalCommandAdapter (JSON Subprocess Plugins)"]
+    A3["Offline Simulator & sandbox-ui"]
   end
 
   subgraph CORE["Watchpost Headless Engine (Python + SQLite WAL)"]
     B1["Noise Filters & Burst Debouncer"]
     B2["2-Bucket Group Context Engine"]
     B3["Local Media & Whisper ASR"]
-    B4["4-Mode Triage & Personas"]
-    B5["SQLite WAL Store & WatchpostDaemon"]
+    B4["4-Mode Triage, Personas & Per-Channel Workspaces"]
+    B5["SQLite WAL Store (threads, hooks, kv_state)"]
   end
 
-  subgraph AGENT["Bring Your Own Coding Agent"]
-    C1["CLIAgentBackend\n(Claude Code / Codex / Gemini / AGY)"]
-    C2["MockAgentBackend (Tests & Demo)"]
+  subgraph AGENT["Execution Backends + Automatic Failover"]
+    C1["FallbackBackend\n(Primary → Backup Failover)"]
+    C2["AntigravityBackend\n(agentapi + watchpost hook-stop)"]
+    C3["CLIAgentBackend\n(Codex read-only / Claude / Gemini)"]
+    C4["MockAgentBackend (Tests & Demo)"]
   end
 
-  subgraph PHONE["Familiar Phone Entrance (Draft-Only Default)"]
-    D1["Telegram Bot"]
-    D2["macOS iMessage"]
+  subgraph PHONE["Phone Entrance (Draft-Only Default + Personal Chat)"]
+    D1["macOS iMessage (chat.db + Attachments + Multi-Handle)"]
+    D2["Telegram Bot"]
   end
 
   A1 --> B1
-  A2 -.-> B1
+  A2 --> B1
   A3 --> B1
-  A4 -.-> B1
   B1 --> B2
   B2 --> B3
   B3 --> B4
   B4 <--> B5
   B4 <--> C1
-  B4 <--> C2
+  C1 --> C2
+  C1 --> C3
+  B4 <--> C4
   B5 --> D1
   B5 --> D2
-  D1 -. "\"go\" / /status / steer" .-> B5
-  D2 -. "\"go\" / /status / steer" .-> B5
+  D1 -. "swipe / #N / go / /new / /reset / voice" .-> B5
+  D2 -. "swipe / #N / go / /status / /list" .-> B5
 ```
 
-## Module Map (`v0.2.0`)
+## Module Map (`v0.3.0`)
 
-- `src/watchpost/config.py`: Pydantic v2 configuration schema (`WatchpostConfig`, `FeishuConfig`, `TelegramConfig`, `IMessageConfig`, `BackendConfig`, `WhisperConfig`), `${ENV_VAR}` expansion, env-var fallbacks, and `0600` JSON persistence.
-- `src/watchpost/models.py`: Pydantic v2 domain models (`ChannelConfig`, `NormalizedMessage`, `GroupContext`, `ThreadRecord`, `ThreadEvent`, `AgentResult`, `OwnerAction`).
+- `src/watchpost/config.py`: Pydantic v2 configuration schema (`WatchpostConfig`, `BackendConfig`, `FeishuConfig`, `TelegramConfig`, `IMessageConfig`, `ExternalAdapterConfig`, `WhisperConfig`), `${ENV_VAR}` expansion, env fallbacks, `persona_file` loading, and `0600` JSON persistence.
+- `src/watchpost/models.py`: Pydantic v2 domain models (`ChannelConfig` with `workspace_dir`/`persona_file`, `EngineConfig` with personal direct-chat settings, `NormalizedMessage`, `GroupContext`, `ThreadRecord`, `ThreadEvent`, `AgentResult`, `OwnerAction`).
 - `src/watchpost/ports.py`: `Protocol` interfaces (`ChannelAdapter`, `AgentBackend`, `NotifierAdapter`, `MediaProcessor`).
-- `src/watchpost/store.py`: Atomic **SQLite WAL** persistence across 5 normalized tables (`channels`, `messages`, `threads`, `thread_events`, `outbound_bindings`).
-- `src/watchpost/adapters/feishu.py`: Read-only official Feishu Open API adapter (`FeishuAdapter`) supporting tenant/user auth, paginated chat discovery, rich-post/mention/media normalization, recall skipping, and path-safe resource downloads.
-- `src/watchpost/notifiers/telegram.py` & `imessage.py`: Owner-authenticated phone entrances (`TelegramNotifier` via Bot API and `IMessageNotifier` via `argv` `osascript` + read-only `chat.db` polling with echo suppression and `attributedBody` decoding).
-- `src/watchpost/filters.py`, `context.py`, `debouncer.py`: Noise/recall filtering, 2-bucket group context assembly, and async burst debouncing.
-- `src/watchpost/prompts.py` & `bubbles.py`: Smart 4-Mode Intent Triage, autonomy gates, `UNTRUSTED EXTERNAL CHAT INPUT` isolation, Markdown stripping, and CJK/EN short sentence splitting.
-- `src/watchpost/media.py`: Local Whisper CLI processor (`ffmpeg` + `whisper-cli`) and media retention pruning.
-- `src/watchpost/backends/cli_agent.py`: Generic async subprocess wrapper (`CLIAgentBackend`) supporting `claude_code`, `codex`, `gemini_cli`, `antigravity`, or custom headless CLI commands.
-- `src/watchpost/engine.py` & `daemon.py`: Orchestrator (`WatchpostEngine`), owner-action dispatcher (`handle_owner_action`), continuous daemon (`WatchpostDaemon`), and environment checker (`run_doctor`).
-- `src/watchpost/skills/watchpost/SKILL.md` & `skill_installer.py`: Bundled cross-harness Agent Skill for guided setup, channel onboarding, and clean uninstall (`watchpost install-skill`).
+- `src/watchpost/store.py`: Atomic **SQLite WAL** persistence across `channels`, `messages`, `threads`, `thread_events`, `outbound_bindings`, `tracked_backend_refs`, `backend_completions` (with consecutive digest dedup), and `kv_state`.
+- `src/watchpost/adapters/feishu.py`: Strictly read-only Feishu adapter supporting `tenant`, `user`, and local `lark_cli` auth modes, `<at>` mention parsing, recall filtering, paginated chat discovery, and media download.
+- `src/watchpost/adapters/external_plugin.py`: `ExternalCommandAdapter` running out-of-process JSON stdin/stdout plugins (`list-chats`, `fetch-recent`, `fetch-by-ids`, `download-media`).
+- `src/watchpost/backends/antigravity.py`: Async `AntigravityBackend` launching/steering conversations via `agentapi`, parsing JSONL transcripts via `extract_latest_assistant_response` + `handle_stop_hook_payload`, and awaiting SQLite `backend_completions`.
+- `src/watchpost/backends/fallback.py`: `FallbackBackend` wrapping primary + backup `AgentBackend` with provider-prefixed thread refs (`antigravity:...` / `codex:...`), transparent `start_thread` failover, and `steer_thread` recovery.
+- `src/watchpost/backends/cli_agent.py`: Async CLI subprocess wrapper (`CLIAgentBackend`) with explicit/read-only `codex_sandbox` support.
+- `src/watchpost/notifiers/imessage.py` & `telegram.py`: Owner-locked phone entrances; iMessage supports multi-handle phone/email normalization (`allowed_handles`), reaction/system/retracted filtering, non-sticker image/audio attachment extraction, `attributedBody` decoding, and echo suppression.
+- `src/watchpost/engine.py` & `daemon.py`: Orchestrator (`WatchpostEngine`), rich owner commands (`#N`, `go`, `/status`, `/list`, `/help`, `/new`, `/reset`, Whisper attachment transcription, TTL-managed Personal Direct Chat), continuous daemon with optional localhost `api_port`, and comprehensive `run_doctor`.
+- `src/watchpost/cli.py`: CLI commands (`init`, `init-config`, `run [--api-port]`, `hook-stop`, `doctor`, `channels [add --workspace]`, `telegram-whoami`, `install-skill`, `sandbox`, `sandbox-send`, `sandbox-ui`, `demo`, `serve`).
 - `src/watchpost/server.py`: Headless FastAPI JSON control API (`127.0.0.1:8787`, zero Web UI).
 
 ## Security & Licensing Boundaries
@@ -68,4 +70,4 @@ flowchart LR
 - **Prompt Injection Defense:** Incoming messages are wrapped explicitly as `UNTRUSTED EXTERNAL CHAT INPUT` and restricted strictly from issuing outbound channel sends.
 - **Draft-Only By Default:** External messaging write tokens are never required; suggested drafts stay isolated until the owner copies or approves them.
 - **Zero Egress By Architecture:** Media, voice audio, repos, and local logs remain on the owner's machine.
-- **License Isolation (`Apache-2.0` Core vs. External Copyleft Bridges):** Watchpost core (`Apache-2.0`) only integrates official APIs and OS/phone entrances directly. External bridges under copyleft terms (such as `wechat-mcp`, `GPL-3.0`) run strictly out-of-process over local REST/CLI boundaries and are never imported into Watchpost's codebase.
+- **License Isolation (`Apache-2.0` Core vs. External Copyleft Bridges):** Watchpost core (`Apache-2.0`) only integrates official APIs, local CLIs, and narrow JSON subprocess protocols. Copyleft desktop bridges stay strictly out-of-process and are never imported into Watchpost.

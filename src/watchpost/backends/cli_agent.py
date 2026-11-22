@@ -53,6 +53,7 @@ class CLIAgentBackend:
         start_cmd: list[str] | None = None,
         steer_cmd: list[str] | None = None,
         timeout_s: float = 120.0,
+        sandbox_mode: str = "",
     ) -> None:
         if preset not in CLI_PRESETS and (not start_cmd or not steer_cmd):
             raise ValueError(f"Unknown CLI preset: {preset}")
@@ -61,6 +62,7 @@ class CLIAgentBackend:
         self._start_cmd = list(start_cmd or defaults["start"])
         self._steer_cmd = list(steer_cmd or defaults["steer"])
         self._timeout_s = float(timeout_s)
+        self._sandbox_mode = sandbox_mode.strip()
 
     async def start_thread(
         self,
@@ -73,14 +75,14 @@ class CLIAgentBackend:
     ) -> tuple[str, AgentResult]:
         del title, model
         cmd = list(self._start_cmd)
-        if (
-            self.name == "codex"
-            and channel is not None
-            and channel.autonomy_mode in {AutonomyMode.assistant_only, AutonomyMode.diagnose_only}
-            and "--sandbox" not in cmd
-            and "-s" not in cmd
-        ):
-            cmd.extend(["--sandbox", "read-only"])
+        if self.name == "codex" and "--sandbox" not in cmd and "-s" not in cmd:
+            if self._sandbox_mode:
+                cmd.extend(["--sandbox", self._sandbox_mode])
+            elif channel is not None and channel.autonomy_mode in {
+                AutonomyMode.assistant_only,
+                AutonomyMode.diagnose_only,
+            }:
+                cmd.extend(["--sandbox", "read-only"])
         cmd.append(prompt)
         stdout, stderr, rc = await self._run(cmd, cwd=cwd)
         if rc != 0:
