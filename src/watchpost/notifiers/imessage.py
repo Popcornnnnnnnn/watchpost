@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import re
 import sqlite3
 import time
@@ -13,6 +14,8 @@ from typing import Awaitable, Callable
 from watchpost.config import IMessageConfig
 from watchpost.models import ChannelConfig, OwnerAction, ThreadRecord
 from watchpost.notifiers import classify_owner_command, format_start_notice
+
+logger = logging.getLogger("watchpost.notifiers.imessage")
 
 _APPLESCRIPT_SEND = """on run argv
     set targetHandle to item 1 of argv
@@ -83,7 +86,9 @@ async def _default_send_applescript(handle: str, text: str) -> bool:
     )
     _out, err = await asyncio.wait_for(proc.communicate(), timeout=20.0)
     if proc.returncode != 0:
-        raise RuntimeError(f"osascript send failed (rc={proc.returncode}): {err.decode('utf-8', errors='replace').strip()}")
+        err_msg = err.decode("utf-8", errors="replace").strip()
+        logger.error("iMessage osascript failed (rc=%s): %s", proc.returncode, err_msg)
+        raise RuntimeError(f"osascript send failed (rc={proc.returncode}): {err_msg}")
     return True
 
 
@@ -136,6 +141,7 @@ class IMessageNotifier:
         self._last_rowid: int | None = None
         self._recent_sent: list[tuple[str, float]] = []
         self._dry_seq: int = 0
+        self._db_error_logged: bool = False
 
     def _record_sent(self, text: str) -> None:
         now = time.monotonic()
@@ -165,8 +171,16 @@ class IMessageNotifier:
         try:
             conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=5.0)
             conn.row_factory = sqlite3.Row
+            self._db_error_logged = False
             return conn
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if not self._db_error_logged:
+                logger.error(
+                    "Cannot open iMessage chat.db (%s): %s (check macOS Full Disk Access)",
+                    self._db_path,
+                    exc,
+                )
+                self._db_error_logged = True
             return None
 
     def _message_columns(self, conn: sqlite3.Connection) -> set[str]:
@@ -336,6 +350,7 @@ class IMessageNotifier:
             if self._last_rowid is None:
                 row = conn.execute("SELECT COALESCE(MAX(ROWID), 0) AS max_id FROM message").fetchone()
                 self._last_rowid = int(row["max_id"]) if row else 0
+                logger.info("iMessage chat.db seeded at ROWID=%d", self._last_rowid)
                 return []
 
             cols = self._message_columns(conn)

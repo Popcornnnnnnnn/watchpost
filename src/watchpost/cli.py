@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import re
 import signal
 import sys
@@ -81,6 +82,13 @@ async def _run_demo_into(db_path: Path, *, language: str) -> int:
 
 
 async def _run_daemon_cli(config_path: Path, *, once: bool, seed: bool, api_port: int = 0) -> int:
+    if not once:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            stream=sys.stdout,
+            force=True,
+        )
     cfg = load_config(config_path)
     if api_port > 0:
         cfg = cfg.model_copy(update={"api_port": api_port})

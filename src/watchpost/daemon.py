@@ -182,6 +182,12 @@ class WatchpostDaemon:
         stopper = stop_event or asyncio.Event()
         if seed_on_start:
             await self.engine.poll_all_channels(seed_if_empty=True, debounced=False)
+        logger.info(
+            "Watchpost daemon started (backend=%s, channels=%d, api_port=%d)",
+            self.engine.backend.name,
+            self.engine.store.get_metrics()["channels"],
+            int(getattr(self.config, "api_port", 0) or 0),
+        )
 
         api_server: Any = None
         api_task: asyncio.Task[None] | None = None
