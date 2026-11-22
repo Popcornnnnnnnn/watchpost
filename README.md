@@ -67,6 +67,19 @@ uv run watchpost install-skill --target claude
    uv run watchpost run
    ```
 
+### Try It Interactively (`watchpost sandbox`)
+Act as external colleagues sending messages into an isolated DM or `@me` group and drive owner replies from the same terminal — zero impact on live apps:
+
+```bash
+# Instant offline loop (MockAgentBackend, zero token cost)
+uv run watchpost sandbox --backend mock
+
+# Or point a real local CLI coding agent at any repository in read-only mode
+uv run watchpost sandbox --backend codex --cwd /path/to/your/repo
+```
+
+Inside the sandbox, type messages directly to act as a colleague, or use `/mode group`, `/as Boss`, `/at <msg>`, `/reply <sb_id> <msg>`, `/img <path> [caption]`, `/recall <sb_id>`, `/autonomy ...`, and `/phone go` / `/phone status` / `/phone <steer>` to act as yourself on the phone.
+
 ### Offline Demo, JSON Control API & Tests
 ```bash
 # Run offline simulation scenario

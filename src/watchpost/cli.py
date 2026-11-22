@@ -15,6 +15,7 @@ import uvicorn
 
 from watchpost import __version__
 from watchpost.adapters.feishu import FeishuAdapter
+from watchpost.adapters.local_sandbox import LocalSandboxAdapter
 from watchpost.backends.mock import MockAgentBackend
 from watchpost.config import (
     WatchpostConfig,
@@ -28,6 +29,7 @@ from watchpost.daemon import WatchpostDaemon, build_engine_from_config, run_doct
 from watchpost.engine import WatchpostEngine
 from watchpost.models import AutonomyMode, ChannelConfig, ChatType, EngineConfig, TriggerMode
 from watchpost.notifiers.telegram import detect_owner_chat_id
+from watchpost.sandbox import run_interactive_sandbox
 from watchpost.server import create_app
 from watchpost.skill_installer import SKILL_TARGETS, install_skill, uninstall_skill
 from watchpost.store import WatchpostStore
@@ -235,6 +237,33 @@ def main(argv: list[str] | None = None) -> int:
     p_skill.add_argument("--dest", default="", help="Optional custom skill directory path")
     p_skill.add_argument("--uninstall", action="store_true", help="Remove installed skill instead of installing")
 
+    p_sb = sub.add_parser("sandbox", help="Interactive sandbox where you simulate colleagues + phone replies")
+    p_sb.add_argument(
+        "--backend",
+        default="mock",
+        choices=["mock", "codex", "claude_code", "gemini_cli", "antigravity"],
+        help="Agent backend to run ('mock' for instant offline testing, or real local CLI like 'codex')",
+    )
+    p_sb.add_argument("--cwd", default=".", help="Workspace directory the agent inspects")
+    p_sb.add_argument("--dir", default="", help="Optional persistent sandbox directory (defaults to temporary)")
+    p_sb.add_argument("--mode", default="dm", choices=["dm", "group"], help="Initial channel mode")
+    p_sb.add_argument(
+        "--autonomy",
+        default="diagnose_only",
+        choices=["assistant_only", "diagnose_only", "auto_fix"],
+    )
+    p_sb.add_argument("--lang", default="zh", help="Output language ('zh' or 'en')")
+    p_sb.add_argument("--persona", default="", help="Optional custom channel persona text")
+
+    p_sbs = sub.add_parser("sandbox-send", help="Append one external message into a persistent --dir sandbox")
+    p_sbs.add_argument("--dir", required=True, help="Sandbox directory matching `watchpost sandbox --dir`")
+    p_sbs.add_argument("--mode", default="dm", choices=["dm", "group"])
+    p_sbs.add_argument("--sender", default="Alex")
+    p_sbs.add_argument("--text", default="")
+    p_sbs.add_argument("--at-owner", action="store_true")
+    p_sbs.add_argument("--reply-to", default="")
+    p_sbs.add_argument("--img", default="")
+
     p_demo = sub.add_parser("demo", help="Run offline head-start simulation scenario")
     p_demo.add_argument("--db", default="", help="Optional persistent DB path (defaults to temporary)")
     p_demo.add_argument("--lang", default="zh", help="Output language ('zh' or 'en')")
@@ -302,6 +331,33 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         installed = install_skill(target=args.target, dest=dest)
         print(f"Installed Watchpost skill to {installed}")
+        return 0
+
+    if args.command == "sandbox":
+        return asyncio.run(
+            run_interactive_sandbox(
+                sandbox_dir=Path(args.dir).expanduser() if args.dir else None,
+                backend_name=args.backend,
+                workspace_dir=args.cwd,
+                initial_mode=args.mode,
+                autonomy=AutonomyMode(args.autonomy),
+                language=args.lang,
+                persona_text=args.persona,
+            )
+        )
+
+    if args.command == "sandbox-send":
+        adapter = LocalSandboxAdapter(Path(args.dir).expanduser())
+        chat_id = "sandbox_group" if args.mode == "group" else "sandbox_dm"
+        msg = adapter.append_message(
+            chat_id,
+            sender_name=args.sender,
+            text=args.text,
+            reply_to_id=args.reply_to,
+            mentions_owner=args.at_owner,
+            image_path=Path(args.img).expanduser() if args.img else None,
+        )
+        print(f"Appended {msg.message_id} into {chat_id} ({adapter.inbox_path})")
         return 0
 
     if args.command == "demo":

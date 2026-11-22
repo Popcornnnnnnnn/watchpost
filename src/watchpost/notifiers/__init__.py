@@ -50,7 +50,14 @@ def format_start_notice(channel_name: str, preview: str, *, is_steer: bool = Fal
     return f"New message in {channel_name}: {snippet} — checking."
 
 
+from watchpost.notifiers.console import ConsoleNotifier
 from watchpost.notifiers.imessage import IMessageNotifier
 from watchpost.notifiers.telegram import TelegramNotifier
 
-__all__ = ["IMessageNotifier", "TelegramNotifier", "classify_owner_command", "format_start_notice"]
+__all__ = [
+    "ConsoleNotifier",
+    "IMessageNotifier",
+    "TelegramNotifier",
+    "classify_owner_command",
+    "format_start_notice",
+]

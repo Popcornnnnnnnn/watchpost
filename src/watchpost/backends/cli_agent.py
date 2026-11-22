@@ -9,9 +9,19 @@ import uuid
 from pathlib import Path
 
 from watchpost.bubbles import extract_sections, split_into_bubbles
-from watchpost.models import AgentResult, ChannelConfig, TriageMode
+from watchpost.models import AgentResult, AutonomyMode, ChannelConfig, TriageMode
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+_META_EVENT_TYPES = {
+    "thread.started",
+    "turn.started",
+    "turn.completed",
+    "turn.failed",
+    "item.started",
+    "item.updated",
+    "item.completed",
+}
+_META_ONLY_KEYS = {"session_id", "thread_id", "conversationId", "conversation_id", "id", "status", "usage"}
 
 CLI_PRESETS: dict[str, dict[str, list[str]]] = {
     "claude_code": {
@@ -19,8 +29,8 @@ CLI_PRESETS: dict[str, dict[str, list[str]]] = {
         "steer": ["claude", "-r", "{ref}", "-p"],
     },
     "codex": {
-        "start": ["codex", "exec"],
-        "steer": ["codex", "exec", "resume", "{ref}"],
+        "start": ["codex", "exec", "--json", "--skip-git-repo-check"],
+        "steer": ["codex", "exec", "resume", "--json", "--skip-git-repo-check", "{ref}"],
     },
     "gemini_cli": {
         "start": ["gemini", "-p"],
@@ -61,8 +71,17 @@ class CLIAgentBackend:
         model: str = "",
         channel: ChannelConfig | None = None,
     ) -> tuple[str, AgentResult]:
-        del title, model, channel
-        cmd = [*self._start_cmd, prompt]
+        del title, model
+        cmd = list(self._start_cmd)
+        if (
+            self.name == "codex"
+            and channel is not None
+            and channel.autonomy_mode in {AutonomyMode.assistant_only, AutonomyMode.diagnose_only}
+            and "--sandbox" not in cmd
+            and "-s" not in cmd
+        ):
+            cmd.extend(["--sandbox", "read-only"])
+        cmd.append(prompt)
         stdout, stderr, rc = await self._run(cmd, cwd=cwd)
         if rc != 0:
             msg = (stderr or stdout or f"CLI exited {rc}").strip()[-300:]
@@ -123,15 +142,53 @@ class CLIAgentBackend:
         return m.group(0) if m else ""
 
     @staticmethod
-    def _parse_output(raw_text: str) -> AgentResult:
-        sec = extract_sections(raw_text)
-        summary = sec.get("summary") or raw_text
+    def _extract_reply_text(stdout: str) -> str:
+        structured_msgs: list[str] = []
+        prose_lines: list[str] = []
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                prose_lines.append("")
+                continue
+            if stripped.startswith("{"):
+                try:
+                    payload = json.loads(stripped)
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict):
+                    item = payload.get("item")
+                    if (
+                        payload.get("type") == "item.completed"
+                        and isinstance(item, dict)
+                        and item.get("type") == "agent_message"
+                        and isinstance(item.get("text"), str)
+                    ):
+                        structured_msgs.append(item["text"])
+                        continue
+                    res_val = payload.get("result")
+                    if isinstance(res_val, str) and res_val.strip():
+                        structured_msgs.append(res_val)
+                        continue
+                    if payload.get("type") in _META_EVENT_TYPES or set(payload).issubset(_META_ONLY_KEYS):
+                        continue
+            prose_lines.append(line)
+
+        if structured_msgs:
+            return structured_msgs[-1].strip()
+        prose = "\n".join(prose_lines).strip()
+        return prose or stdout.strip()
+
+    @classmethod
+    def _parse_output(cls, raw_text: str) -> AgentResult:
+        extracted = cls._extract_reply_text(raw_text)
+        sec = extract_sections(extracted)
+        summary = sec.get("summary") or extracted
         att = sec.get("attention", "").strip()
         if att.lower() in {"none", "n/a", "-", "无"}:
             att = ""
         mode = TriageMode.mode_4_bug if att else TriageMode.mode_1_qa
         return AgentResult(
-            raw_text=raw_text,
+            raw_text=extracted,
             summary_bubbles=split_into_bubbles(summary, max_bubbles=3),
             suggested_reply=sec.get("suggested_reply", "").strip(),
             needs_attention=att,
