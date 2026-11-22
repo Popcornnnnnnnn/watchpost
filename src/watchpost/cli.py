@@ -50,17 +50,20 @@ async def _run_demo_into(db_path: Path, *, language: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="watchpost", description="Self-hosted Field-Ops & Engineering Copilot")
+    parser = argparse.ArgumentParser(
+        prog="watchpost",
+        description="Headless local background bridge for your coding agent — zero-copy-paste head-starts delivered to your phone",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Initialize Watchpost SQLite WAL database")
     p_init.add_argument("--db", default="./data/watchpost.db", help="Path to SQLite database")
 
-    p_demo = sub.add_parser("demo", help="Run offline Field-Ops Simulator demo")
+    p_demo = sub.add_parser("demo", help="Run offline head-start simulation scenario")
     p_demo.add_argument("--db", default="", help="Optional persistent DB path (defaults to temporary)")
     p_demo.add_argument("--lang", default="zh", help="Output language ('zh' or 'en')")
 
-    p_serve = sub.add_parser("serve", help="Start FastAPI server and Web Inbox Dashboard")
+    p_serve = sub.add_parser("serve", help="Start headless Watchpost JSON control API server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8787)
     p_serve.add_argument("--db", default="./data/watchpost.db")

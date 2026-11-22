@@ -1,34 +1,35 @@
 # Watchpost Architecture
 
-Watchpost separates **ingestion**, **context/triage**, **agent execution**, and **owner delivery** behind narrow Python `Protocol` contracts so every channel, agent runtime, and mobile/web notifier stays swappable.
+Watchpost separates **ingestion**, **context/triage**, **coding-agent execution**, and **phone delivery** behind narrow Python `Protocol` contracts so every channel, agent CLI harness, and phone entrance stays swappable without any Web UI or standalone chat frontend.
 
 ## System Topology
 
 ```mermaid
 flowchart LR
   subgraph IN["Channel Adapters"]
-    A1["Feishu Official API"]
-    A2["Slack Socket Mode"]
-    A3["WeCom Official API"]
-    A4["Offline Field-Ops Simulator"]
+    A1["Feishu Official API (Core)"]
+    A2["Slack Socket Mode (Core)"]
+    A3["Offline Simulator (Core)"]
+    A4["External Plugins via HTTP/CLI\n(e.g. wechat-mcp GPL-3.0 on :8300)"]
   end
 
-  subgraph CORE["Watchpost Core Engine (FastAPI + SQLite WAL)"]
+  subgraph CORE["Watchpost Headless Engine (Python + SQLite WAL)"]
     B1["Noise Filters & Burst Debouncer"]
     B2["2-Bucket Group Context Engine"]
     B3["Local Media & Whisper ASR"]
     B4["4-Mode Intent Triage & Personas"]
-    B5["SQLite WAL State & Event Store"]
+    B5["SQLite WAL Store & JSON Control API (:8787)"]
   end
 
-  subgraph AGENT["Pluggable AgentBackends"]
-    C1["CLI Agents (Claude Code / Codex / Gemini / AGY)"]
-    C2["Direct LLM + MCP / Mock Backend"]
+  subgraph AGENT["Bring Your Own Coding Agent"]
+    C1["CLIAgentBackend\n(Claude Code / Codex / Gemini / AGY)"]
+    C2["MockAgentBackend (Tests & Demo)"]
   end
 
-  subgraph OUT["Owner Delivery (Draft-Only Default)"]
-    D1["Web Inbox Dashboard (:8787)"]
-    D2["Mobile Notifiers (Telegram / Feishu DM / Slack DM)"]
+  subgraph PHONE["Familiar Phone Entrance (Draft-Only Default)"]
+    D1["Telegram Bot"]
+    D2["macOS iMessage"]
+    D3["Feishu Self-DM"]
   end
 
   A1 --> B1
@@ -43,6 +44,10 @@ flowchart LR
   B4 <--> C2
   B5 --> D1
   B5 --> D2
+  B5 --> D3
+  D1 -. "\"go\" / follow-up steer" .-> B5
+  D2 -. "\"go\" / follow-up steer" .-> B5
+  D3 -. "\"go\" / follow-up steer" .-> B5
 ```
 
 ## Module Map
@@ -56,11 +61,13 @@ flowchart LR
 - `src/watchpost/prompts.py`: Smart 4-Mode Intent Triage + autonomy gate (`assistant_only` / `diagnose_only` / `auto_fix`) + `UNTRUSTED EXTERNAL CHAT INPUT` framing.
 - `src/watchpost/bubbles.py`: Markdown stripper, bilingual heading extractor (`总结`/`Summary`, `建议回复`/`Suggested Reply`, `需要注意`/`Needs Attention`), and CJK/EN short sentence bubble splitter.
 - `src/watchpost/media.py`: Local Whisper CLI processor (`ffmpeg` + `whisper-cli`) and media retention pruning.
+- `src/watchpost/backends/cli_agent.py`: Generic async subprocess wrapper (`CLIAgentBackend`) supporting headless CLI harnesses (`claude_code`, `codex`, `gemini_cli`, `antigravity`, or custom start/steer commands).
 - `src/watchpost/engine.py`: End-to-end orchestrator (`WatchpostEngine`).
-- `src/watchpost/server.py`: FastAPI REST API + self-contained responsive Web Inbox Dashboard.
+- `src/watchpost/server.py`: Headless FastAPI JSON control API (`127.0.0.1:8787`, no Web UI), managed locally via an installable Agent Skill or CLI/API calls.
 
-## Security & Open-Core Boundaries
+## Security & Licensing Boundaries
 
 - **Prompt Injection Defense:** Incoming messages are wrapped explicitly as `UNTRUSTED EXTERNAL CHAT INPUT` and restricted strictly from issuing outbound channel sends.
-- **Draft-Only By Default:** Customer-facing write tokens are never required; suggested drafts stay isolated until a human copies or approves them.
-- **Open-Core Split:** Single-team self-hosted core (`Apache-2.0`) covers all adapters, local Whisper, pluggable agents, and Web Inbox. Multi-engineer shared queues, RBAC, SSO/OIDC, and immutable compliance audit exports sit cleanly above `WatchpostStore`.
+- **Draft-Only By Default:** External messaging write tokens are never required; suggested drafts stay isolated until the owner copies or approves them.
+- **Zero Egress By Architecture:** Media, voice audio, repos, and local logs remain on the owner's machine.
+- **License Isolation (`Apache-2.0` Core vs. External Copyleft Bridges):** Watchpost core (`Apache-2.0`) only integrates official APIs and OS/phone entrances directly. External bridges under copyleft terms (such as `wechat-mcp`, `GPL-3.0`) run strictly out-of-process over local REST/CLI boundaries and are never imported into Watchpost's codebase.

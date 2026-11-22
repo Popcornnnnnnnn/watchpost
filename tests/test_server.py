@@ -1,4 +1,4 @@
-"""FastAPI server and Web Inbox Dashboard tests."""
+"""Headless FastAPI local JSON control API tests."""
 
 from __future__ import annotations
 
@@ -10,20 +10,21 @@ from fastapi.testclient import TestClient
 from watchpost.server import create_app
 
 
-def test_dashboard_and_rest_api_flow() -> None:
+def test_headless_root_and_rest_api_flow() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        app = create_app(Path(tmp) / "web.db")
+        app = create_app(Path(tmp) / "daemon.db")
         client = TestClient(app)
 
-        # HTML shell, security headers, modern clipboard & light/dark meta, zero innerHTML sink
+        # Headless JSON descriptor and strict non-UI security headers
         res = client.get("/")
         assert res.status_code == 200
+        body = res.json()
+        assert body["service"] == "watchpost"
+        assert body["mode"] == "headless-daemon"
+        assert "/api/health" in body["endpoints"]
         assert res.headers["X-Content-Type-Options"] == "nosniff"
         assert res.headers["X-Frame-Options"] == "DENY"
-        assert "script-src 'nonce-" in res.headers["Content-Security-Policy"]
-        assert '<meta name="color-scheme" content="light dark">' in res.text
-        assert 'command="--copy"' in res.text
-        assert "innerHTML" not in res.text
+        assert res.headers["Content-Security-Policy"] == "default-src 'none'; frame-ancestors 'none'"
 
         h0 = client.get("/api/health").json()
         assert h0["status"] == "ok"

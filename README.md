@@ -1,22 +1,30 @@
 # Watchpost
 
-**Self-hosted, open-source B2B Field-Ops & Engineering Copilot (`Apache-2.0`).**
+**Headless local background bridge for your coding agent — zero-copy-paste head-starts delivered to your phone (`Apache-2.0`).**
 
-Watchpost passively monitors selected engineering DMs and `@me` support groups, filters out small talk and recalled noise, reconstructs overnight multi-person group handoffs, transcribes voice notes locally via Whisper, triages intent *before* running code/SSH checks, delegates diagnosis to your chosen agent backend (`Claude Code`, `Codex`, `Gemini CLI`, `Antigravity`, or direct LLM/MCP), and delivers crisp mobile summaries + **1-tap-copy draft replies** — **draft-only by default**.
+Watchpost removes the manual copy-paste loop when urgent work or deliverables arrive in chat. It runs invisibly on your laptop, Mac mini, or bastion host, watches selected DMs and `@me` mentions (`Feishu`, `Slack`, etc.) without leaking read receipts, applies your rules and autonomy gates, injects text, photos, and local **Whisper** voice transcripts directly into **your own coding agent** (`Claude Code`, `Codex`, `Gemini CLI`, `Antigravity`, or any custom CLI runner), and sends concise mobile bubbles + **1-tap-copy draft replies** only to *you* on your familiar phone chat (`Telegram`, macOS `iMessage`, or `Feishu self-DM`).
 
-## Why Self-Hosted?
+## Why Watchpost?
 
-Field engineering teams never want to upload private firmware repos, production SSH keys, internal telemetry, or customer voice notes to a third-party SaaS. Watchpost runs inside your own laptop, bastion host, or private Docker network so your code, audio, and credentials never leave your perimeter.
+- **No Copy-Paste Bottleneck:** Start debugging or preparing a deliverable the instant a message lands — whether it is a 2-minute live incident or a 2-hour spec/report review.
+- **No Heavy Platform UI:** No standalone web inbox or extra chat app to babysit. Manage Watchpost through an installable **Agent Skill** inside your existing coding agent and receive handoffs on your phone.
+- **Bring Your Own Coding Agent:** Runs headless CLI agents against your private repos, local files, internal LAN tools, and read-only SSH — nothing sensitive leaves your perimeter to a third-party cloud SaaS.
+- **Human-Only Handoff (Draft-Only Default):** External senders never talk directly to your AI. You review the short diagnosis or 70–80% draft on your phone and copy-paste the reply yourself.
 
-## Key Capabilities
+## Inbound Work Modes
 
-- **Passive, Zero-Read-Receipt Monitoring:** Polls selected DMs and `@me` group threads while skipping owner turns, recalled messages, stickers, `@all` broadcasts, and pure acknowledgements (`OK`, `收到`).
+1. **Live Firefighting (Minutes):** Field engineer or on-call alert arrives with screenshots or voice clips → immediate local diagnosis, incremental follow-up steering, and a paste-ready reply draft.
+2. **Deliverable Head-Start (Hours):** A teammate or manager drops specs, PDFs, or logs for an afternoon check → the same event-triggered engine starts immediately so a fact-grounded draft is waiting before you even open your laptop.
+3. **Quiet Tracking & Digests (Planned Config Option):** Silent action-item extraction or periodic `mode: digest` summaries for low-urgency groups, kept secondary to real-time head-starts.
+
+## Key Capabilities (Phase 1 Core)
+
+- **Passive Noise & Recall Filtering:** Skips owner turns, system/call notices, recalled (`deleted`) messages, pure acknowledgements/stickers (`OK`, `收到`), and `@all` broadcasts unless tied to an active thread.
 - **2-Bucket Group Context Engine:** Pulls high-confidence clues (recursive `reply_to` chains, same-sender bursts, and overnight `Engineer A @Support -> Support @Lead` handoffs) with media decoded, while keeping unrelated group chatter text-only.
-- **Offline Whisper Voice Transcription:** Transcribes field voice notes locally with domain vocabulary hints.
-- **Smart 4-Mode Intent Triage:** Distinguishes quick status/estimate questions (`Mode 1`), coordination/advice (`Mode 2`), and FYI updates (`Mode 3`) from actual bug investigations (`Mode 4`).
-- **Per-Channel Personas & Autonomy Gates:** Configure `assistant_only`, `diagnose_only` (wait for explicit `"go"` approval before edits/restarts), or opt-in `auto_fix`.
-- **Pluggable Runtime & SQLite WAL Store:** Clean `ChannelAdapter`, `AgentBackend`, and `NotifierAdapter` protocols backed by a single-file SQLite WAL database.
-- **Web Inbox Dashboard:** Responsive local UI on `:8787` for 1-tap copy drafts, `"go"` approvals, inline steering, channel toggles, and telemetry.
+- **Offline Whisper Voice Transcription:** Transcribes field voice notes locally via `ffmpeg` + `whisper-cli` (`ggml` models) with per-channel domain vocabulary hints.
+- **Smart 4-Mode Intent Triage:** Distinguishes quick status/estimate/doc questions (`Mode 1`), advice/coordination (`Mode 2`), and FYI updates (`Mode 3`) from deep investigations (`Mode 4`).
+- **Per-Channel Personas & Autonomy Gates:** Configure `assistant_only`, `diagnose_only` (wait for explicit `"go"` approval before edits or restarts), or opt-in `auto_fix`, with `UNTRUSTED EXTERNAL CHAT INPUT` boundaries on every prompt.
+- **Headless Daemon & SQLite WAL Store:** Clean `ChannelAdapter`, `AgentBackend`, `NotifierAdapter`, and `MediaProcessor` protocols backed by a single-file SQLite WAL database and a pure-JSON local control API on `:8787` (zero Web UI).
 
 ## Quickstart (Phase 1 — Core Engine & Offline Simulator)
 
@@ -27,37 +35,32 @@ cd watchpost
 uv sync --all-extras
 ```
 
-1. **Run the offline Field-Ops Simulator CLI demo:**
+1. **Run the offline simulation CLI demo:**
    ```bash
    uv run watchpost demo
    ```
-   Replays a field-ops scenario (recalled noise, small talk, overnight `Sam @Alex` photo handoff → morning `Alex @Lead` diagnosis, and a rollout status Q&A) and prints short bubbles + 1-tap-copy drafts.
+   Replays a realistic work scenario (recalled noise, small talk, overnight `Sam @Alex` photo handoff → morning `Alex @Lead` diagnosis, and a rollout status Q&A) and prints mobile bubbles + 1-tap-copy drafts.
 
-2. **Start the Web Inbox Dashboard:**
+2. **Start the headless local JSON control API (`:8787`):**
    ```bash
    uv run watchpost serve --host 127.0.0.1 --port 8787 --db ./data/watchpost.db
    ```
-   Open <http://127.0.0.1:8787> and click **Run Field-Ops Demo** to test live triage, 1-tap draft copy, `"go"` approval, and follow-up steering.
+   Test endpoints with `curl` (e.g., `GET /`, `POST /api/simulate/run`, `GET /api/threads`, `POST /api/threads/{id}/steer`, `POST /api/threads/{id}/approve`).
 
 3. **Run tests:**
    ```bash
    uv run pytest -v
    ```
 
-## Phase 1 Status & Completion Criteria
+## External Adapter & License Boundary
 
-- **Status:** Phase 1 Complete & Verified (`v0.1.0`)
-- **Delivered in Phase 1:**
-  - Core models & plugin `Protocol` contracts (`src/watchpost/ports.py`, `models.py`)
-  - 5-table SQLite WAL state store (`src/watchpost/store.py`)
-  - Noise/recall filters, 2-bucket group context engine, async burst debouncer, 4-mode prompt builder, CJK/EN short bubble splitter (`src/watchpost/`)
-  - Pluggable backends (`MockAgentBackend`, `CLIAgentBackend`) & offline `SimulatorAdapter`
-  - FastAPI REST API & zero-dependency responsive Web Inbox Dashboard (`src/watchpost/server.py`)
-- **Next Steps (Phase 2):**
-  - Official **Feishu (Lark)** & **Slack** `ChannelAdapter` implementations
-  - `Dockerfile` + `docker-compose.yml` for 1-command server deployment
-  - Channel onboarding search picker & `"Auto-Draft Persona"` endpoint
-  - Direct LLM + MCP backend (`Phase 2/3`) & **WeCom** + mobile push notifiers (`Phase 3`)
+Watchpost core is **`Apache-2.0`** and ships only official-API adapters and phone notifiers (`Feishu`, `Slack`, `Telegram`, macOS `iMessage`). Unofficial or copyleft desktop bridges—such as macOS local WeChat bridges like `wechat-mcp` (`GPL-3.0`)—remain separate out-of-process services integrated only over local HTTP (`:8300`) or CLI boundaries, never imported into the Watchpost Python package.
+
+## Roadmap
+
+- **Phase 1 — Headless Core Engine (`v0.1.0`, Done):** Protocol contracts, 5-table SQLite WAL store, noise/recall filters, 2-bucket group context engine, async burst debouncer, 4-mode intent triage, CJK/EN short bubble splitter, local Whisper runner, generic `CLIAgentBackend`, offline `SimulatorAdapter`, and headless FastAPI JSON control API (`src/watchpost/server.py`).
+- **Phase 2 — Guided Skill + Real Loop (Next, post-dogfooding):** Official **Feishu** adapter (zero read receipts), **Telegram** & macOS **iMessage** phone notifiers, and installable **`watchpost` Agent Skill** (conversational onboarding, phone pairing, persona drafting, and clean removal).
+- **Phase 3 — Breadth & Packaging:** **Slack** Socket Mode adapter, `Auto-Draft Persona` from history, optional `mode: digest` channel trigger, optional `wechat-mcp` (`:8300`) external plugin guide, and headless `Dockerfile` / `docker-compose.yml`.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system architecture.
 
