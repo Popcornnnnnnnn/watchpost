@@ -877,3 +877,59 @@ def test_imessage_photo_forwarding_quotes_and_echo_suppression(tmp_path: Path, m
         assert len(owner_acts) == 1 and owner_acts[0].attachments[0]["name"] == "owner_shot.png"
 
     asyncio.run(_run())
+
+
+def test_thread_persists_active_status_while_backend_runs(tmp_path: Path) -> None:
+    store = WatchpostStore(tmp_path / "active_state.db")
+    ch = ChannelConfig(
+        id="ch_live",
+        adapter="feishu",
+        external_chat_id="oc_live",
+        name="Peer Live",
+        chat_type=ChatType.p2p,
+        trigger_mode=TriggerMode.all,
+        autonomy_mode=AutonomyMode.diagnose_only,
+    )
+    store.upsert_channel(ch)
+    observed_mid_statuses: list[ThreadStatus] = []
+
+    class _ObservingBackend(_RecordingBackend):
+        async def start_thread(
+            self,
+            title: str,
+            prompt: str,
+            *,
+            cwd: Path,
+            model: str = "",
+            channel: ChannelConfig | None = None,
+        ) -> tuple[str, AgentResult]:
+            for th in store.list_threads(limit=10):
+                observed_mid_statuses.append(th.status)
+            return await super().start_thread(title, prompt, cwd=cwd, model=model, channel=channel)
+
+    async def _run() -> None:
+        engine = WatchpostEngine(
+            store,
+            _ObservingBackend("obs"),
+            config=EngineConfig(workspace_dir=tmp_path, language="zh"),
+        )
+        created = await engine.ingest_messages(
+            "ch_live",
+            [
+                NormalizedMessage(
+                    message_id="m_1",
+                    channel_id="ch_live",
+                    position=1,
+                    create_ms=int(time.time() * 1000),
+                    sender_id="ou_peer",
+                    sender_name="Peer Live",
+                    clean_text="帮忙看下站控状态",
+                )
+            ],
+        )
+        assert observed_mid_statuses == [ThreadStatus.active]
+        assert len(created) == 1
+        final = store.get_thread(created[0].id)
+        assert final is not None and final.status == ThreadStatus.completed
+
+    asyncio.run(_run())

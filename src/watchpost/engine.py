@@ -354,64 +354,88 @@ class WatchpostEngine:
         )
         original_preview, image_paths, topic = self._summarize_batch_for_notice(batch)
         title = f"[{channel.adapter}] {display_name}: {topic}"
-        preview_thread = matched_thread or ThreadRecord(
-            id="pending",
-            channel_id=channel.id,
-            backend=self.backend.name,
-            backend_thread_ref="",
-            sender_id=sender.sender_id,
-            sender_name=sender.sender_name,
-            title=topic,
+        is_steer = matched_thread is not None
+        thread_id = matched_thread.id if matched_thread is not None else f"th_{uuid.uuid4().hex[:12]}"
+        created_at = matched_thread.created_at if matched_thread is not None else now_ts
+        extra_ids = group_ctx.reply_chain_ids if (group_ctx and matched_thread is None) else []
+        mids = list(
+            dict.fromkeys(
+                [
+                    *(matched_thread.message_ids if matched_thread is not None else []),
+                    *(m.message_id for m in batch),
+                    *extra_ids,
+                ]
+            )
+        )
+        active_record = self.store.create_or_update_thread(
+            ThreadRecord(
+                id=thread_id,
+                channel_id=channel.id,
+                backend=self.backend.name,
+                backend_thread_ref=(
+                    matched_thread.backend_thread_ref if matched_thread is not None else f"pending_{thread_id}"
+                ),
+                sender_id=(matched_thread.sender_id if matched_thread is not None else sender.sender_id),
+                sender_name=(matched_thread.sender_name if matched_thread is not None else sender.sender_name),
+                title=topic,
+                status=ThreadStatus.active,
+                root_msg_id=(matched_thread.root_msg_id if matched_thread is not None else sender.message_id),
+                message_ids=mids,
+                triage_mode=(matched_thread.triage_mode if matched_thread is not None else TriageMode.mode_1_qa),
+                pending_go=False,
+                created_at=created_at,
+                updated_at=time.time(),
+            )
         )
         start_tokens = await self._notify_start_all(
             channel,
-            preview_thread,
+            active_record,
             original_preview,
-            is_steer=(matched_thread is not None),
+            is_steer=is_steer,
             attachments=image_paths,
         )
+        self._bind_tokens(thread_id, start_tokens)
 
         target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
-        if matched_thread is not None:
-            steer_msg = build_steer_prompt(
-                channel,
-                recent_messages,
-                batch,
-                group_context=group_ctx,
-                language=self.config.language,
+        try:
+            if matched_thread is not None:
+                steer_msg = build_steer_prompt(
+                    channel,
+                    recent_messages,
+                    batch,
+                    group_context=group_ctx,
+                    language=self.config.language,
+                )
+                result = await self.backend.steer_thread(
+                    matched_thread.backend_thread_ref,
+                    title,
+                    steer_msg,
+                    cwd=target_cwd,
+                    channel=channel,
+                )
+                backend_ref = matched_thread.backend_thread_ref
+            else:
+                prompt = build_new_thread_prompt(
+                    channel,
+                    channel.persona_text,
+                    recent_messages,
+                    batch,
+                    group_context=group_ctx,
+                    language=self.config.language,
+                )
+                backend_ref, result = await self.backend.start_thread(
+                    title,
+                    prompt,
+                    cwd=target_cwd,
+                    channel=channel,
+                )
+        except Exception:
+            self.store.create_or_update_thread(
+                active_record.model_copy(
+                    update={"status": ThreadStatus.error, "pending_go": False, "updated_at": time.time()}
+                )
             )
-            result = await self.backend.steer_thread(
-                matched_thread.backend_thread_ref,
-                title,
-                steer_msg,
-                cwd=target_cwd,
-                channel=channel,
-            )
-            thread_id = matched_thread.id
-            backend_ref = matched_thread.backend_thread_ref
-            mids = list(dict.fromkeys([*matched_thread.message_ids, *(m.message_id for m in batch)]))
-            created_at = matched_thread.created_at
-            is_steer = True
-        else:
-            prompt = build_new_thread_prompt(
-                channel,
-                channel.persona_text,
-                recent_messages,
-                batch,
-                group_context=group_ctx,
-                language=self.config.language,
-            )
-            backend_ref, result = await self.backend.start_thread(
-                title,
-                prompt,
-                cwd=target_cwd,
-                channel=channel,
-            )
-            thread_id = f"th_{uuid.uuid4().hex[:12]}"
-            extra_ids = group_ctx.reply_chain_ids if group_ctx else []
-            mids = list(dict.fromkeys([*(m.message_id for m in batch), *extra_ids]))
-            created_at = now_ts
-            is_steer = False
+            raise
 
         completion_label = self._completion_channel_label(
             channel,
@@ -437,24 +461,16 @@ class WatchpostEngine:
             else ThreadStatus.completed
         )
 
-        record = ThreadRecord(
-            id=thread_id,
-            channel_id=channel.id,
-            backend=self.backend.name,
-            backend_thread_ref=backend_ref or thread_id,
-            sender_id=sender.sender_id,
-            sender_name=sender.sender_name,
-            title=topic,
-            status=status,
-            root_msg_id=matched_thread.root_msg_id if matched_thread else sender.message_id,
-            message_ids=mids,
-            triage_mode=result.triage_mode,
-            pending_go=pending_go,
-            created_at=created_at,
-            updated_at=time.time(),
+        record = active_record.model_copy(
+            update={
+                "backend_thread_ref": backend_ref or thread_id,
+                "status": status,
+                "triage_mode": result.triage_mode,
+                "pending_go": pending_go,
+                "updated_at": time.time(),
+            }
         )
         record = self.store.create_or_update_thread(record)
-        self._bind_tokens(record.id, start_tokens)
         self.store.add_thread_event(
             ThreadEvent(
                 thread_id=record.id,
@@ -505,13 +521,22 @@ class WatchpostEngine:
             approved_go=approved_go,
             language=self.config.language,
         )
-        result = await self.backend.steer_thread(
-            thread.backend_thread_ref,
-            f"[{channel.adapter}] {channel.name}: {thread.title}",
-            steer_prompt,
-            cwd=target_cwd,
-            channel=channel,
+        active_thread = self.store.create_or_update_thread(
+            thread.model_copy(update={"status": ThreadStatus.active, "updated_at": time.time()})
         )
+        try:
+            result = await self.backend.steer_thread(
+                active_thread.backend_thread_ref,
+                f"[{channel.adapter}] {channel.name}: {active_thread.title}",
+                steer_prompt,
+                cwd=target_cwd,
+                channel=channel,
+            )
+        except Exception:
+            self.store.create_or_update_thread(
+                active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
+            )
+            raise
         all_bubbles, draft_reply = format_completion_bubbles(
             self._completion_channel_label(channel, sender_name=thread.sender_name),
             result.raw_text,
@@ -644,13 +669,24 @@ class WatchpostEngine:
                 is_steer=True,
                 language=self.config.language,
             )
-            result = await self.backend.steer_thread(
-                active_thread.backend_thread_ref,
-                f"[direct] {ch.name}: {active_thread.title}",
-                prompt,
-                cwd=target_cwd,
-                channel=ch,
+            active_thread = self.store.create_or_update_thread(
+                active_thread.model_copy(
+                    update={"status": ThreadStatus.active, "pending_go": False, "updated_at": time.time()}
+                )
             )
+            try:
+                result = await self.backend.steer_thread(
+                    active_thread.backend_thread_ref,
+                    f"[direct] {ch.name}: {active_thread.title}",
+                    prompt,
+                    cwd=target_cwd,
+                    channel=ch,
+                )
+            except Exception:
+                self.store.create_or_update_thread(
+                    active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
+                )
+                raise
             all_bubbles, draft_reply = format_completion_bubbles(
                 self._completion_channel_label(ch),
                 result.raw_text,
@@ -680,18 +716,26 @@ class WatchpostEngine:
             await self._notify_completion_all(ch, updated, all_bubbles)
             return updated
 
-        preview = ThreadRecord(
-            id="pending",
-            channel_id=ch.id,
-            backend=self.backend.name,
-            backend_thread_ref="",
-            sender_id=action.notifier,
-            sender_name="Owner",
-            title=topic,
+        thread_id = f"th_{uuid.uuid4().hex[:12]}"
+        active_record = self.store.create_or_update_thread(
+            ThreadRecord(
+                id=thread_id,
+                channel_id=ch.id,
+                backend=self.backend.name,
+                backend_thread_ref=f"personal_{thread_id}",
+                sender_id=action.notifier,
+                sender_name="Owner",
+                title=topic,
+                status=ThreadStatus.active,
+                pending_go=False,
+                created_at=now_ts,
+                updated_at=time.time(),
+            )
         )
         start_tokens: list[tuple[str, str]] = []
         if self.config.ack_on_receive:
-            start_tokens = await self._notify_start_all(ch, preview, topic, is_steer=False)
+            start_tokens = await self._notify_start_all(ch, active_record, topic, is_steer=False)
+            self._bind_tokens(thread_id, start_tokens)
 
         prompt = build_personal_direct_prompt(
             owner_message,
@@ -700,34 +744,34 @@ class WatchpostEngine:
             is_steer=False,
             language=self.config.language,
         )
-        backend_ref, result = await self.backend.start_thread(
-            title,
-            prompt,
-            cwd=target_cwd,
-            channel=ch,
-        )
+        try:
+            backend_ref, result = await self.backend.start_thread(
+                title,
+                prompt,
+                cwd=target_cwd,
+                channel=ch,
+            )
+        except Exception:
+            self.store.create_or_update_thread(
+                active_record.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
+            )
+            raise
         all_bubbles, draft_reply = format_completion_bubbles(
             self._completion_channel_label(ch),
             result.raw_text,
             error=result.error,
             language=self.config.language,
         )
-        record = ThreadRecord(
-            id=f"th_{uuid.uuid4().hex[:12]}",
-            channel_id=ch.id,
-            backend=self.backend.name,
-            backend_thread_ref=backend_ref or f"personal_{uuid.uuid4().hex[:8]}",
-            sender_id=action.notifier,
-            sender_name="Owner",
-            title=topic,
-            status=ThreadStatus.error if result.error else ThreadStatus.completed,
-            triage_mode=result.triage_mode,
-            pending_go=False,
-            created_at=now_ts,
-            updated_at=time.time(),
+        record = active_record.model_copy(
+            update={
+                "backend_thread_ref": backend_ref or active_record.backend_thread_ref,
+                "status": ThreadStatus.error if result.error else ThreadStatus.completed,
+                "triage_mode": result.triage_mode,
+                "pending_go": False,
+                "updated_at": time.time(),
+            }
         )
         record = self.store.create_or_update_thread(record)
-        self._bind_tokens(record.id, start_tokens)
         self.store.add_thread_event(ThreadEvent(thread_id=record.id, kind="inbound", raw_text=owner_message))
         self.store.add_thread_event(
             ThreadEvent(
