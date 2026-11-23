@@ -485,6 +485,40 @@ class WatchpostStore:
             row = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
             return _row_to_thread(row) if row else None
 
+    def dismiss_thread_go(self, thread_id: str) -> ThreadRecord | None:
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                """
+                UPDATE threads
+                SET pending_go = 0,
+                    status = CASE WHEN status = 'awaiting_go' THEN 'completed' ELSE status END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, thread_id),
+            )
+            updated = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
+        return _row_to_thread(updated) if updated else None
+
+    def dismiss_all_pending_go(self) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE threads
+                SET pending_go = 0,
+                    status = CASE WHEN status = 'awaiting_go' THEN 'completed' ELSE status END,
+                    updated_at = ?
+                WHERE pending_go = 1
+                """,
+                (now,),
+            )
+            return int(cur.rowcount or 0)
+
     def list_threads(self, *, limit: int = 50) -> list[ThreadRecord]:
         with self._connect() as conn:
             rows = conn.execute(

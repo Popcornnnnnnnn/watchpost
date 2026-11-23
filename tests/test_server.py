@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from watchpost.models import ThreadStatus
 from watchpost.server import create_app
 
 
@@ -65,3 +66,35 @@ def test_headless_root_and_rest_api_flow() -> None:
         assert h1["metrics"]["awaiting_go"] == 0
 
         assert client.get("/api/threads/nonexistent").status_code == 404
+        assert client.post("/api/threads/nonexistent/dismiss").status_code == 404
+
+
+def test_dismiss_and_dismiss_all_pending_go() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = create_app(Path(tmp) / "daemon.db")
+        client = TestClient(app)
+
+        sim = client.post("/api/simulate/run")
+        assert sim.status_code == 200
+
+        threads = client.get("/api/threads").json()
+        go_thread = next(t for t in threads if t["pending_go"])
+
+        dismissed = client.post(f"/api/threads/{go_thread['id']}/dismiss")
+        assert dismissed.status_code == 200
+        assert dismissed.json()["pending_go"] is False
+        assert dismissed.json()["status"] == "completed"
+        assert client.get("/api/health").json()["metrics"]["awaiting_go"] == 0
+
+        # Re-simulate and test bulk dismiss-all
+        store = app.state.watchpost_store
+        store.create_or_update_thread(
+            store.get_thread(go_thread["id"]).model_copy(
+                update={"pending_go": True, "status": ThreadStatus.awaiting_go}
+            )
+        )
+        assert client.get("/api/health").json()["metrics"]["awaiting_go"] == 1
+        bulk = client.post("/api/threads/dismiss-all")
+        assert bulk.status_code == 200
+        assert bulk.json() == {"cleared": 1, "awaiting_go": 0}
+        assert client.get("/api/health").json()["metrics"]["awaiting_go"] == 0

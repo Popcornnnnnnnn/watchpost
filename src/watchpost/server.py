@@ -106,6 +106,11 @@ def create_app(
             out.append(data)
         return out
 
+    @app.post("/api/threads/dismiss-all")
+    async def dismiss_all_threads() -> dict[str, Any]:
+        cleared = store.dismiss_all_pending_go()
+        return {"cleared": cleared, "awaiting_go": store.get_metrics()["awaiting_go"]}
+
     @app.get("/api/threads/{thread_id}")
     async def get_thread(thread_id: str) -> dict[str, Any]:
         th = store.get_thread(thread_id)
@@ -129,6 +134,16 @@ def create_app(
     async def approve_thread(thread_id: str) -> dict[str, Any]:
         try:
             updated = await engine.steer_from_owner(thread_id, "go", approved_go=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        data = updated.model_dump(mode="json")
+        data["events"] = [e.model_dump(mode="json") for e in store.list_thread_events(thread_id)]
+        return data
+
+    @app.post("/api/threads/{thread_id}/dismiss")
+    async def dismiss_thread(thread_id: str) -> dict[str, Any]:
+        try:
+            updated = engine.dismiss_go(thread_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         data = updated.model_dump(mode="json")

@@ -7,6 +7,7 @@ import re
 from watchpost.models import OwnerAction
 
 _APPROVE_TOKENS = {"go", "approve", "执行", "改吧", "批准", "同意", "可以改", "继续执行"}
+_DISMISS_TOKENS = {"dismiss", "skip", "cancel", "忽略", "取消", "不用", "算了", "关闭go"}
 _STATUS_TOKENS = {"/status", "status", "状态"}
 _LIST_TOKENS = {"/list", "list", "列表"}
 _HELP_TOKENS = {"/help", "help", "帮助"}
@@ -54,6 +55,8 @@ def classify_owner_command(
     lower = clean.lower()
     if lower in _APPROVE_TOKENS or clean in _APPROVE_TOKENS:
         kind = "approve_go"
+    elif lower in _DISMISS_TOKENS or clean in _DISMISS_TOKENS:
+        kind = "dismiss_go"
     elif lower in _STATUS_TOKENS or clean in _STATUS_TOKENS:
         kind = "status"
     elif lower in _LIST_TOKENS or clean in _LIST_TOKENS:
@@ -76,11 +79,12 @@ def classify_owner_command(
         if indexed is not None:
             list_index, rest = indexed
             rest_lower = rest.lower()
-            cmd_kind = (
-                "approve_go"
-                if rest and (rest_lower in _APPROVE_TOKENS or rest in _APPROVE_TOKENS)
-                else "steer"
-            )
+            if rest and (rest_lower in _APPROVE_TOKENS or rest in _APPROVE_TOKENS):
+                cmd_kind = "approve_go"
+            elif rest and (rest_lower in _DISMISS_TOKENS or rest in _DISMISS_TOKENS):
+                cmd_kind = "dismiss_go"
+            else:
+                cmd_kind = "steer"
             return OwnerAction(
                 notifier=notifier,
                 kind=cmd_kind,

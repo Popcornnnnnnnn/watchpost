@@ -106,7 +106,7 @@ End with these exact plain-text headings (NO Markdown, no `**`/`*`/`` ` ``/`#`, 
 （只写发给 {target} 的简洁纯中文草稿，2–4 句短话，方便长按复制。）
 
 需要注意：
-（写 `无`，或 1 句 40 字以内的纯中文提醒。）"""
+（仅当需要主人回复 `go` 批准执行代码修改、部署或重启时，写 1 句 40 字以内的纯中文待审批说明；普通排查提醒、无法连网或无需执行动作时一律写 `无`。）"""
 
     return f"""## Required Final Response Format (Short Texting Style)
 End with these exact plain-text headings (NO Markdown symbols, no bullet dumps, no raw SHAs/PIDs):
@@ -118,7 +118,7 @@ Suggested Reply:
 (ONLY the concise copy-ready draft for {target}, with zero extra labels inside it.)
 
 Needs Attention:
-(Write `None` or 1 brief sentence if owner action or `"go"` approval is needed.)"""
+(Write `None` unless explicit owner `"go"` approval is needed for a concrete code edit, deploy, or restart; do NOT put general caveats or FYIs here.)"""
 
 
 def build_new_thread_prompt(

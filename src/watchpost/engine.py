@@ -541,6 +541,15 @@ class WatchpostEngine:
         await self._notify_completion_all(channel, updated, all_bubbles)
         return updated
 
+    def dismiss_go(self, thread_id: str) -> ThreadRecord:
+        updated = self.store.dismiss_thread_go(thread_id)
+        if updated is None:
+            raise KeyError(f"Unknown thread: {thread_id}")
+        self.store.add_thread_event(
+            ThreadEvent(thread_id=updated.id, kind="owner_dismiss", raw_text="dismiss")
+        )
+        return updated
+
     def _format_owner_action_message(
         self,
         action: OwnerAction,
@@ -744,6 +753,7 @@ class WatchpostEngine:
                 "- list / 列表：查看最近 5 条会话（支持 #1 / #2 引用）\n"
                 "- #N 内容 或 #N go：追问或批准列表第 N 条会话\n"
                 "- go / 执行：批准最近一条待确认会话执行修复\n"
+                "- skip / 忽略（或 #N skip / 左滑回复 忽略）：清除待确认（go）标记但不执行\n"
                 "- /new [内容]：开启新的个人直聊会话\n"
                 "- /reset：重置个人直聊上下文\n"
                 "- 直接发文字/语音/图片：自动进行个人直聊或按回复引用追问"
@@ -753,6 +763,7 @@ class WatchpostEngine:
                 "- list: show recent threads (#1..#5)\n"
                 "- #N <text> or #N go: steer or approve listed thread N\n"
                 "- go / approve: approve latest pending thread\n"
+                "- skip / dismiss (or #N skip): clear pending go without executing\n"
                 "- /new [text]: start a fresh personal direct chat\n"
                 "- /reset: clear personal direct chat context\n"
                 "- direct text/voice/image: personal chat or quote-reply steer"
@@ -858,6 +869,36 @@ class WatchpostEngine:
             if not target_id:
                 recent = self.store.list_threads(limit=1)
                 target_id = recent[0].id if recent else ""
+
+        if action.kind == "dismiss_go":
+            if not target_id:
+                for th in self.store.list_threads(limit=20):
+                    if th.pending_go:
+                        target_id = th.id
+                        break
+            if not target_id:
+                await self._send_owner_reply(
+                    action.notifier,
+                    "当前没有待确认执行（go）的会话。" if is_zh else "No pending go approvals to dismiss.",
+                )
+                return None
+            try:
+                updated = self.dismiss_go(target_id)
+            except KeyError:
+                await self._send_owner_reply(
+                    action.notifier,
+                    "未找到对应会话，无法关闭待确认标记。" if is_zh else "Thread not found; cannot dismiss go.",
+                )
+                return None
+            await self._send_owner_reply(
+                action.notifier,
+                (
+                    f"已关闭待确认（go）：{updated.title}"
+                    if is_zh
+                    else f"Dismissed pending go: {updated.title}"
+                ),
+            )
+            return updated
 
         if not target_id and action.kind == "steer":
             has_personal_ws = self.config.personal_workspace_dir is not None

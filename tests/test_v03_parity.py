@@ -45,6 +45,7 @@ from watchpost.models import (
     NormalizedMessage,
     OwnerAction,
     ThreadRecord,
+    ThreadStatus,
     TriggerMode,
 )
 from watchpost.notifiers import classify_owner_command
@@ -498,6 +499,10 @@ def test_command_classifier_and_engine_v03_parity(tmp_path: Path) -> None:
     assert np is not None and np.kind == "new_personal" and np.text == "check logs"
     idx_go = classify_owner_command("#2 go", notifier="imessage")
     assert idx_go is not None and idx_go.kind == "approve_go" and idx_go.list_index == 2
+    assert classify_owner_command("skip", notifier="imessage").kind == "dismiss_go"  # type: ignore[union-attr]
+    assert classify_owner_command("忽略", notifier="imessage").kind == "dismiss_go"  # type: ignore[union-attr]
+    idx_dismiss = classify_owner_command("#2 dismiss", notifier="imessage")
+    assert idx_dismiss is not None and idx_dismiss.kind == "dismiss_go" and idx_dismiss.list_index == 2
 
     persona_path = tmp_path / "ops_persona.md"
     persona_path.write_text("Monitor critical gateway alarms calmly.", encoding="utf-8")
@@ -610,6 +615,24 @@ def test_command_classifier_and_engine_v03_parity(tmp_path: Path) -> None:
         # /new <body?> starts a brand-new personal thread immediately
         p4 = await engine.handle_owner_action(classify_owner_command("/new 检查分支", notifier="imessage"))  # type: ignore[arg-type]
         assert p4 is not None and p4.id != p3.id
+
+        # Dismissing pending_go via owner command ("忽略") clears flag without invoking backend
+        store.create_or_update_thread(
+            created[0].model_copy(update={"pending_go": True, "status": ThreadStatus.awaiting_go})
+        )
+        assert store.get_metrics()["awaiting_go"] == 1
+        steers_before = len(backend.steers)
+        starts_before = len(backend.starts)
+        dismissed = await engine.handle_owner_action(
+            OwnerAction(notifier="imessage", kind="dismiss_go", text="忽略")
+        )
+        assert dismissed is not None and dismissed.id == created[0].id
+        assert dismissed.pending_go is False
+        assert dismissed.status == ThreadStatus.completed
+        assert store.get_metrics()["awaiting_go"] == 0
+        assert len(backend.steers) == steers_before
+        assert len(backend.starts) == starts_before
+        assert any("已关闭待确认（go）" in txt for txt in notifier.direct_replies)
 
     asyncio.run(_run())
 
