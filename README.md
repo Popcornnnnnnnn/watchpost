@@ -1,5 +1,7 @@
 # Watchpost
 
+**Website:** [watchpost.popcornnn.xyz](https://watchpost.popcornnn.xyz)
+
 **Headless local background bridge for your coding agent (`Apache-2.0`).**
 Watches selected chat channels, runs local triage + your coding agent (`Antigravity`, `Codex`, `Claude Code`, `Gemini CLI`, with automatic primary→backup failover), and delivers concise diagnoses and **1-tap-copy draft replies** strictly to your phone or DM—never auto-sending to external senders.
 

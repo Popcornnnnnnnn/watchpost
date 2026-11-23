@@ -1,0 +1,182 @@
+/* Watchpost Showcase Design Tokens
+ * Layer architecture + light-dark() + prefers-color-scheme + :has(meta[name="color-scheme"])
+ */
+
+@layer reset, base, theme, components, utilities;
+
+@layer theme {
+  :root {
+    --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", Consolas, monospace;
+
+    /* Fluid typography (max <= 2.5 * min for WCAG 1.4.4 200% zoom) */
+    --text-hero: clamp(2.15rem, 1.35rem + 2.8vw, 3.65rem);
+    --text-h2: clamp(1.55rem, 1.15rem + 1.4vw, 2.35rem);
+    --text-h3: clamp(1.1rem, 1rem + 0.45vw, 1.35rem);
+    --text-lead: clamp(1.02rem, 0.94rem + 0.35vw, 1.24rem);
+
+    /* Raw light & dark color pairs */
+    --raw-bg-light: #F5F7FB;
+    --raw-bg-dark: #070B13;
+    --raw-surface-light: #FFFFFF;
+    --raw-surface-dark: #0E1523;
+    --raw-slab-light: #E9EEF7;
+    --raw-slab-dark: #151F32;
+    --raw-glass-light: rgba(245, 247, 251, 0.84);
+    --raw-glass-dark: rgba(7, 11, 19, 0.84);
+
+    --raw-ink-light: #0D1320;
+    --raw-ink-dark: #F1F5F9;
+    --raw-ink-secondary-light: #3E485C;
+    --raw-ink-secondary-dark: #A5B4CC;
+    --raw-ink-muted-light: #59657D;
+    --raw-ink-muted-dark: #8696B0;
+
+    --raw-border-light: rgba(13, 19, 32, 0.11);
+    --raw-border-dark: rgba(241, 245, 249, 0.12);
+    --raw-border-strong-light: rgba(13, 19, 32, 0.22);
+    --raw-border-strong-dark: rgba(241, 245, 249, 0.22);
+
+    --raw-accent-light: #1D4ED8;
+    --raw-accent-dark: #60A5FA;
+    --raw-accent-solid-light: #1D4ED8;
+    --raw-accent-solid-dark: #2563EB;
+    --raw-accent-tint-light: rgba(29, 78, 216, 0.10);
+    --raw-accent-tint-dark: rgba(59, 130, 246, 0.18);
+
+    --raw-ok-ink-light: #065F46;
+    --raw-ok-ink-dark: #34D399;
+    --raw-ok-bg-light: #D1FAE5;
+    --raw-ok-bg-dark: rgba(16, 185, 129, 0.16);
+
+    --raw-warn-ink-light: #92400E;
+    --raw-warn-ink-dark: #FBBF24;
+    --raw-warn-bg-light: #FEF3C7;
+    --raw-warn-bg-dark: rgba(245, 158, 11, 0.16);
+
+    --raw-scroll-track-light: #EAEFF6;
+    --raw-scroll-track-dark: #0D1422;
+    --raw-scroll-thumb-light: #6B778D;
+    --raw-scroll-thumb-dark: #4B5B78;
+
+    /* Progressive enhancement defaults (light fallback) */
+    --bg: var(--raw-bg-light);
+    --surface: var(--raw-surface-light);
+    --slab: var(--raw-slab-light);
+    --glass: var(--raw-glass-light);
+    --ink: var(--raw-ink-light);
+    --ink-secondary: var(--raw-ink-secondary-light);
+    --ink-muted: var(--raw-ink-muted-light);
+    --border: var(--raw-border-light);
+    --border-strong: var(--raw-border-strong-light);
+    --accent: var(--raw-accent-light);
+    --accent-solid: var(--raw-accent-solid-light);
+    --accent-tint: var(--raw-accent-tint-light);
+    --ok-ink: var(--raw-ok-ink-light);
+    --ok-bg: var(--raw-ok-bg-light);
+    --warn-ink: var(--raw-warn-ink-light);
+    --warn-bg: var(--raw-warn-bg-light);
+    --scroll-track: var(--raw-scroll-track-light);
+    --scroll-thumb: var(--raw-scroll-thumb-light);
+
+    @media (prefers-color-scheme: dark) {
+      --bg: var(--raw-bg-dark);
+      --surface: var(--raw-surface-dark);
+      --slab: var(--raw-slab-dark);
+      --glass: var(--raw-glass-dark);
+      --ink: var(--raw-ink-dark);
+      --ink-secondary: var(--raw-ink-secondary-dark);
+      --ink-muted: var(--raw-ink-muted-dark);
+      --border: var(--raw-border-dark);
+      --border-strong: var(--raw-border-strong-dark);
+      --accent: var(--raw-accent-dark);
+      --accent-solid: var(--raw-accent-solid-dark);
+      --accent-tint: var(--raw-accent-tint-dark);
+      --ok-ink: var(--raw-ok-ink-dark);
+      --ok-bg: var(--raw-ok-bg-dark);
+      --warn-ink: var(--raw-warn-ink-dark);
+      --warn-bg: var(--raw-warn-bg-dark);
+      --scroll-track: var(--raw-scroll-track-dark);
+      --scroll-thumb: var(--raw-scroll-thumb-dark);
+    }
+
+    @supports (color: light-dark(white, black)) {
+      --bg: light-dark(var(--raw-bg-light), var(--raw-bg-dark));
+      --surface: light-dark(var(--raw-surface-light), var(--raw-surface-dark));
+      --slab: light-dark(var(--raw-slab-light), var(--raw-slab-dark));
+      --glass: light-dark(var(--raw-glass-light), var(--raw-glass-dark));
+      --ink: light-dark(var(--raw-ink-light), var(--raw-ink-dark));
+      --ink-secondary: light-dark(var(--raw-ink-secondary-light), var(--raw-ink-secondary-dark));
+      --ink-muted: light-dark(var(--raw-ink-muted-light), var(--raw-ink-muted-dark));
+      --border: light-dark(var(--raw-border-light), var(--raw-border-dark));
+      --border-strong: light-dark(var(--raw-border-strong-light), var(--raw-border-strong-dark));
+      --accent: light-dark(var(--raw-accent-light), var(--raw-accent-dark));
+      --accent-solid: light-dark(var(--raw-accent-solid-light), var(--raw-accent-solid-dark));
+      --accent-tint: light-dark(var(--raw-accent-tint-light), var(--raw-accent-tint-dark));
+      --ok-ink: light-dark(var(--raw-ok-ink-light), var(--raw-ok-ink-dark));
+      --ok-bg: light-dark(var(--raw-ok-bg-light), var(--raw-ok-bg-dark));
+      --warn-ink: light-dark(var(--raw-warn-ink-light), var(--raw-warn-ink-dark));
+      --warn-bg: light-dark(var(--raw-warn-bg-light), var(--raw-warn-bg-dark));
+      --scroll-track: light-dark(var(--raw-scroll-track-light), var(--raw-scroll-track-dark));
+      --scroll-thumb: light-dark(var(--raw-scroll-thumb-light), var(--raw-scroll-thumb-dark));
+    }
+
+    color-scheme: light dark;
+    accent-color: var(--accent);
+    scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+
+    &:has(> head > meta[name="color-scheme"][content="dark"]) {
+      color-scheme: dark;
+    }
+
+    &:has(> head > meta[name="color-scheme"][content="light"]) {
+      color-scheme: light;
+    }
+  }
+
+  /* Explicit scheme fallback for browsers supporting :has without light-dark() */
+  @supports not (color: light-dark(white, black)) {
+    :root:has(> head > meta[name="color-scheme"][content="dark"]) {
+      --bg: var(--raw-bg-dark);
+      --surface: var(--raw-surface-dark);
+      --slab: var(--raw-slab-dark);
+      --glass: var(--raw-glass-dark);
+      --ink: var(--raw-ink-dark);
+      --ink-secondary: var(--raw-ink-secondary-dark);
+      --ink-muted: var(--raw-ink-muted-dark);
+      --border: var(--raw-border-dark);
+      --border-strong: var(--raw-border-strong-dark);
+      --accent: var(--raw-accent-dark);
+      --accent-solid: var(--raw-accent-solid-dark);
+      --accent-tint: var(--raw-accent-tint-dark);
+      --ok-ink: var(--raw-ok-ink-dark);
+      --ok-bg: var(--raw-ok-bg-dark);
+      --warn-ink: var(--raw-warn-ink-dark);
+      --warn-bg: var(--raw-warn-bg-dark);
+      --scroll-track: var(--raw-scroll-track-dark);
+      --scroll-thumb: var(--raw-scroll-thumb-dark);
+    }
+
+    :root:has(> head > meta[name="color-scheme"][content="light"]) {
+      --bg: var(--raw-bg-light);
+      --surface: var(--raw-surface-light);
+      --slab: var(--raw-slab-light);
+      --glass: var(--raw-glass-light);
+      --ink: var(--raw-ink-light);
+      --ink-secondary: var(--raw-ink-secondary-light);
+      --ink-muted: var(--raw-ink-muted-light);
+      --border: var(--raw-border-light);
+      --border-strong: var(--raw-border-strong-light);
+      --accent: var(--raw-accent-light);
+      --accent-solid: var(--raw-accent-solid-light);
+      --accent-tint: var(--raw-accent-tint-light);
+      --ok-ink: var(--raw-ok-ink-light);
+      --ok-bg: var(--raw-ok-bg-light);
+      --warn-ink: var(--raw-warn-ink-light);
+      --warn-bg: var(--raw-warn-bg-light);
+      --scroll-track: var(--raw-scroll-track-light);
+      --scroll-thumb: var(--raw-scroll-thumb-light);
+    }
+  }
+}

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://watchpost.popcornnn.xyz/sitemap.xml

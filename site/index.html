@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script>
+    try {
+      var savedTheme = localStorage.getItem('watchpost.theme');
+      if (savedTheme === 'light' || savedTheme === 'dark') {
+        document.querySelector('meta[name="color-scheme"]').content = savedTheme;
+      }
+      var savedLang = localStorage.getItem('watchpost.lang');
+      if (savedLang === 'zh-Hans') {
+        document.documentElement.lang = 'zh-Hans';
+      }
+    } catch (e) {}
+  </script>
+  <title>Watchpost — Headless Local Bridge for Your Coding Agent</title>
+  <meta name="description" content="Watchpost monitors noisy work chats locally, runs your coding agent with automatic failover, and pushes concise diagnoses and 1-tap copy draft replies to your phone—never auto-sending to outsiders.">
+  <link rel="canonical" href="https://watchpost.popcornnn.xyz/">
+  <meta property="og:title" content="Watchpost — Stand watch over noisy chats. Never auto-send a word.">
+  <meta property="og:description" content="Headless Apache-2.0 local background bridge for Antigravity, Codex, Claude Code, and Gemini CLI across Feishu, Slack, Discord, Telegram, DingTalk, WeCom, iMessage, ntfy, Bark, and Pushover.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://watchpost.popcornnn.xyz/">
+  <meta property="og:image" content="https://watchpost.popcornnn.xyz/assets/og-watchpost.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Watchpost — Headless Local Agent Bridge">
+  <meta name="twitter:description" content="4-mode triage, Quiet Hours, cross-channel incident memory, zero-downtime hot reload, and 15+ native platforms.">
+  <meta name="twitter:image" content="https://watchpost.popcornnn.xyz/assets/og-watchpost.png">
+  <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
+  <link rel="stylesheet" href="./styles/tokens.css">
+  <link rel="stylesheet" href="./styles/main.css">
+  <script type="module" src="./scripts/main.js"></script>
+</head>
+<body>
+  <a class="skip-link visually-hidden" href="#main-content" data-i18n="nav.skip">Skip to main content</a>
+  <div id="live-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand-link" href="#main-content">
+        <svg class="brand-icon" aria-hidden="true" viewBox="0 0 64 64" fill="none">
+          <rect width="64" height="64" rx="16" fill="#0B111C"/>
+          <path d="M18 46h28" stroke="#94A3B8" stroke-width="3.2" stroke-linecap="round"/>
+          <path d="M24 46l3.5-20h9L40 46" stroke="#E2E8F0" stroke-width="3.2" stroke-linejoin="round"/>
+          <rect x="26" y="16" width="12" height="10" rx="3" fill="#3B82F6"/>
+          <circle cx="32" cy="21" r="2.2" fill="#FFFFFF"/>
+          <path d="M44 17a15 15 0 0 1 0 10" stroke="#F59E0B" stroke-width="3.2" stroke-linecap="round"/>
+        </svg>
+        <span>Watchpost</span>
+        <span class="brand-badge">v0.3</span>
+      </a>
+
+      <nav class="primary-nav" aria-label="Primary">
+        <a href="#simulator" data-i18n="nav.simulator">Simulator</a>
+        <a href="#guardrails" data-i18n="nav.guardrails">Guardrails</a>
+        <a href="#platforms" data-i18n="nav.platforms">Platforms</a>
+        <a href="#quickstart" data-i18n="nav.quickstart">Quickstart</a>
+      </nav>
+
+      <div class="header-actions">
+        <button type="button" class="pill-btn" id="lang-toggle" aria-pressed="false">
+          <span data-i18n="controls.langLabel">中文</span>
+        </button>
+        <button type="button" class="icon-btn" id="theme-toggle" aria-pressed="false">
+          <span class="theme-option-light">
+            <svg class="theme-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+            <span class="visually-hidden" data-i18n="controls.toLight">Switch to light theme</span>
+          </span>
+          <span class="theme-option-dark">
+            <svg class="theme-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+            <span class="visually-hidden" data-i18n="controls.toDark">Switch to dark theme</span>
+          </span>
+        </button>
+        <a class="pill-btn" href="https://popcornnn.xyz/" data-i18n="nav.studio">Studio</a>
+      </div>
+    </div>
+  </header>
+
+  <main id="main-content" tabindex="-1">
+    <section class="hero">
+      <div class="container hero-grid">
+        <div>
+          <div class="eyebrow">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            <span data-i18n="hero.eyebrow">HEADLESS LOCAL AGENT BRIDGE · APACHE-2.0</span>
+          </div>
+          <h1 data-i18n="hero.title">Stand watch over noisy chats. Never auto-send a word.</h1>
+          <p class="hero-sub" data-i18n="hero.sub">
+            Watchpost passively watches selected team chats, runs your local coding agent with automatic backup failover, and pushes crisp diagnoses plus 1-tap copy draft replies straight to your phone—waiting for your "go" before touching code.
+          </p>
+          <div class="cta-row">
+            <a class="btn-primary" href="#simulator" data-i18n="hero.ctaPrimary">Try Live Simulator</a>
+            <a class="btn-secondary" href="#quickstart" data-i18n="hero.ctaSecondary">Setup in 60s</a>
+            <a class="btn-secondary" href="https://github.com/Popcornnnnnnnn/watchpost" data-i18n="hero.ctaRepo">GitHub Repo</a>
+          </div>
+          <div class="trust-strip">
+            <div class="trust-item">
+              <strong data-i18n="trust.t1Title">Draft-First Safety</strong>
+              <span data-i18n="trust.t1Sub">Zero auto-replies to outsiders</span>
+            </div>
+            <div class="trust-item">
+              <strong data-i18n="trust.t2Title">15+ Native Platforms</strong>
+              <span data-i18n="trust.t2Sub">Chats + phone push built in</span>
+            </div>
+            <div class="trust-item">
+              <strong data-i18n="trust.t3Title">100% Local State</strong>
+              <span data-i18n="trust.t3Sub">SQLite WAL + Whisper ASR</span>
+            </div>
+            <div class="trust-item">
+              <strong data-i18n="trust.t4Title">Primary → Backup Agent</strong>
+              <span data-i18n="trust.t4Sub">Antigravity, Codex, Claude, Gemini</span>
+            </div>
+          </div>
+        </div>
+
+        <aside class="flow-card" aria-label="Watchpost signal flow overview">
+          <div class="flow-step">
+            <div class="flow-kicker" data-i18n="flow.k1">01 · Inbound Work Channels (Read-Only)</div>
+            <p data-i18n="flow.v1">Feishu · Slack · Discord · Telegram · DingTalk · WeCom · WhatsApp SDK — debounced bursts + Bucket 1/2 reply-chain context.</p>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">↓</div>
+          <div class="flow-step">
+            <div class="flow-kicker" data-i18n="flow.k2">02 · Local Coding Agent + Guardrails</div>
+            <p data-i18n="flow.v2">Antigravity (agentapi + Stop Hook) with auto-failover to Codex / Claude Code / Gemini CLI, cross-channel memory &amp; Quiet Hours queue.</p>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">↓</div>
+          <div class="flow-step is-gate">
+            <div class="flow-kicker" data-i18n="flow.k3">03 · Phone Entrance + "go" Gate</div>
+            <p data-i18n="flow.v3">iMessage · Telegram · Slack/Discord DM · WeCom · ntfy · Bark · Pushover — concise bubbles + 1-tap copy draft. Reply "go" to execute fixes.</p>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section" id="simulator">
+      <div class="container">
+        <div class="section-head">
+          <h2 data-i18n="sim.heading">Interactive Bridge Simulator</h2>
+          <p data-i18n="sim.sub">
+            Switch between real scenarios and test how Watchpost separates noisy group triage, overnight Quiet Hours, sibling-channel recall, and Personal Direct Chat.
+          </p>
+        </div>
+
+        <div class="tabs-widget sim-shell" data-tabs-widget="simulator">
+          <div class="tablist-scroll" role="tablist" focusgroup="tablist nomemory" aria-label="Watchpost scenario simulator">
+            <button type="button" role="tab" id="sim-tab-triage" aria-selected="true" tabindex="0" focusgroupstart data-i18n="sim.tab1">Incident Triage</button>
+            <button type="button" role="tab" id="sim-tab-quiet" aria-selected="false" tabindex="-1" data-i18n="sim.tab2">Quiet Hours</button>
+            <button type="button" role="tab" id="sim-tab-memory" aria-selected="false" tabindex="-1" data-i18n="sim.tab3">Cross-Channel Memory</button>
+            <button type="button" role="tab" id="sim-tab-direct" aria-selected="false" tabindex="-1" data-i18n="sim.tab4">Personal Direct Chat</button>
+          </div>
+
+          <!-- Panel 1: Incident Triage -->
+          <div role="tabpanel" aria-labelledby="sim-tab-triage" tabindex="0" data-sim-panel="triage">
+            <div class="sim-grid">
+              <div class="pane-card">
+                <div class="pane-head">
+                  <span class="pane-title" data-i18n="sim.p1LeftTitle">Slack · #ops-alerts (diagnose_only)</span>
+                  <span class="pane-meta" data-i18n="sim.p1LeftBadge">25s Burst · No Read Leak</span>
+                </div>
+                <div class="msg-bubble">
+                  <span class="msg-sender">Alex · 14:08:11</span>
+                  <span data-i18n="sim.p1Msg1">Staging checkout webhook just started timing out with 502s.</span>
+                </div>
+                <div class="msg-bubble">
+                  <span class="msg-sender">Alex · 14:08:23</span>
+                  <span data-i18n="sim.p1Msg2">@owner can you check worker/db.py? Looks like pool exhaustion.</span>
+                </div>
+                <div class="sim-status-note" data-sim-state="triage" data-i18n="sim.p1StateInit">
+                  Watchpost finished read-only diagnosis (Mode 4 Bug) and paused at the "go" approval gate. Outsiders see nothing until you copy or approve.
+                </div>
+              </div>
+
+              <div class="pane-card">
+                <div class="pane-head">
+                  <span class="pane-title" data-i18n="sim.p1RightTitle">Owner Phone · iMessage / Slack DM</span>
+                  <span class="pane-meta is-warn" data-sim-badge="triage" data-i18n="sim.p1RightBadgeInit">Awaiting "go"</span>
+                </div>
+                <div class="msg-bubble is-phone" data-i18n="sim.p1Bubble1">
+                  [Slack · #ops-alerts] worker/db.py opens an unclosed session when retries throw on HTTP 502 (verified locally, 3 unit checks pass). Say "go" to apply the patch or "skip" to dismiss.
+                </div>
+                <div class="msg-bubble is-draft">
+                  <div class="draft-head">
+                    <span class="draft-label" data-i18n="sim.draftLabel">1-Tap Copy Draft (Bark / UI)</span>
+                    <button type="button" class="mini-copy-btn" data-copy-target="draft-triage" aria-label="Copy triage reply draft" data-i18n="sim.copyBtn">Copy Draft</button>
+                  </div>
+                  <p id="draft-triage" data-i18n="sim.p1Draft">Looking at worker/db.py now — found the session leak on 502 retries. Preparing a safe fix and will share diff results shortly.</p>
+                </div>
+                <div class="msg-bubble is-owner" hidden data-sim-reply="triage"></div>
+                <div class="sim-actions">
+                  <button type="button" class="chip-btn is-approve" data-sim-act="approve" data-panel="triage" data-i18n="sim.btnGo">Reply "go"</button>
+                  <button type="button" class="chip-btn" data-sim-act="dismiss" data-panel="triage" data-i18n="sim.btnSkip">Reply "skip"</button>
+                  <button type="button" class="chip-btn" data-sim-act="reset" data-panel="triage" data-i18n="sim.btnReset">Reset</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Panel 2: Quiet Hours -->
+          <div role="tabpanel" aria-labelledby="sim-tab-quiet" hidden="until-found" data-sim-panel="quiet">
+            <div class="sim-grid">
+              <div class="pane-card">
+                <div class="pane-head">
+                  <span class="pane-title" data-i18n="sim.p2LeftTitle">Feishu &amp; Discord · 02:15 Local Time</span>
+                  <span class="pane-meta is-warn" data-sim-badge="quiet" data-i18n="sim.p2LeftBadge">Quiet Hours · 23:00–08:00</span>
+                </div>
+                <div class="msg-bubble">
+                  <span class="msg-sender">Night Shift · 02:14</span>
+                  <span data-i18n="sim.p2Msg1">[routine] Staging nightly benchmark took 4% longer after dependency bump.</span>
+                </div>
+                <div class="msg-bubble">
+                  <span class="msg-sender">Site Bot · 04:02</span>
+                  <span data-i18n="sim.p2Msg2">URGENT P0: Payment callback worker down in eu-west!</span>
+                </div>
+                <div class="sim-status-note" data-sim-state="quiet" data-i18n="sim.p2StateInit">
+                  Routine alerts are silently diagnosed locally and queued into kv_state for the 08:00 morning briefing—while urgent keywords break through immediately.
+                </div>
+              </div>
+
+              <div class="pane-card">
+                <div class="pane-head">
+                  <span class="pane-title" data-i18n="sim.p2RightTitle">Owner Phone · Morning Briefing</span>
+                  <span class="pane-meta" data-i18n="sim.p2RightBadge">auto_brief_on_end: true</span>
+                </div>
+                <div class="msg-bubble is-phone" data-sim-phone="quiet" data-i18n="sim.p2Bubble1">
+                  02:14 queued silently (diagnosed cleanly, zero wake-up ping). 04:02 matched urgent_keywords ["P0"] and punched through Quiet Hours immediately.
+                </div>
+                <div class="msg-bubble is-owner" hidden data-sim-reply="quiet"></div>
+                <div class="sim-actions">
+                  <button type="button" class="chip-btn is-approve" data-sim-act="brief" data-panel="quiet" data-i18n="sim.btnBrief">Send /brief</button>
+                  <button type="button" class="chip-btn" data-sim-act="mute" data-panel="quiet" data-i18n="sim.btnMute">Send /mute 2h</button>
+                  <button type="button" class="chip-btn" data-sim-act="reset" data-panel="quiet" data-i18n="sim.btnReset">Reset</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Panel 3: Cross-Channel Memory -->
+          <div role="tabpanel" aria-labelledby="sim-tab-memory" hidden="until-found" data-sim-panel="memory">
+            <div class="sim-grid">
+              <div class="pane-card">
+                <div class="pane-head">
+                  <span class="pane-title" data-i18n="sim.p3LeftTitle">Two Sibling Channels · Shared Workspace</span>
+                  <span class="pane-meta is-ok" data-i18n="sim.p3LeftBadge">cross_channel_window_s: 7200</span>
+                </div>
+                <div class="msg-bubble">
+                  <span class="msg-sender">WeCom · Customer Support · 15:10</span>
+                  <span data-i18n="sim.p3Msg1">Enterprise tenant hits HTTP 429 on /v1/export since 15:00.</span>
+                </div>
+                <div class="msg-bubble">
+                  <span class="msg-sender">Discord · #backend-dev · 15:42</span>
+                  <span data-i18n="sim.p3Msg2">@owner Anyone seeing rate-limiter drops on export jobs?</span>
+                </div>
+                <div class="sim-status-note" data-sim-state="memory" data-i18n="sim.p3StateInit">
+                  Watchpost automatically injects the sibling WeCom finding (Redis burst cap change in PR #48) into the Discord prompt—strictly excluding Personal Direct Chat history.
+                </div>
+              </div>
+
+              <div class="pane-card">
+                <div class="pane-head">
+                  <span class="pane-title" data-i18n="sim.p3RightTitle">Owner Phone · Linked Recall</span>
+                  <span class="pane-meta is-ok" data-i18n="sim.p3RightBadge">Zero Privacy Bleed</span>
+                </div>
+                <div class="msg-bubble is-phone" data-i18n="sim.p3Bubble1">
+                  [Discord · #backend-dev] Matches the 15:10 WeCom report in the same repo: export bursts hit the tightened Redis limit (120→40 req/min). Same root cause; draft ready.
+                </div>
+                <div class="msg-bubble is-draft">
+                  <div class="draft-head">
+                    <span class="draft-label" data-i18n="sim.draftLabel">1-Tap Copy Draft</span>
+                    <button type="button" class="mini-copy-btn" data-copy-target="draft-memory" aria-label="Copy cross-channel reply draft" data-i18n="sim.copyBtn">Copy Draft</button>
+                  </div>
+                  <p id="draft-memory" data-i18n="sim.p3Draft">Yes — support flagged the same 429s earlier. It comes from the Redis export cap change (120→40/min). Rolling back the limiter config or whitelisting batch workers fixes both.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Panel 4: Personal Direct Chat -->
+          <div role="tabpanel" aria-labelledby="sim-tab-direct" hidden="until-found" data-sim-panel="direct">
+            <div class="sim-grid">
+              <div class="pane-card">
+                <div class="pane-head">
+                  <span class="pane-title" data-i18n="sim.p4LeftTitle">Owner → Phone Entrance (Plain Message)</span>
+                  <span class="pane-meta" data-i18n="sim.p4LeftBadge">thread_originator_guid Guard</span>
+                </div>
+                <div class="msg-bubble is-owner" data-i18n="sim.p4Msg1">
+                  Check why test_queue_retry is flaky in this repo today.
+                </div>
+                <div class="sim-status-note" data-i18n="sim.p4StateInit">
+                  Plain un-swiped iMessages always route to your Personal Direct Agent session—never hijacked by macOS automatic reply_to_guid chains, and never leaked to work channels.
+                </div>
+              </div>
+
+              <div class="pane-card">
+                <div class="pane-head">
+                  <span class="pane-title" data-i18n="sim.p4RightTitle">Direct Coding Agent Reply</span>
+                  <span class="pane-meta is-ok" data-i18n="sim.p4RightBadge">Natural Tone · /new /reset</span>
+                </div>
+                <div class="msg-bubble is-phone" data-i18n="sim.p4Bubble1">
+                  Checked test_queue_retry: it uses wall-clock sleep(0.05) instead of a monotonic fake clock under CI load. Swapping to an event gate fixes it cleanly—reply "apply" if you want me to edit and re-run pytest.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="guardrails">
+      <div class="container">
+        <div class="section-head">
+          <h2 data-i18n="guards.heading">Four Core Engineering Guardrails</h2>
+          <p data-i18n="guards.sub">
+            Built so an autonomous coding agent stays genuinely helpful in noisy real-world work chats without ever embarrassing you or breaking production silently.
+          </p>
+        </div>
+
+        <div class="cards-wrap">
+          <div class="guardrails-grid">
+            <article class="feature-card reveal-block">
+              <span class="feature-tag" data-i18n="guards.c1Tag">SAFE EXECUTION</span>
+              <h3 data-i18n="guards.c1Title">4-Mode Triage &amp; "go" Approval Gate</h3>
+              <p data-i18n="guards.c1Desc">
+                Classifies incoming messages into Q&amp;A, Advice, FYI, or Bug under per-channel autonomy (assistant_only, diagnose_only, auto_fix). High-impact edits pause until you reply go, or skip to dismiss cleanly.
+              </p>
+            </article>
+
+            <article class="feature-card reveal-block">
+              <span class="feature-tag" data-i18n="guards.c2Tag">NOISE CONTROL</span>
+              <h3 data-i18n="guards.c2Title">Quiet Hours &amp; Morning Briefing</h3>
+              <p data-i18n="guards.c2Desc">
+                Suppress pings overnight (such as 23:00–08:00) while diagnosing quietly into SQLite kv_state, then flush one morning digest at 08:00. Configurable urgent keywords still break through on real emergencies.
+              </p>
+            </article>
+
+            <article class="feature-card reveal-block">
+              <span class="feature-tag" data-i18n="guards.c3Tag">CONTEXT RECALL</span>
+              <h3 data-i18n="guards.c3Title">Cross-Channel Memory + Isolation</h3>
+              <p data-i18n="guards.c3Desc">
+                Feeds recent incident summaries from sibling channels in the same repository (for example Support in WeCom + Dev in Slack) while keeping owner_direct personal sessions strictly sealed off.
+              </p>
+            </article>
+
+            <article class="feature-card reveal-block">
+              <span class="feature-tag" data-i18n="guards.c4Tag">RESILIENCE</span>
+              <h3 data-i18n="guards.c4Title">Hot Reload &amp; Backup Agent Failover</h3>
+              <p data-i18n="guards.c4Desc">
+                Reload channels, personas, and Quiet Hours in milliseconds with POST /api/reload or SIGHUP, recover active threads cleanly after crashes, and automatically fail over from Antigravity to Codex or Claude Code.
+              </p>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="platforms">
+      <div class="container">
+        <div class="section-head">
+          <h2 data-i18n="plat.heading">Complete Platform Matrix</h2>
+          <p data-i18n="plat.sub">
+            Zero-dependency Python adapters over official APIs and OS protocols, paired with a stdio JSON SDK (watchpost.sdk) for custom or copyleft external bridges.
+          </p>
+        </div>
+
+        <div class="tablist-scroll" role="toolbar" aria-label="Filter platform matrix by category" id="matrix-filters">
+          <button type="button" class="tab-btn" data-filter="all" aria-pressed="true" data-i18n="plat.fAll">All Integrations</button>
+          <button type="button" class="tab-btn" data-filter="inbound" aria-pressed="false" data-i18n="plat.fIn">Work Chat Sources</button>
+          <button type="button" class="tab-btn" data-filter="notifier" aria-pressed="false" data-i18n="plat.fOut">Owner Entrances</button>
+          <button type="button" class="tab-btn" data-filter="agent" aria-pressed="false" data-i18n="plat.fAgent">Agent Backends</button>
+        </div>
+
+        <div class="table-scroll">
+          <table class="platform-table">
+            <caption data-i18n="plat.caption">Supported inbound chat adapters, owner push/steering entrances, and local coding agent backends in Watchpost v0.3</caption>
+            <thead>
+              <tr>
+                <th scope="col" data-i18n="plat.colName">Integration</th>
+                <th scope="col" data-i18n="plat.colRole">Direction</th>
+                <th scope="col" data-i18n="plat.colProto">Transport &amp; Highlights</th>
+                <th scope="col" data-i18n="plat.colStatus">Status</th>
+              </tr>
+            </thead>
+            <tbody id="matrix-body">
+              <tr data-cat="inbound">
+                <th scope="row">Feishu / Lark</th>
+                <td data-i18n="plat.rIn">Work Chat</td>
+                <td data-i18n="plat.dFeishu">Read-only REST (tenant, user, lark-cli), <at> mentions, image/audio/file download, zero read receipts</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="inbound notifier">
+                <th scope="row">Slack</th>
+                <td data-i18n="plat.rBoth">Work Chat + Owner DM</td>
+                <td data-i18n="plat.dSlack">Web API history + thread replies, <@user> &amp; <!channel>, private file download, DM conversations.open + thread go</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="inbound notifier">
+                <th scope="row">Discord</th>
+                <td data-i18n="plat.rBoth">Work Chat + Owner DM</td>
+                <td data-i18n="plat.dDiscord">REST v10 guild channels &amp; attachments, message_reference reply chains, DM steering</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="inbound notifier">
+                <th scope="row">Telegram</th>
+                <td data-i18n="plat.rBoth">Work Chat + Owner DM</td>
+                <td data-i18n="plat.dTelegram">Shared single-stream TelegramUpdateHub (zero stolen updates), @username mentions, photo/voice download, /brief /mute</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="inbound">
+                <th scope="row">DingTalk (钉钉)</th>
+                <td data-i18n="plat.rIn">Work Chat</td>
+                <td data-i18n="plat.dDing">Signed HMAC-SHA256 webhook (POST /api/webhooks/dingtalk), atUsers trigger, OAuth2 robot file download</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="inbound notifier">
+                <th scope="row">WeCom (企业微信)</th>
+                <td data-i18n="plat.rBoth">Work Chat + App Push</td>
+                <td data-i18n="plat.dWecom">Signed SHA1 GET/POST /api/webhooks/wecom, XXE-safe XML &amp; JSON ingest, media/get, message/send push</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="inbound">
+                <th scope="row">WhatsApp / Desktop Bridges</th>
+                <td data-i18n="plat.rIn">External Plugin</td>
+                <td data-i18n="plat.dWa">Executable stdio SDK template (examples/whatsapp_plugin_template.py) keeping copyleft/desktop bridges outside Apache-2.0 core</td>
+                <td><span class="status-pill is-sdk" data-i18n="plat.sSdk">Plugin SDK</span></td>
+              </tr>
+              <tr data-cat="notifier">
+                <th scope="row">macOS iMessage</th>
+                <td data-i18n="plat.rOut">Owner Phone</td>
+                <td data-i18n="plat.dImsg">chat.db swipe-reply thread_originator_guid, plain message → Personal Direct Chat, photos &amp; Whisper voice</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="notifier">
+                <th scope="row">ntfy</th>
+                <td data-i18n="plat.rOut">Owner Push (1/2-Way)</td>
+                <td data-i18n="plat.dNtfy">UTF-8 JSON publish + optional reply_topic NDJSON polling for #N / go / skip / /brief</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="notifier">
+                <th scope="row">Bark</th>
+                <td data-i18n="plat.rOut">iOS Push</td>
+                <td data-i18n="plat.dBark">Clean APNs alert with copy / autoCopy populated strictly from the standalone draft reply bubble</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="notifier">
+                <th scope="row">Pushover</th>
+                <td data-i18n="plat.rOut">Mobile/Desktop Push</td>
+                <td data-i18n="plat.dPushover">Multi-device delivery via Pushover REST API with automatic 1024-char chunking</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+              <tr data-cat="agent">
+                <th scope="row">Antigravity · Codex · Claude · Gemini</th>
+                <td data-i18n="plat.rAgent">Coding Agents</td>
+                <td data-i18n="plat.dAgent">AntigravityBackend (agentapi + Stop Hook) and CLI runners with FallbackBackend automatic failover</td>
+                <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="quickstart">
+      <div class="container">
+        <div class="section-head">
+          <h2 data-i18n="qs.heading">Quickstart, SDK &amp; Local Sandbox</h2>
+          <p data-i18n="qs.sub">
+            Start with one guided wizard command, test your plugin with automated conformance checks, or simulate colleagues and phone replies offline in your browser.
+          </p>
+        </div>
+
+        <div class="tabs-widget" data-tabs-widget="quickstart">
+          <div class="tablist-scroll" role="tablist" focusgroup="tablist nomemory" aria-label="Watchpost quickstart examples">
+            <button type="button" role="tab" id="qs-tab-setup" aria-selected="true" tabindex="0" focusgroupstart data-i18n="qs.tab1">Interactive Setup</button>
+            <button type="button" role="tab" id="qs-tab-sdk" aria-selected="false" tabindex="-1" data-i18n="qs.tab2">Plugin SDK</button>
+            <button type="button" role="tab" id="qs-tab-sandbox" aria-selected="false" tabindex="-1" data-i18n="qs.tab3">Local Sandbox UI</button>
+            <button type="button" role="tab" id="qs-tab-webhook" aria-selected="false" tabindex="-1" data-i18n="qs.tab4">Webhook &amp; Control API</button>
+          </div>
+
+          <div role="tabpanel" aria-labelledby="qs-tab-setup" tabindex="0">
+            <div class="code-panel">
+              <div class="code-bar">
+                <span>bash · Setup Wizard</span>
+                <button type="button" class="code-copy-btn" data-copy-target="code-setup" aria-label="Copy setup commands" data-i18n="qs.copy">Copy</button>
+              </div>
+              <pre><code id="code-setup">git clone https://github.com/Popcornnnnnnnn/watchpost.git &amp;&amp; cd watchpost
+uv sync --all-extras
+
+# Writes 0600 ~/.config/watchpost/config.json with ${ENV_VAR} placeholders
+uv run watchpost setup
+
+uv run watchpost channels list-remote --adapter slack
+uv run watchpost doctor &amp;&amp; uv run watchpost run --api-port 8787</code></pre>
+            </div>
+          </div>
+
+          <div role="tabpanel" aria-labelledby="qs-tab-sdk" hidden="until-found">
+            <div class="code-panel">
+              <div class="code-bar">
+                <span>bash · Scaffold &amp; Conformance Check</span>
+                <button type="button" class="code-copy-btn" data-copy-target="code-sdk" aria-label="Copy Plugin SDK commands" data-i18n="qs.copy">Copy</button>
+              </div>
+              <pre><code id="code-sdk"># Scaffold a custom adapter or notifier powered by watchpost.sdk
+uv run watchpost plugins scaffold --kind channel --name my_bridge --dest ./plugins/my_bridge
+
+# Automated schema + contract verification (supports WhatsApp bridge template too)
+uv run watchpost plugins check --kind channel --test-fetch --cmd python3 ./plugins/my_bridge/plugin.py
+uv run watchpost plugins check --kind channel --test-fetch --cmd python3 examples/whatsapp_plugin_template.py</code></pre>
+            </div>
+          </div>
+
+          <div role="tabpanel" aria-labelledby="qs-tab-sandbox" hidden="until-found">
+            <div class="code-panel">
+              <div class="code-bar">
+                <span>bash · Offline Simulator &amp; Test Suite</span>
+                <button type="button" class="code-copy-btn" data-copy-target="code-sandbox" aria-label="Copy sandbox commands" data-i18n="qs.copy">Copy</button>
+              </div>
+              <pre><code id="code-sandbox"># 2-column browser simulator: act as colleagues on left, steer/approve on right
+uv run watchpost sandbox-ui --backend mock
+
+# Or point a real local CLI agent at a repository safely in read-only mode
+uv run watchpost sandbox-ui --backend codex --cwd /path/to/repo --autonomy diagnose_only
+
+# Run the offline unit &amp; webhook verification suite (51 tests)
+uv run pytest -q tests/</code></pre>
+            </div>
+          </div>
+
+          <div role="tabpanel" aria-labelledby="qs-tab-webhook" hidden="until-found">
+            <div class="code-panel">
+              <div class="code-bar">
+                <span>bash · Signed Webhooks &amp; Hot Reload</span>
+                <button type="button" class="code-copy-btn" data-copy-target="code-webhook" aria-label="Copy webhook API commands" data-i18n="qs.copy">Copy</button>
+              </div>
+              <pre><code id="code-webhook"># Zero-downtime hot reload of channels, personas, Quiet Hours &amp; debounce timings
+curl -s -X POST http://127.0.0.1:8787/api/reload
+
+# Trigger or inspect Quiet Hours &amp; Morning Briefing
+curl -s http://127.0.0.1:8787/api/quiet
+curl -s -X POST http://127.0.0.1:8787/api/brief
+
+# Fail-closed signed webhook receivers built into watchpost run --api-port 8787:
+#   POST /api/webhooks/dingtalk   (HMAC-SHA256 timestamp + sign headers)
+#   GET|POST /api/webhooks/wecom  (SHA1 msg_signature verification)</code></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div>
+        <strong data-i18n="footer.brand">Watchpost v0.3 · Apache-2.0</strong>
+        <span data-i18n="footer.note"> — Runs locally on your machine. Copyleft/desktop bridges stay separate out-of-process plugins via watchpost.sdk.</span>
+      </div>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="https://popcornnn.xyz/" data-i18n="footer.home">popcornnn.xyz</a>
+        <a href="https://github.com/Popcornnnnnnnn/watchpost" data-i18n="footer.repo">GitHub</a>
+        <a href="#simulator" data-i18n="footer.sim">Simulator</a>
+        <a href="#quickstart" data-i18n="footer.docs">Quickstart</a>
+      </nav>
+    </div>
+  </footer>
+</body>
+</html>
