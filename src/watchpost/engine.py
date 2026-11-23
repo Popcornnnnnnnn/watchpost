@@ -7,11 +7,12 @@ import logging
 import re
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from watchpost.adapters.simulator import SimulatorAdapter, default_demo_channels
-from watchpost.bubbles import format_completion_bubbles
+from watchpost.bubbles import format_completion_bubbles, strip_markdown
 from watchpost.context import assemble_group_context, match_group_thread
 from watchpost.debouncer import BurstDebouncer
 from watchpost.filters import is_small_talk_only, should_trigger
@@ -116,6 +117,271 @@ class WatchpostEngine:
         re.IGNORECASE,
     )
     _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)?")
+    _DURATION_RE = re.compile(
+        r"^\s*(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|小时|m|min|mins|minute|minutes|分|分钟)?\s*$",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _parse_hhmm(hhmm: str) -> int | None:
+        parts = (hhmm or "").strip().split(":")
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            return None
+        hh, mm = int(parts[0]), int(parts[1])
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh * 60 + mm
+        return None
+
+    @classmethod
+    def _parse_duration_minutes(cls, raw: str, *, default_minutes: int = 120) -> int:
+        m = cls._DURATION_RE.fullmatch(raw or "")
+        if m is None:
+            return default_minutes
+        val = float(m.group(1))
+        unit = (m.group(2) or "m").lower()
+        mins = int(round(val * 60)) if unit.startswith("h") or unit == "小时" else int(round(val))
+        return max(1, min(mins, 24 * 60))
+
+    def _next_quiet_end_ts(self, now_dt: datetime) -> float:
+        qh = self.config.quiet_hours
+        start_min = self._parse_hhmm(qh.start)
+        end_min = self._parse_hhmm(qh.end)
+        if not qh.enabled or start_min is None or end_min is None or start_min == end_min:
+            return 0.0
+        end_h, end_m = divmod(end_min, 60)
+        today_end = now_dt.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+        cur_min = now_dt.hour * 60 + now_dt.minute
+        if start_min > end_min:
+            end_dt = today_end + timedelta(days=1) if cur_min >= start_min else today_end
+        else:
+            end_dt = today_end if cur_min < end_min else (today_end + timedelta(days=1))
+        return end_dt.timestamp()
+
+    def get_quiet_status(self, *, now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts) if now_ts is not None else time.time()
+        mute_until = float(self.store.get_kv("quiet_mute_until", 0.0) or 0.0)
+        override_off_until = float(self.store.get_kv("quiet_override_off_until", 0.0) or 0.0)
+        raw_queue = self.store.get_kv("quiet_digest_queue", [])
+        queued_count = len(raw_queue) if isinstance(raw_queue, list) else 0
+
+        qh = self.config.quiet_hours
+        start_min = self._parse_hhmm(qh.start)
+        end_min = self._parse_hhmm(qh.end)
+        in_schedule = False
+        if qh.enabled and start_min is not None and end_min is not None and start_min != end_min:
+            now_dt = datetime.fromtimestamp(now)
+            cur_min = now_dt.hour * 60 + now_dt.minute
+            if start_min > end_min:
+                in_schedule = cur_min >= start_min or cur_min < end_min
+            else:
+                in_schedule = start_min <= cur_min < end_min
+
+        if now < mute_until:
+            active = True
+            reason = "muted"
+        elif now < override_off_until:
+            active = False
+            reason = ""
+        elif in_schedule:
+            active = True
+            reason = "schedule"
+        else:
+            active = False
+            reason = ""
+
+        return {
+            "active": active,
+            "reason": reason,
+            "enabled": bool(qh.enabled),
+            "start": qh.start,
+            "end": qh.end,
+            "muted_until": mute_until,
+            "override_off_until": override_off_until,
+            "queued_count": queued_count,
+        }
+
+    def set_quiet_mute(self, *, minutes: int = 120, now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts) if now_ts is not None else time.time()
+        mins = max(1, min(int(minutes), 24 * 60))
+        self.store.set_kv("quiet_mute_until", now + mins * 60)
+        self.store.set_kv("quiet_override_off_until", 0.0)
+        return self.get_quiet_status(now_ts=now)
+
+    def clear_quiet_mute(self, *, now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts) if now_ts is not None else time.time()
+        self.store.set_kv("quiet_mute_until", 0.0)
+        qh = self.config.quiet_hours
+        start_min = self._parse_hhmm(qh.start)
+        end_min = self._parse_hhmm(qh.end)
+        override_until = 0.0
+        if qh.enabled and start_min is not None and end_min is not None and start_min != end_min:
+            now_dt = datetime.fromtimestamp(now)
+            cur_min = now_dt.hour * 60 + now_dt.minute
+            in_sched = (cur_min >= start_min or cur_min < end_min) if start_min > end_min else (start_min <= cur_min < end_min)
+            if in_sched:
+                override_until = self._next_quiet_end_ts(now_dt)
+        self.store.set_kv("quiet_override_off_until", override_until)
+        return self.get_quiet_status(now_ts=now)
+
+    def _batch_matches_urgent_keywords(self, batch: list[NormalizedMessage]) -> bool:
+        kws = [k.strip().lower() for k in self.config.quiet_hours.urgent_keywords if k and k.strip()]
+        if not kws:
+            return False
+        parts: list[str] = []
+        for m in batch:
+            if m.clean_text:
+                parts.append(m.clean_text)
+            for art in m.artifacts:
+                if art.transcript:
+                    parts.append(art.transcript)
+        hay = "\n".join(parts).lower()
+        return any(kw in hay for kw in kws)
+
+    def _queue_quiet_digest_item(
+        self,
+        channel: ChannelConfig,
+        thread: ThreadRecord,
+        summary_text: str,
+        draft_reply: str,
+        *,
+        now_ts: float | None = None,
+    ) -> None:
+        raw_queue = self.store.get_kv("quiet_digest_queue", [])
+        queue = [x for x in raw_queue if isinstance(x, dict)] if isinstance(raw_queue, list) else []
+        clean_sum = " ".join((summary_text or "").split())
+        if len(clean_sum) > 140:
+            clean_sum = clean_sum[:137].rstrip() + "..."
+        clean_draft = " ".join((draft_reply or "").split())
+        if len(clean_draft) > 160:
+            clean_draft = clean_draft[:157].rstrip() + "..."
+        item = {
+            "thread_id": thread.id,
+            "channel_id": channel.id,
+            "channel_name": channel.name,
+            "sender_name": thread.sender_name,
+            "title": thread.title,
+            "pending_go": bool(thread.pending_go),
+            "summary": clean_sum or thread.title,
+            "draft_reply": clean_draft,
+            "updated_at": float(now_ts if now_ts is not None else thread.updated_at or time.time()),
+        }
+        deduped = [x for x in queue if x.get("thread_id") != thread.id][-29:]
+        deduped.append(item)
+        self.store.set_kv("quiet_digest_queue", deduped)
+
+    def format_briefing_bubbles(self, items: list[dict[str, Any]], *, is_quiet_flush: bool) -> list[str]:
+        is_zh = self.config.language.lower().startswith("zh")
+        count = len(items)
+        if is_zh:
+            header = (
+                f"早安简报（夜间静默期共处理 {count} 条）："
+                if is_quiet_flush
+                else f"最近 12 小时频道简报（{count} 条）："
+            )
+        else:
+            header = (
+                f"Morning briefing ({count} overnight items):"
+                if is_quiet_flush
+                else f"Recent 12h briefing ({count} items):"
+            )
+
+        entries: list[str] = []
+        for idx, item in enumerate(items, start=1):
+            ch_name = str(item.get("channel_name") or item.get("channel_id") or "").strip()
+            go_tag = (" [待确认 go]" if is_zh else " [needs go]") if item.get("pending_go") else ""
+            summary = str(item.get("summary") or item.get("title") or "").strip()
+            draft = str(item.get("draft_reply") or "").strip()
+            if is_zh:
+                line = f"{idx}. {ch_name}{go_tag}：{summary}"
+                if draft:
+                    line += f"\n   建议回复：{draft}"
+            else:
+                line = f"{idx}. {ch_name}{go_tag}: {summary}"
+                if draft:
+                    line += f"\n   Draft: {draft}"
+            entries.append(line)
+
+        bubbles: list[str] = []
+        chunk_size = 3
+        for pos in range(0, len(entries), chunk_size):
+            part = entries[pos : pos + chunk_size]
+            if pos == 0:
+                bubbles.append(f"{header}\n\n" + "\n\n".join(part))
+            else:
+                bubbles.append("\n\n".join(part))
+        return bubbles[:4] if bubbles else [header]
+
+    async def send_briefing(self, *, notifier_name: str = "", now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts) if now_ts is not None else time.time()
+        is_zh = self.config.language.lower().startswith("zh")
+        raw_queue = self.store.get_kv("quiet_digest_queue", [])
+        queue = [x for x in raw_queue if isinstance(x, dict)] if isinstance(raw_queue, list) else []
+
+        if queue:
+            self.store.set_kv("quiet_digest_queue", [])
+            bubbles = self.format_briefing_bubbles(queue, is_quiet_flush=True)
+            queued_flushed = len(queue)
+        else:
+            cutoff = now - 43200.0
+            recent_items: list[dict[str, Any]] = []
+            for th in self.store.list_threads(limit=30):
+                if th.updated_at < cutoff:
+                    continue
+                ch = self.store.get_channel(th.channel_id)
+                if ch is None or ch.adapter == "owner_direct":
+                    continue
+                events = self.store.list_thread_events(th.id)
+                reply_evs = [ev for ev in events if ev.kind in {"agent_reply", "error"}]
+                summary = ""
+                draft = ""
+                if reply_evs:
+                    last_ev = reply_evs[-1]
+                    summary = " ".join(last_ev.summary_bubbles[:2]).strip() or strip_markdown(last_ev.raw_text)
+                    draft = last_ev.suggested_reply.strip()
+                summary = " ".join(summary.split())
+                if len(summary) > 140:
+                    summary = summary[:137].rstrip() + "..."
+                draft = " ".join(draft.split())
+                if len(draft) > 160:
+                    draft = draft[:157].rstrip() + "..."
+                recent_items.append(
+                    {
+                        "thread_id": th.id,
+                        "channel_id": th.channel_id,
+                        "channel_name": ch.name,
+                        "sender_name": th.sender_name,
+                        "title": th.title,
+                        "pending_go": th.pending_go,
+                        "summary": summary or th.title,
+                        "draft_reply": draft,
+                        "updated_at": th.updated_at,
+                    }
+                )
+            queued_flushed = 0
+            if recent_items:
+                bubbles = self.format_briefing_bubbles(recent_items[:12], is_quiet_flush=False)
+            else:
+                bubbles = [
+                    "过去 12 小时没有新的群聊或私聊事件。"
+                    if is_zh
+                    else "No new channel activity in the last 12 hours."
+                ]
+
+        for bubble in bubbles:
+            await self._send_owner_reply(notifier_name, bubble)
+        self.store.set_kv("last_brief_sent_at", now)
+        return {"sent": True, "queued_flushed": queued_flushed, "bubbles": bubbles}
+
+    async def flush_quiet_digest_if_due(self, *, now_ts: float | None = None) -> int:
+        if not self.config.quiet_hours.auto_brief_on_end:
+            return 0
+        if self.get_quiet_status(now_ts=now_ts)["active"]:
+            return 0
+        raw_queue = self.store.get_kv("quiet_digest_queue", [])
+        if not isinstance(raw_queue, list) or not raw_queue:
+            return 0
+        res = await self.send_briefing(now_ts=now_ts)
+        return int(res.get("queued_flushed") or 0)
 
     @classmethod
     def _summarize_batch_for_notice(cls, batch: list[NormalizedMessage]) -> tuple[str, list[str], str]:
@@ -397,14 +663,17 @@ class WatchpostEngine:
                 updated_at=time.time(),
             )
         )
-        start_tokens = await self._notify_start_all(
-            channel,
-            active_record,
-            original_preview,
-            is_steer=is_steer,
-            attachments=image_paths,
-        )
-        self._bind_tokens(thread_id, start_tokens)
+        quiet_state = self.get_quiet_status(now_ts=now_ts)
+        suppress_notify = bool(quiet_state["active"] and not self._batch_matches_urgent_keywords(batch))
+        if not suppress_notify:
+            start_tokens = await self._notify_start_all(
+                channel,
+                active_record,
+                original_preview,
+                is_steer=is_steer,
+                attachments=image_paths,
+            )
+            self._bind_tokens(thread_id, start_tokens)
 
         target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
         try:
@@ -425,12 +694,24 @@ class WatchpostEngine:
                 )
                 backend_ref = matched_thread.backend_thread_ref
             else:
+                cross_memory = (
+                    self.store.get_recent_cross_channel_context(
+                        exclude_channel_id=channel.id,
+                        workspace_dir=str(target_cwd),
+                        window_s=self.config.cross_channel_window_s,
+                        limit=self.config.cross_channel_max_items,
+                        now_ts=now_ts,
+                    )
+                    if self.config.cross_channel_window_s > 0 and self.config.cross_channel_max_items > 0
+                    else []
+                )
                 prompt = build_new_thread_prompt(
                     channel,
                     channel.persona_text,
                     recent_messages,
                     batch,
                     group_context=group_ctx,
+                    cross_channel_memory=cross_memory,
                     language=self.config.language,
                 )
                 backend_ref, result = await self.backend.start_thread(
@@ -499,7 +780,21 @@ class WatchpostEngine:
             )
         )
 
-        await self._notify_completion_all(channel, record, all_bubbles)
+        if suppress_notify:
+            quiet_summary = (
+                " ".join(result.summary_bubbles[:2]).strip()
+                or strip_markdown(result.raw_text)
+                or result.error
+            )
+            self._queue_quiet_digest_item(
+                channel,
+                record,
+                quiet_summary,
+                draft_reply or result.suggested_reply,
+                now_ts=now_ts,
+            )
+        else:
+            await self._notify_completion_all(channel, record, all_bubbles)
 
         del is_steer
         return record
@@ -822,24 +1117,57 @@ class WatchpostEngine:
                 "Watchpost 指令说明：\n"
                 "- status / 状态：查看运行状态与待确认会话\n"
                 "- list / 列表：查看最近 5 条会话（支持 #1 / #2 引用）\n"
+                "- /brief / 早报：立即发送夜间或最近 12 小时简报\n"
+                "- /mute 2h / /unmute：临时静音或恢复消息通知\n"
                 "- #N 内容 或 #N go：追问或批准列表第 N 条会话\n"
                 "- go / 执行：批准最近一条待确认会话执行修复\n"
                 "- skip / 忽略（或 #N skip / 左滑回复 忽略）：清除待确认（go）标记但不执行\n"
                 "- /new [内容]：开启新的个人直聊会话\n"
                 "- /reset：重置个人直聊上下文\n"
-                "- 直接发文字/语音/图片：自动进行个人直聊或按回复引用追问"
+                "- 直接发文字/语音/图片：自动进入个人直聊；左滑回复通知气泡可追问对应工作会话"
                 if is_zh
                 else "Watchpost commands:\n"
                 "- status: view running status & pending approvals\n"
                 "- list: show recent threads (#1..#5)\n"
+                "- /brief: send overnight or recent 12h briefing now\n"
+                "- /mute [2h] / /unmute: pause or resume notifications\n"
                 "- #N <text> or #N go: steer or approve listed thread N\n"
                 "- go / approve: approve latest pending thread\n"
                 "- skip / dismiss (or #N skip): clear pending go without executing\n"
                 "- /new [text]: start a fresh personal direct chat\n"
                 "- /reset: clear personal direct chat context\n"
-                "- direct text/voice/image: personal chat or quote-reply steer"
+                "- direct text/voice/image: personal chat; swipe-reply on alert bubble to steer work thread"
             )
             await self._send_owner_reply(action.notifier, msg)
+            return None
+
+        if action.kind == "brief":
+            await self.send_briefing(notifier_name=action.notifier)
+            return None
+
+        if action.kind == "mute":
+            mins = self._parse_duration_minutes(action.text, default_minutes=120)
+            st = self.set_quiet_mute(minutes=mins)
+            msg = (
+                f"已开启静音 {mins} 分钟（期间仅默默排查并写入简报，收到 /brief 或解除后汇总；紧急关键词仍会提醒）。"
+                if is_zh
+                else f"Notifications muted for {mins}m (silent diagnosis + digest queued until unmuted or /brief)."
+            )
+            if st.get("queued_count"):
+                msg += f" 当前已攒 {st['queued_count']} 条。" if is_zh else f" ({st['queued_count']} queued.)"
+            await self._send_owner_reply(action.notifier, msg)
+            return None
+
+        if action.kind == "unmute":
+            st = self.clear_quiet_mute()
+            msg = (
+                "已恢复消息通知。"
+                if is_zh
+                else "Notifications resumed."
+            )
+            await self._send_owner_reply(action.notifier, msg)
+            if int(st.get("queued_count") or 0) > 0:
+                await self.send_briefing(notifier_name=action.notifier)
             return None
 
         if action.kind == "status":

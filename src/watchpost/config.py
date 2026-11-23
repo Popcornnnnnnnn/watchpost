@@ -10,7 +10,7 @@ from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, Field
 
-from watchpost.models import ChannelConfig
+from watchpost.models import ChannelConfig, QuietHoursConfig
 
 _ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -86,6 +86,9 @@ class WatchpostConfig(BaseModel):
     debounce_s: float = 25.0
     max_debounce_s: float = 60.0
     api_port: int = 0
+    quiet_hours: QuietHoursConfig = Field(default_factory=QuietHoursConfig)
+    cross_channel_window_s: int = 7200
+    cross_channel_max_items: int = 5
     backend: BackendConfig = Field(default_factory=BackendConfig)
     whisper: WhisperConfig = Field(default_factory=WhisperConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)

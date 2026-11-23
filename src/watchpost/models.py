@@ -157,12 +157,20 @@ class ThreadEvent(BaseModel):
 
 class OwnerAction(BaseModel):
     notifier: str
-    kind: str  # "steer" | "approve_go" | "status" | "list" | "help" | "new_personal" | "reset_personal"
+    kind: str  # "steer" | "approve_go" | "dismiss_go" | "status" | "list" | "help" | "new_personal" | "reset_personal" | "brief" | "mute" | "unmute"
     thread_id: str = ""
     text: str = ""
     reply_token: str = ""
     list_index: int = 0
     attachments: list[dict[str, str]] = Field(default_factory=list)
+
+
+class QuietHoursConfig(BaseModel):
+    enabled: bool = False
+    start: str = "23:00"
+    end: str = "08:00"
+    urgent_keywords: list[str] = Field(default_factory=list)
+    auto_brief_on_end: bool = True
 
 
 class EngineConfig(BaseModel):
@@ -174,3 +182,6 @@ class EngineConfig(BaseModel):
     personal_workspace_dir: Path | None = None
     personal_session_ttl_s: int = 3600
     ack_on_receive: bool = True
+    quiet_hours: QuietHoursConfig = Field(default_factory=QuietHoursConfig)
+    cross_channel_window_s: int = 7200
+    cross_channel_max_items: int = 5

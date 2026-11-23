@@ -98,3 +98,119 @@ def test_dismiss_and_dismiss_all_pending_go() -> None:
         assert bulk.status_code == 200
         assert bulk.json() == {"cleared": 1, "awaiting_go": 0}
         assert client.get("/api/health").json()["metrics"]["awaiting_go"] == 0
+
+
+def test_hot_reload_quiet_brief_and_persistent_channel_patch(monkeypatch) -> None:
+    import stat
+    from watchpost.config import (
+        BackendConfig,
+        FeishuConfig,
+        WatchpostConfig,
+        load_config,
+        load_raw_config,
+        save_config,
+    )
+    from watchpost.daemon import WatchpostDaemon, build_engine_from_config
+    from watchpost.models import ChannelConfig, ChatType, QuietHoursConfig, TriggerMode
+
+    monkeypatch.setenv("TEST_FEISHU_TOKEN", "tok-secret-1")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        cfg_path = root / "config.json"
+        persona_keep = root / "persona_keep.md"
+        persona_keep.write_text("# Persona v1", encoding="utf-8")
+
+        cfg = WatchpostConfig(
+            db_path=str(root / "wp.db"),
+            media_dir=str(root / "media"),
+            workspace_dir=str(root),
+            language="zh",
+            quiet_hours=QuietHoursConfig(enabled=False, start="23:00", end="08:00"),
+            backend=BackendConfig(preset="mock"),
+            feishu=FeishuConfig(enabled=False, auth_mode="user", user_access_token="${TEST_FEISHU_TOKEN}"),
+            channels=[
+                ChannelConfig(
+                    id="ch_keep",
+                    adapter="simulator",
+                    external_chat_id="sim_1",
+                    name="Keep Peer",
+                    chat_type=ChatType.p2p,
+                    trigger_mode=TriggerMode.all,
+                    persona_file=str(persona_keep),
+                ),
+                ChannelConfig(
+                    id="ch_drop",
+                    adapter="simulator",
+                    external_chat_id="sim_2",
+                    name="Drop Peer",
+                    chat_type=ChatType.p2p,
+                    trigger_mode=TriggerMode.all,
+                ),
+            ],
+        )
+        save_config(cfg, cfg_path)
+
+        resolved = load_config(cfg_path)
+        engine = build_engine_from_config(resolved)
+        daemon = WatchpostDaemon(engine, resolved, config_path=cfg_path)
+        app = create_app(
+            resolved.db_path,
+            engine=engine,
+            reload_fn=daemon.reload_from_disk,
+            config_path=cfg_path,
+        )
+        client = TestClient(app)
+
+        # Persistent mode patch writes both SQLite and config.json while preserving placeholders & 0600 perms
+        patch = client.patch("/api/channels/ch_keep", json={"autonomy_mode": "assistant_only"})
+        assert patch.status_code == 200
+        assert patch.json()["autonomy_mode"] == "assistant_only"
+        raw_after = load_raw_config(cfg_path)
+        assert raw_after.feishu.user_access_token == "${TEST_FEISHU_TOKEN}"
+        raw_keep = next(c for c in raw_after.channels if c.id == "ch_keep")
+        assert raw_keep.autonomy_mode.value == "assistant_only"
+        assert raw_keep.persona_file == str(persona_keep)
+        assert stat.S_IMODE(cfg_path.stat().st_mode) == 0o600
+
+        # Mutate persona file + add channel + remove ch_drop -> hot reload applies immediately
+        persona_keep.write_text("# Persona v2 updated", encoding="utf-8")
+        updated_cfg = raw_after.model_copy(
+            update={
+                "channels": [
+                    raw_keep,
+                    ChannelConfig(
+                        id="ch_new",
+                        adapter="simulator",
+                        external_chat_id="sim_3",
+                        name="New Peer",
+                        chat_type=ChatType.p2p,
+                        trigger_mode=TriggerMode.all,
+                    ),
+                ]
+            }
+        )
+        save_config(updated_cfg, cfg_path)
+
+        rel = client.post("/api/reload")
+        assert rel.status_code == 200
+        rel_body = rel.json()
+        assert rel_body["reloaded"] is True
+        assert rel_body["channels"] == 2
+        assert rel_body["disabled"] == 1
+
+        ch_keep_db = engine.store.get_channel("ch_keep")
+        ch_drop_db = engine.store.get_channel("ch_drop")
+        ch_new_db = engine.store.get_channel("ch_new")
+        assert ch_keep_db is not None and "Persona v2 updated" in ch_keep_db.persona_text
+        assert ch_drop_db is not None and ch_drop_db.enabled is False
+        assert ch_new_db is not None and ch_new_db.enabled is True
+
+        # Quiet & briefing endpoints work cleanly
+        q0 = client.get("/api/quiet").json()
+        assert q0["active"] is False
+        q1 = client.post("/api/quiet", json={"action": "mute", "minutes": 45}).json()
+        assert q1["active"] is True and q1["reason"] == "muted"
+        q2 = client.post("/api/quiet", json={"action": "unmute"}).json()
+        assert q2["active"] is False
+        b = client.post("/api/brief")
+        assert b.status_code == 200 and b.json()["sent"] is True

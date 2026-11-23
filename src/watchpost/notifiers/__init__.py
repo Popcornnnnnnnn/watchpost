@@ -12,6 +12,9 @@ _STATUS_TOKENS = {"/status", "status", "状态"}
 _LIST_TOKENS = {"/list", "list", "列表"}
 _HELP_TOKENS = {"/help", "help", "帮助"}
 _RESET_TOKENS = {"/reset"}
+_BRIEF_TOKENS = {"/brief", "brief", "早报", "简报", "汇总"}
+_UNMUTE_TOKENS = {"/unmute", "unmute", "取消静音", "解除静音"}
+_MUTE_CMD_RE = re.compile(r"^(?:/mute|mute|静音)(?:\s+(.+)|\s*(\d+.*))?$", re.IGNORECASE)
 
 
 def _parse_indexed_command(clean: str) -> tuple[int, str] | None:
@@ -65,6 +68,20 @@ def classify_owner_command(
         kind = "help"
     elif lower in _RESET_TOKENS:
         kind = "reset_personal"
+    elif lower in _BRIEF_TOKENS or clean in _BRIEF_TOKENS:
+        kind = "brief"
+    elif lower in _UNMUTE_TOKENS or clean in _UNMUTE_TOKENS:
+        kind = "unmute"
+    elif (mute_m := _MUTE_CMD_RE.fullmatch(clean)) is not None:
+        dur = (mute_m.group(1) or mute_m.group(2) or "2h").strip()
+        return OwnerAction(
+            notifier=notifier,
+            kind="mute",
+            thread_id=thread_id,
+            text=dur or "2h",
+            reply_token=reply_token,
+            attachments=att_list,
+        )
     elif lower == "/new" or (lower.startswith("/new") and len(clean) > 4 and clean[4].isspace()):
         return OwnerAction(
             notifier=notifier,

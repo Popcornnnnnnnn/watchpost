@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from watchpost import __version__
 from watchpost.adapters.simulator import SimulatorAdapter
 from watchpost.backends.mock import MockAgentBackend
+from watchpost.config import load_raw_config, save_config
 from watchpost.engine import WatchpostEngine
 from watchpost.models import AutonomyMode, EngineConfig, TriggerMode
 from watchpost.ports import AgentBackend
@@ -29,20 +30,34 @@ class SteerBody(BaseModel):
     message: str
 
 
+class QuietControlBody(BaseModel):
+    action: Literal["mute", "unmute", "toggle"]
+    minutes: int = 120
+
+
 def create_app(
     db_path: Path | str,
     *,
     backend: AgentBackend | None = None,
     config: EngineConfig | None = None,
+    engine: WatchpostEngine | None = None,
+    reload_fn: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+    config_path: Path | str | None = None,
 ) -> FastAPI:
-    store = WatchpostStore(db_path)
-    chosen_backend = backend or MockAgentBackend(language=(config.language if config else "zh"))
-    engine = WatchpostEngine(store, chosen_backend, config=config)
-    engine.register_adapter(SimulatorAdapter())
+    if engine is not None:
+        active_engine = engine
+        store = engine.store
+        chosen_backend = engine.backend
+    else:
+        store = WatchpostStore(db_path)
+        chosen_backend = backend or MockAgentBackend(language=(config.language if config else "zh"))
+        active_engine = WatchpostEngine(store, chosen_backend, config=config)
+        active_engine.register_adapter(SimulatorAdapter())
 
     app = FastAPI(title="Watchpost", version=__version__)
     app.state.watchpost_store = store
-    app.state.watchpost_engine = engine
+    app.state.watchpost_engine = active_engine
+    app.state.watchpost_config_path = Path(config_path).expanduser() if config_path else None
 
     @app.middleware("http")
     async def _security_headers(request: Request, call_next):
@@ -65,6 +80,9 @@ def create_app(
                 "/api/health",
                 "/api/channels",
                 "/api/threads",
+                "/api/reload",
+                "/api/quiet",
+                "/api/brief",
                 "/api/simulate/run",
             ],
         }
@@ -76,6 +94,7 @@ def create_app(
             "version": __version__,
             "backend": chosen_backend.name,
             "metrics": store.get_metrics(),
+            "quiet_hours": active_engine.get_quiet_status(),
         }
 
     @app.get("/api/channels")
@@ -94,7 +113,64 @@ def create_app(
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="Channel not found")
+
+        cfg_file: Path | None = app.state.watchpost_config_path
+        if cfg_file is not None and cfg_file.is_file():
+            raw_cfg = load_raw_config(cfg_file)
+            changed = False
+            new_channels = []
+            for ch in raw_cfg.channels:
+                if ch.id == channel_id:
+                    patch_updates: dict[str, Any] = {}
+                    if body.enabled is not None:
+                        patch_updates["enabled"] = body.enabled
+                    if body.autonomy_mode is not None:
+                        patch_updates["autonomy_mode"] = body.autonomy_mode
+                    if body.trigger_mode is not None:
+                        patch_updates["trigger_mode"] = body.trigger_mode
+                    if body.whisper_prompt is not None:
+                        patch_updates["whisper_prompt"] = body.whisper_prompt
+                    if body.persona_text is not None:
+                        patch_updates["persona_text"] = body.persona_text
+                    if patch_updates:
+                        ch = ch.model_copy(update=patch_updates)
+                        changed = True
+                new_channels.append(ch)
+            if changed:
+                save_config(raw_cfg.model_copy(update={"channels": new_channels}), cfg_file)
+
         return updated.model_dump(mode="json")
+
+    @app.post("/api/reload")
+    async def reload_config_endpoint() -> dict[str, Any]:
+        if reload_fn is None:
+            raise HTTPException(status_code=501, detail="Hot reload is only available in daemon mode")
+        try:
+            return await reload_fn()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Reload failed: {exc}") from exc
+
+    @app.get("/api/quiet")
+    async def get_quiet() -> dict[str, Any]:
+        return active_engine.get_quiet_status()
+
+    @app.post("/api/quiet")
+    async def control_quiet(body: QuietControlBody) -> dict[str, Any]:
+        cur = active_engine.get_quiet_status()
+        act = body.action
+        if act == "toggle":
+            act = "unmute" if cur["active"] else "mute"
+        if act == "mute":
+            return active_engine.set_quiet_mute(minutes=body.minutes)
+        st = active_engine.clear_quiet_mute()
+        if int(st.get("queued_count") or 0) > 0:
+            await active_engine.send_briefing()
+            st = active_engine.get_quiet_status()
+        return st
+
+    @app.post("/api/brief")
+    async def send_brief_endpoint() -> dict[str, Any]:
+        return await active_engine.send_briefing()
 
     @app.get("/api/threads")
     async def list_threads() -> list[dict[str, Any]]:
@@ -123,7 +199,7 @@ def create_app(
     @app.post("/api/threads/{thread_id}/steer")
     async def steer_thread(thread_id: str, body: SteerBody) -> dict[str, Any]:
         try:
-            updated = await engine.steer_from_owner(thread_id, body.message, approved_go=False)
+            updated = await active_engine.steer_from_owner(thread_id, body.message, approved_go=False)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         data = updated.model_dump(mode="json")
@@ -133,7 +209,7 @@ def create_app(
     @app.post("/api/threads/{thread_id}/approve")
     async def approve_thread(thread_id: str) -> dict[str, Any]:
         try:
-            updated = await engine.steer_from_owner(thread_id, "go", approved_go=True)
+            updated = await active_engine.steer_from_owner(thread_id, "go", approved_go=True)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         data = updated.model_dump(mode="json")
@@ -143,7 +219,7 @@ def create_app(
     @app.post("/api/threads/{thread_id}/dismiss")
     async def dismiss_thread(thread_id: str) -> dict[str, Any]:
         try:
-            updated = engine.dismiss_go(thread_id)
+            updated = active_engine.dismiss_go(thread_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         data = updated.model_dump(mode="json")
@@ -160,6 +236,6 @@ def create_app(
 
     @app.post("/api/simulate/run")
     async def simulate_run() -> dict[str, Any]:
-        return await engine.run_demo_scenario()
+        return await active_engine.run_demo_scenario()
 
     return app

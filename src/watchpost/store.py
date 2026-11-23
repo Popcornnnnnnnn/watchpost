@@ -570,6 +570,101 @@ class WatchpostStore:
             ).fetchall()
         return [_row_to_thread(r) for r in rows]
 
+    def get_recent_cross_channel_context(
+        self,
+        *,
+        exclude_channel_id: str,
+        workspace_dir: str = "",
+        window_s: float = 7200.0,
+        limit: int = 5,
+        now_ts: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return compact summaries of recent non-personal threads in other channels sharing the workspace."""
+        eff_limit = max(0, int(limit))
+        eff_window = float(window_s)
+        if eff_limit <= 0 or eff_window <= 0:
+            return []
+
+        now = float(now_ts) if now_ts is not None else time.time()
+        cutoff = now - eff_window
+        ws_clean = workspace_dir.strip()
+
+        with self._connect() as conn:
+            if ws_clean:
+                rows = conn.execute(
+                    """
+                    SELECT t.id, t.channel_id, t.sender_name, t.title, t.status, t.pending_go, t.updated_at,
+                           c.name AS channel_name, c.adapter AS adapter
+                    FROM threads t
+                    JOIN channels c ON c.id = t.channel_id
+                    WHERE t.channel_id != ?
+                      AND c.adapter != 'owner_direct'
+                      AND t.status != ?
+                      AND t.updated_at >= ?
+                      AND (c.workspace_dir = '' OR c.workspace_dir = ?)
+                    ORDER BY t.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (exclude_channel_id, ThreadStatus.active.value, cutoff, ws_clean, eff_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT t.id, t.channel_id, t.sender_name, t.title, t.status, t.pending_go, t.updated_at,
+                           c.name AS channel_name, c.adapter AS adapter
+                    FROM threads t
+                    JOIN channels c ON c.id = t.channel_id
+                    WHERE t.channel_id != ?
+                      AND c.adapter != 'owner_direct'
+                      AND t.status != ?
+                      AND t.updated_at >= ?
+                    ORDER BY t.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (exclude_channel_id, ThreadStatus.active.value, cutoff, eff_limit),
+                ).fetchall()
+
+            results: list[dict[str, Any]] = []
+            for r in rows:
+                ev = conn.execute(
+                    """
+                    SELECT summary_bubbles_json, raw_text
+                    FROM thread_events
+                    WHERE thread_id = ? AND kind IN ('agent_reply', 'error')
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (r["id"],),
+                ).fetchone()
+                summary = ""
+                if ev is not None:
+                    try:
+                        bubbles = json.loads(ev["summary_bubbles_json"] or "[]")
+                    except Exception:
+                        bubbles = []
+                    if isinstance(bubbles, list) and bubbles:
+                        summary = " ".join(str(b).strip() for b in bubbles[:2] if str(b).strip())
+                    if not summary:
+                        summary = str(ev["raw_text"] or "")
+                summary = " ".join(summary.split())
+                if len(summary) > 180:
+                    summary = summary[:177].rstrip() + "..."
+                uts = float(r["updated_at"] or 0.0)
+                age_min = max(0, int((now - uts) // 60)) if uts > 0 else 0
+                results.append(
+                    {
+                        "thread_id": str(r["id"] or ""),
+                        "channel_name": str(r["channel_name"] or r["channel_id"] or ""),
+                        "adapter": str(r["adapter"] or ""),
+                        "sender_name": str(r["sender_name"] or ""),
+                        "title": str(r["title"] or ""),
+                        "status": str(r["status"] or ""),
+                        "pending_go": bool(r["pending_go"]),
+                        "summary": summary,
+                        "age_min": age_min,
+                    }
+                )
+            return results
+
     def find_active_p2p_thread(self, channel_id: str, *, ttl_s: float, now_ts: float | None = None) -> ThreadRecord | None:
         now = now_ts if now_ts is not None else time.time()
         with self._connect() as conn:

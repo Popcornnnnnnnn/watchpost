@@ -124,6 +124,9 @@ def build_engine_from_config(
             personal_workspace_dir=personal_ws,
             personal_session_ttl_s=cfg.imessage.personal_session_ttl_s,
             ack_on_receive=cfg.imessage.ack_on_receive,
+            quiet_hours=cfg.quiet_hours,
+            cross_channel_window_s=cfg.cross_channel_window_s,
+            cross_channel_max_items=cfg.cross_channel_max_items,
         ),
         media_processor=media_proc,
         media_dir=Path(cfg.media_dir).expanduser(),
@@ -159,9 +162,117 @@ def build_engine_from_config(
 class WatchpostDaemon:
     """Runs passive channel watching and owner phone-command polling cleanly."""
 
-    def __init__(self, engine: WatchpostEngine, config: WatchpostConfig) -> None:
+    def __init__(
+        self,
+        engine: WatchpostEngine,
+        config: WatchpostConfig,
+        *,
+        config_path: Path | None = None,
+    ) -> None:
         self.engine = engine
         self.config = config
+        self.config_path = Path(config_path).expanduser() if config_path else None
+        self._reload_lock = asyncio.Lock()
+
+    async def reload_from_disk(self) -> dict[str, Any]:
+        """Hot-reload channels, personas, quiet hours, and timings from disk without restarting."""
+        async with self._reload_lock:
+            if self.config_path is None or not self.config_path.is_file():
+                raise FileNotFoundError(
+                    f"Watchpost config path unavailable for reload: {self.config_path}"
+                )
+            new_cfg = load_config(self.config_path)
+            personal_ws = (
+                Path(new_cfg.imessage.personal_workspace_dir).expanduser()
+                if new_cfg.imessage.personal_workspace_dir
+                else None
+            )
+            self.engine.config = EngineConfig(
+                workspace_dir=Path(new_cfg.workspace_dir).expanduser(),
+                language=new_cfg.language,
+                debounce_s=new_cfg.debounce_s,
+                max_debounce_s=new_cfg.max_debounce_s,
+                media_retention_days=self.engine.config.media_retention_days,
+                personal_workspace_dir=personal_ws,
+                personal_session_ttl_s=new_cfg.imessage.personal_session_ttl_s,
+                ack_on_receive=new_cfg.imessage.ack_on_receive,
+                quiet_hours=new_cfg.quiet_hours,
+                cross_channel_window_s=new_cfg.cross_channel_window_s,
+                cross_channel_max_items=new_cfg.cross_channel_max_items,
+            )
+            self.engine.debouncer.debounce_s = float(new_cfg.debounce_s)
+            self.engine.debouncer.max_debounce_s = float(new_cfg.max_debounce_s)
+
+            configured_ids = {ch.id for ch in new_cfg.channels}
+            disabled_count = 0
+            for existing in self.engine.store.list_channels():
+                if existing.adapter == "owner_direct":
+                    continue
+                if existing.id not in configured_ids and existing.enabled:
+                    self.engine.store.update_channel_settings(existing.id, enabled=False)
+                    disabled_count += 1
+            for ch in new_cfg.channels:
+                self.engine.store.upsert_channel(ch)
+
+            old_to_close: list[Any] = []
+            has_feishu = new_cfg.feishu.enabled or any(
+                c.adapter == "feishu" and c.enabled for c in new_cfg.channels
+            )
+            if "feishu" in self.engine.adapters:
+                old_to_close.append(self.engine.adapters.pop("feishu"))
+            if has_feishu:
+                self.engine.register_adapter(FeishuAdapter(new_cfg.feishu))
+
+            old_ext_names = [
+                name for name in list(self.engine.adapters) if name not in {"feishu", "simulator"}
+            ]
+            for name in old_ext_names:
+                old_to_close.append(self.engine.adapters.pop(name))
+            for ext_cfg in new_cfg.external_adapters:
+                if ext_cfg.name and ext_cfg.command:
+                    self.engine.register_adapter(ExternalCommandAdapter(ext_cfg))
+
+            for obj in old_to_close:
+                aclose = getattr(obj, "aclose", None)
+                if callable(aclose):
+                    try:
+                        await aclose()
+                    except Exception:
+                        pass
+
+            self.config = new_cfg
+            for ch in new_cfg.channels:
+                stored = self.engine.store.get_channel(ch.id)
+                if (
+                    ch.enabled
+                    and ch.adapter != "owner_direct"
+                    and ch.adapter in self.engine.adapters
+                    and stored is not None
+                    and stored.cursor_pos == 0
+                    and stored.cursor_ms == 0
+                    and not self.engine.store.get_recent_messages(ch.id, limit=1)
+                ):
+                    try:
+                        fetched = await self.engine.adapters[ch.adapter].fetch_recent(ch)
+                        await self.engine.ingest_messages(
+                            ch.id,
+                            fetched,
+                            seed_if_empty=True,
+                            debounced=True,
+                        )
+                    except Exception as exc:
+                        logger.warning("Reload seed failed (%s / %s): %s", ch.adapter, ch.id, exc)
+
+            active_count = sum(
+                1 for c in self.engine.store.list_channels() if c.enabled and c.adapter != "owner_direct"
+            )
+            logger.info("Hot-reloaded Watchpost config (%d active channels, %d disabled)", active_count, disabled_count)
+            return {
+                "reloaded": True,
+                "channels": active_count,
+                "disabled": disabled_count,
+                "quiet_hours": self.engine.get_quiet_status(),
+            }
 
     async def run_once(self, *, seed_if_empty: bool = False, debounced: bool = False) -> dict[str, int]:
         polled = await self.engine.poll_all_channels(seed_if_empty=seed_if_empty, debounced=debounced)
@@ -203,6 +314,9 @@ class WatchpostDaemon:
                 self.engine.store.db_path,
                 backend=self.engine.backend,
                 config=self.engine.config,
+                engine=self.engine,
+                reload_fn=self.reload_from_disk,
+                config_path=self.config_path,
             )
             uv_cfg = uvicorn.Config(
                 app,
@@ -215,16 +329,17 @@ class WatchpostDaemon:
             api_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
             api_task = asyncio.create_task(api_server.serve())
 
-        chan_interval = max(1.0, float(self.config.poll_interval_s))
-        owner_interval = max(0.5, float(self.config.owner_poll_interval_s))
         next_chan_at = 0.0
         next_owner_at = 0.0
 
         try:
             while not stopper.is_set():
                 now = time.monotonic()
+                chan_interval = max(1.0, float(self.config.poll_interval_s))
+                owner_interval = max(0.5, float(self.config.owner_poll_interval_s))
                 if now >= next_chan_at:
                     await self.engine.poll_all_channels(seed_if_empty=False, debounced=True)
+                    await self.engine.flush_quiet_digest_if_due()
                     next_chan_at = now + chan_interval
                 if now >= next_owner_at:
                     await self.engine.poll_owner_actions_once()

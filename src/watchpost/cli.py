@@ -105,7 +105,7 @@ async def _run_daemon_cli(
     if api_port > 0:
         cfg = cfg.model_copy(update={"api_port": api_port})
     engine = build_engine_from_config(cfg)
-    daemon = WatchpostDaemon(engine, cfg)
+    daemon = WatchpostDaemon(engine, cfg, config_path=config_path)
     if once:
         try:
             summary = await daemon.run_once(seed_if_empty=seed, debounced=False)
@@ -119,6 +119,19 @@ async def _run_daemon_cli(
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+    if hasattr(signal, "SIGHUP"):
+        def _on_sighup() -> None:
+            task = asyncio.create_task(daemon.reload_from_disk())
+            task.add_done_callback(
+                lambda t: logging.getLogger("watchpost.cli").warning("SIGHUP reload failed: %s", t.exception())
+                if not t.cancelled() and t.exception() is not None
+                else None
+            )
+
+        try:
+            loop.add_signal_handler(signal.SIGHUP, _on_sighup)
         except NotImplementedError:
             pass
     await daemon.run_forever(stop_event=stop_event, seed_on_start=True)

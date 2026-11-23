@@ -1235,3 +1235,245 @@ def test_imessage_plain_message_ignores_reply_to_guid_and_routes_to_personal(tmp
         assert backend.steers[-1][3] == work_ws
 
     asyncio.run(_run())
+
+
+def test_quiet_hours_briefing_urgent_and_mute_commands(tmp_path: Path, monkeypatch: Any) -> None:
+    from datetime import datetime
+    import watchpost.engine as engine_mod
+    from watchpost.models import QuietHoursConfig
+
+    ts_2330 = datetime(2026, 11, 23, 23, 30, 0).timestamp()
+    ts_0200 = datetime(2026, 11, 24, 2, 0, 0).timestamp()
+    ts_0805 = datetime(2026, 11, 24, 8, 5, 0).timestamp()
+    clock = {"now": ts_2330}
+    monkeypatch.setattr(engine_mod.time, "time", lambda: clock["now"])
+
+    async def _run() -> None:
+        store = WatchpostStore(tmp_path / "quiet.db")
+        ch = ChannelConfig(
+            id="ch_ops",
+            adapter="feishu",
+            external_chat_id="oc_ops",
+            name="Field Support",
+            chat_type=ChatType.p2p,
+            trigger_mode=TriggerMode.all,
+            autonomy_mode=AutonomyMode.diagnose_only,
+        )
+        store.upsert_channel(ch)
+
+        backend = _RecordingBackend("ag")
+        notifier = _RecordingNotifier()
+        engine = WatchpostEngine(
+            store,
+            backend,
+            config=EngineConfig(
+                workspace_dir=tmp_path,
+                personal_workspace_dir=tmp_path,
+                language="zh",
+                quiet_hours=QuietHoursConfig(
+                    enabled=True,
+                    start="23:00",
+                    end="08:00",
+                    urgent_keywords=["URGENT", "停机"],
+                    auto_brief_on_end=True,
+                ),
+            ),
+            notifiers=[notifier],
+        )
+
+        # 1. During 23:00–08:00, normal inbound runs silently and queues into morning briefing
+        th_quiet = await engine.ingest_messages(
+            ch.id,
+            [
+                NormalizedMessage(
+                    message_id="m_q1",
+                    channel_id=ch.id,
+                    position=1,
+                    create_ms=int(ts_2330 * 1000),
+                    sender_id="ou_1",
+                    sender_name="Engineer",
+                    clean_text="帮我查一下夜间报文日志",
+                )
+            ],
+        )
+        assert len(th_quiet) == 1
+        assert len(notifier.starts) == 0
+        assert len(notifier.completions) == 0
+        assert engine.get_quiet_status(now_ts=ts_2330)["queued_count"] == 1
+
+        # 2. Urgent keyword breaks through during 02:00
+        clock["now"] = ts_0200
+        await engine.ingest_messages(
+            ch.id,
+            [
+                NormalizedMessage(
+                    message_id="m_urg",
+                    channel_id=ch.id,
+                    position=2,
+                    create_ms=int(ts_0200 * 1000),
+                    sender_id="ou_1",
+                    sender_name="Engineer",
+                    clean_text="URGENT 现场服务异常退出",
+                )
+            ],
+        )
+        assert len(notifier.starts) == 1
+        assert len(notifier.completions) == 1
+
+        # 3. Personal Direct Chat still notifies immediately during Quiet Hours
+        p_res = await engine.handle_owner_action(classify_owner_command("查一下分支", notifier="imessage"))  # type: ignore[arg-type]
+        assert p_res is not None and p_res.channel_id == "personal_direct"
+        assert len(notifier.completions) == 2
+
+        # 4. At 08:05, morning briefing flushes once and clears queue (no duplicate on second call)
+        clock["now"] = ts_0805
+        flushed = await engine.flush_quiet_digest_if_due(now_ts=ts_0805)
+        assert flushed == 1
+        assert engine.get_quiet_status(now_ts=ts_0805)["queued_count"] == 0
+        assert any("早安简报" in txt and "Field Support" in txt for txt in notifier.direct_replies)
+        assert await engine.flush_quiet_digest_if_due(now_ts=ts_0805) == 0
+
+        # 5. Daytime /mute 60m -> quiet active -> silent -> /brief flushes -> /unmute resumes
+        await engine.handle_owner_action(classify_owner_command("/mute 60m", notifier="imessage"))  # type: ignore[arg-type]
+        assert engine.get_quiet_status(now_ts=ts_0805)["reason"] == "muted"
+        comp_before = len(notifier.completions)
+        await engine.ingest_messages(
+            ch.id,
+            [
+                NormalizedMessage(
+                    message_id="m_m1",
+                    channel_id=ch.id,
+                    position=3,
+                    create_ms=int(ts_0805 * 1000),
+                    sender_id="ou_1",
+                    sender_name="Engineer",
+                    clean_text="顺便看看温度传感器",
+                )
+            ],
+        )
+        assert len(notifier.completions) == comp_before
+        assert engine.get_quiet_status(now_ts=ts_0805)["queued_count"] == 1
+
+        await engine.handle_owner_action(classify_owner_command("早报", notifier="imessage"))  # type: ignore[arg-type]
+        assert engine.get_quiet_status(now_ts=ts_0805)["queued_count"] == 0
+
+        await engine.handle_owner_action(classify_owner_command("/unmute", notifier="imessage"))  # type: ignore[arg-type]
+        assert engine.get_quiet_status(now_ts=ts_0805)["active"] is False
+
+        # 6. /unmute inside scheduled Quiet Hours overrides schedule until next 08:00
+        clock["now"] = ts_2330
+        assert engine.get_quiet_status(now_ts=ts_2330)["active"] is True
+        await engine.handle_owner_action(classify_owner_command("/unmute", notifier="imessage"))  # type: ignore[arg-type]
+        assert engine.get_quiet_status(now_ts=ts_2330)["active"] is False
+
+    asyncio.run(_run())
+
+
+def test_cross_channel_same_incident_memory_and_isolation(tmp_path: Path) -> None:
+    ws_1 = tmp_path / "ws_one"
+    ws_2 = tmp_path / "ws_two"
+    ws_1.mkdir()
+    ws_2.mkdir()
+
+    async def _run() -> None:
+        store = WatchpostStore(tmp_path / "cross.db")
+        ch_a = ChannelConfig(
+            id="ch_a",
+            adapter="feishu",
+            external_chat_id="oc_a",
+            name="Peer Alpha",
+            chat_type=ChatType.p2p,
+            trigger_mode=TriggerMode.all,
+            autonomy_mode=AutonomyMode.diagnose_only,
+            workspace_dir=str(ws_1),
+        )
+        ch_b = ChannelConfig(
+            id="ch_b",
+            adapter="wechat",
+            external_chat_id="wx_b",
+            name="Peer Beta",
+            chat_type=ChatType.p2p,
+            trigger_mode=TriggerMode.all,
+            autonomy_mode=AutonomyMode.diagnose_only,
+            workspace_dir=str(ws_1),
+        )
+        ch_c = ChannelConfig(
+            id="ch_c",
+            adapter="feishu",
+            external_chat_id="oc_c",
+            name="Other Project",
+            chat_type=ChatType.p2p,
+            trigger_mode=TriggerMode.all,
+            autonomy_mode=AutonomyMode.diagnose_only,
+            workspace_dir=str(ws_2),
+        )
+        for ch in (ch_a, ch_b, ch_c):
+            store.upsert_channel(ch)
+
+        backend = _RecordingBackend("ag")
+        engine = WatchpostEngine(
+            store,
+            backend,
+            config=EngineConfig(
+                workspace_dir=ws_1,
+                personal_workspace_dir=ws_1,
+                language="zh",
+                cross_channel_window_s=7200,
+                cross_channel_max_items=5,
+            ),
+        )
+
+        now_ms = int(time.time() * 1000)
+        await engine.ingest_messages(
+            ch_a.id,
+            [
+                NormalizedMessage(
+                    message_id="m_a1",
+                    channel_id=ch_a.id,
+                    position=1,
+                    create_ms=now_ms,
+                    sender_id="ou_a",
+                    sender_name="Peer Alpha",
+                    clean_text="Controller Alpha heartbeat timeout",
+                )
+            ],
+        )
+        await engine.ingest_messages(
+            ch_c.id,
+            [
+                NormalizedMessage(
+                    message_id="m_c1",
+                    channel_id=ch_c.id,
+                    position=1,
+                    create_ms=now_ms + 100,
+                    sender_id="ou_c",
+                    sender_name="Other Project",
+                    clean_text="Secret ws2 unrelated message",
+                )
+            ],
+        )
+        await engine.handle_owner_action(classify_owner_command("Private personal query", notifier="imessage"))  # type: ignore[arg-type]
+
+        await engine.ingest_messages(
+            ch_b.id,
+            [
+                NormalizedMessage(
+                    message_id="m_b1",
+                    channel_id=ch_b.id,
+                    position=1,
+                    create_ms=now_ms + 200,
+                    sender_id="wx_b",
+                    sender_name="Peer Beta",
+                    clean_text="Same controller timeout happening here too",
+                )
+            ],
+        )
+
+        prompt_b = backend.starts[-1][1]
+        assert "## Recent Cross-Channel Activity (Last 2h — Same-Incident Reference Only)" in prompt_b
+        assert "Peer Alpha (feishu)" in prompt_b
+        assert "Other Project" not in prompt_b
+        assert "Private personal query" not in prompt_b
+        assert "个人直聊" not in prompt_b
+
+    asyncio.run(_run())
