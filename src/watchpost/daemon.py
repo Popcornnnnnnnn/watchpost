@@ -180,6 +180,9 @@ class WatchpostDaemon:
         seed_on_start: bool = True,
     ) -> None:
         stopper = stop_event or asyncio.Event()
+        recovered = self.engine.store.recover_stale_active_threads()
+        if recovered:
+            logger.warning("Recovered %d orphaned active thread(s) on startup", recovered)
         if seed_on_start:
             await self.engine.poll_all_channels(seed_if_empty=True, debounced=False)
         logger.info(

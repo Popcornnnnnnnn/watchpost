@@ -34,7 +34,7 @@ from watchpost.config import (
     resolve_config,
     save_config,
 )
-from watchpost.daemon import build_engine_from_config, run_doctor
+from watchpost.daemon import WatchpostDaemon, build_engine_from_config, run_doctor
 from watchpost.engine import WatchpostEngine
 from watchpost.models import (
     AgentResult,
@@ -933,3 +933,119 @@ def test_thread_persists_active_status_while_backend_runs(tmp_path: Path) -> Non
         assert final is not None and final.status == ThreadStatus.completed
 
     asyncio.run(_run())
+
+
+def test_daemon_recovers_stale_active_threads_on_startup(tmp_path: Path) -> None:
+    db_path = tmp_path / "recover.db"
+    store = WatchpostStore(db_path)
+    ch = ChannelConfig(
+        id="ch_rec",
+        adapter="feishu",
+        external_chat_id="oc_rec",
+        name="Peer Recover",
+        chat_type=ChatType.p2p,
+        trigger_mode=TriggerMode.all,
+        autonomy_mode=AutonomyMode.diagnose_only,
+    )
+    store.upsert_channel(ch)
+
+    old_ts = time.time() - 7200
+    store.create_or_update_thread(
+        ThreadRecord(
+            id="th_orphan",
+            channel_id=ch.id,
+            backend="antigravity",
+            backend_thread_ref="conv_orphan",
+            sender_id="ou_1",
+            sender_name="Peer Recover",
+            title="Orphan active turn",
+            status=ThreadStatus.active,
+            pending_go=False,
+            created_at=old_ts - 60,
+            updated_at=old_ts,
+        )
+    )
+    store.create_or_update_thread(
+        ThreadRecord(
+            id="th_done",
+            channel_id=ch.id,
+            backend="antigravity",
+            backend_thread_ref="conv_done",
+            sender_id="ou_1",
+            sender_name="Peer Recover",
+            title="Completed turn",
+            status=ThreadStatus.completed,
+            pending_go=False,
+            created_at=old_ts - 120,
+            updated_at=old_ts - 30,
+        )
+    )
+
+    # Opening another WatchpostStore instance must NOT alter an active thread while a live daemon may own it
+    concurrent_store = WatchpostStore(db_path)
+    still_active = concurrent_store.get_thread("th_orphan")
+    assert still_active is not None and still_active.status == ThreadStatus.active
+
+    async def _run() -> None:
+        cfg = WatchpostConfig(
+            db_path=str(db_path),
+            media_dir=str(tmp_path / "media"),
+            workspace_dir=str(tmp_path),
+            api_port=0,
+        )
+        engine = WatchpostEngine(store, _RecordingBackend("obs"), config=EngineConfig(workspace_dir=tmp_path))
+        daemon = WatchpostDaemon(engine, cfg)
+        stop_ev = asyncio.Event()
+        stop_ev.set()
+        await daemon.run_forever(stop_event=stop_ev, seed_on_start=False)
+
+    asyncio.run(_run())
+
+    orphan_after = store.get_thread("th_orphan")
+    done_after = store.get_thread("th_done")
+    assert orphan_after is not None
+    assert orphan_after.status == ThreadStatus.error
+    assert orphan_after.pending_go is False
+    assert abs(orphan_after.updated_at - old_ts) < 0.001
+    events = store.list_thread_events("th_orphan")
+    assert any(ev.kind == "error" and "Interrupted" in ev.raw_text for ev in events)
+    assert done_after is not None and done_after.status == ThreadStatus.completed
+
+
+def test_summarize_batch_strips_markdown_image_keys() -> None:
+    pure_preview, pure_imgs, pure_topic = WatchpostEngine._summarize_batch_for_notice(
+        [
+            NormalizedMessage(
+                message_id="m_img_only",
+                channel_id="ch_1",
+                position=1,
+                create_ms=1000,
+                sender_id="ou_1",
+                sender_name="Peer",
+                msg_type="post",
+                clean_text="![Image](img_v3_0217n_66540c18-cd99-4a00-8000-abcdef123456)",
+            )
+        ]
+    )
+    assert pure_topic == "[图片]"
+    assert pure_preview == ""
+    assert pure_imgs == []
+
+    mixed_preview, mixed_imgs, mixed_topic = WatchpostEngine._summarize_batch_for_notice(
+        [
+            NormalizedMessage(
+                message_id="m_img_mixed",
+                channel_id="ch_1",
+                position=2,
+                create_ms=2000,
+                sender_id="ou_1",
+                sender_name="Peer",
+                msg_type="post",
+                clean_text="![Image](img_v3_0217n_66540c18-cd99-4a00-8000-abcdef123456) 站控报暂停",
+            )
+        ]
+    )
+    assert mixed_topic == "站控报暂停"
+    assert "img_v3_" not in mixed_topic
+    assert "img_v3_" not in mixed_preview
+    assert mixed_imgs == []

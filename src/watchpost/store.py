@@ -519,6 +519,41 @@ class WatchpostStore:
             )
             return int(cur.rowcount or 0)
 
+    def recover_stale_active_threads(self) -> int:
+        """Mark orphaned `active` threads from a prior crash/restart as `error` without altering `updated_at`."""
+        now = time.time()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM threads WHERE status = ?",
+                (ThreadStatus.active.value,),
+            ).fetchall()
+            if not rows:
+                return 0
+            conn.execute(
+                "UPDATE threads SET status = ?, pending_go = 0 WHERE status = ?",
+                (ThreadStatus.error.value, ThreadStatus.active.value),
+            )
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT INTO thread_events (
+                        thread_id, kind, summary_bubbles_json, suggested_reply, needs_attention,
+                        raw_text, draft_copied, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"],
+                        "error",
+                        "[]",
+                        "",
+                        "",
+                        "Interrupted: Watchpost restarted while turn was active.",
+                        0,
+                        now,
+                    ),
+                )
+            return len(rows)
+
     def list_threads(self, *, limit: int = 50) -> list[ThreadRecord]:
         with self._connect() as conn:
             rows = conn.execute(

@@ -115,27 +115,37 @@ class WatchpostEngine:
         r"^(?:\[(?:Image|Voice|Audio|File|Media|Video|Sticker|图片|语音|文件|Recalled)(?:\s*:[^\]]*)?\])$",
         re.IGNORECASE,
     )
+    _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)?")
 
     @classmethod
     def _summarize_batch_for_notice(cls, batch: list[NormalizedMessage]) -> tuple[str, list[str], str]:
         text_parts: list[str] = []
         image_paths: list[str] = []
         seen_imgs: set[str] = set()
+        has_image = False
         for m in batch:
-            txt = (m.clean_text or "").strip()
+            raw_txt = (m.clean_text or "").strip()
+            if (
+                m.msg_type == "image"
+                or bool(cls._MD_IMAGE_RE.search(raw_txt))
+                or any(r.kind in {"image", "video_cover"} for r in m.media_refs)
+            ):
+                has_image = True
+            txt = cls._MD_IMAGE_RE.sub("", raw_txt).strip()
             if txt and not cls._MEDIA_ONLY_TEXT_RE.fullmatch(txt):
                 text_parts.append(txt)
             for art in m.artifacts:
                 if art.kind == "audio" and art.transcript.strip():
                     text_parts.append(f"[语音] {art.transcript.strip()}")
                 elif art.kind in {"image", "video_cover"} and art.path:
+                    has_image = True
                     p = str(art.path).strip()
                     if p and p not in seen_imgs:
                         seen_imgs.add(p)
                         image_paths.append(p)
         original_text = "\n".join(text_parts).strip()
         first_line = original_text.splitlines()[0].strip() if original_text else ""
-        topic = (first_line[:36] if first_line else ("[图片]" if image_paths else "[Media]")).replace("\n", " ")
+        topic = (first_line[:36] if first_line else ("[图片]" if has_image else "[Media]")).replace("\n", " ")
         return original_text, image_paths, topic
 
     def _completion_channel_label(self, channel: ChannelConfig, *, sender_name: str = "") -> str:
