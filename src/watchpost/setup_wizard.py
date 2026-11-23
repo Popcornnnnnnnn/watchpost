@@ -11,10 +11,17 @@ from watchpost.config import (
     DEFAULT_DB_PATH,
     DEFAULT_MEDIA_DIR,
     BackendConfig,
+    BarkConfig,
+    DingTalkConfig,
+    DiscordConfig,
     FeishuConfig,
     IMessageConfig,
+    NtfyConfig,
+    PushoverConfig,
+    SlackConfig,
     TelegramConfig,
     WatchpostConfig,
+    WeComConfig,
     save_config,
 )
 from watchpost.daemon import run_doctor
@@ -158,7 +165,7 @@ def run_setup_wizard(
 
     plat_default = str(opts.get("platform") or env_info["recommended_platform"])
     platform_choice = _ask(
-        "Work chat source (feishu-lark-cli/feishu-api/external-plugin/none)",
+        "Work chat source (feishu-lark-cli/feishu-api/slack/discord/telegram/dingtalk/wecom/external-plugin/none)",
         plat_default,
         interactive=interactive,
         input_fn=ask_fn,
@@ -166,7 +173,7 @@ def run_setup_wizard(
 
     ntf_default = str(opts.get("notifier") or env_info["recommended_notifier"])
     notifier_choice = _ask(
-        "Owner phone/desktop entrance (imessage/telegram/external-notifier/none)",
+        "Owner phone/desktop entrance (imessage/telegram/slack-dm/discord-dm/ntfy/bark/pushover/wecom/external-notifier/none)",
         ntf_default,
         interactive=interactive,
         input_fn=ask_fn,
@@ -215,25 +222,90 @@ def run_setup_wizard(
     else:
         feishu_cfg = FeishuConfig(enabled=False)
 
-    if notifier_choice == "imessage":
-        imsg_cfg = IMessageConfig(
+    tg_cfg = TelegramConfig(
+        enabled=(notifier_choice == "telegram"),
+        inbound_enabled=(platform_choice == "telegram"),
+        bot_token="${TELEGRAM_BOT_TOKEN}" if (notifier_choice == "telegram" or platform_choice == "telegram") else "",
+        owner_chat_id="${TELEGRAM_OWNER_CHAT_ID}" if notifier_choice == "telegram" else "",
+        owner_username="${TELEGRAM_OWNER_USERNAME}" if platform_choice == "telegram" else "",
+    )
+
+    imsg_cfg = (
+        IMessageConfig(
             enabled=True,
             owner_handle="${WATCHPOST_IMESSAGE_HANDLE}",
             personal_workspace_dir=workspace_dir,
             personal_session_ttl_s=86400,
             ack_on_receive=False,
         )
-        tg_cfg = TelegramConfig(enabled=False)
-    elif notifier_choice == "telegram":
-        imsg_cfg = IMessageConfig(enabled=False)
-        tg_cfg = TelegramConfig(
-            enabled=True,
-            bot_token="${TELEGRAM_BOT_TOKEN}",
-            owner_chat_id="${TELEGRAM_OWNER_CHAT_ID}",
+        if notifier_choice == "imessage"
+        else IMessageConfig(enabled=False)
+    )
+
+    slack_cfg = (
+        SlackConfig(
+            enabled=(platform_choice == "slack"),
+            dm_enabled=(notifier_choice == "slack-dm"),
+            bot_token="${SLACK_BOT_TOKEN}",
+            owner_user_id="${SLACK_OWNER_USER_ID}",
         )
-    else:
-        imsg_cfg = IMessageConfig(enabled=False)
-        tg_cfg = TelegramConfig(enabled=False)
+        if (platform_choice == "slack" or notifier_choice == "slack-dm")
+        else SlackConfig(enabled=False)
+    )
+
+    discord_cfg = (
+        DiscordConfig(
+            enabled=(platform_choice == "discord"),
+            dm_enabled=(notifier_choice == "discord-dm"),
+            bot_token="${DISCORD_BOT_TOKEN}",
+            owner_user_id="${DISCORD_OWNER_USER_ID}",
+        )
+        if (platform_choice == "discord" or notifier_choice == "discord-dm")
+        else DiscordConfig(enabled=False)
+    )
+
+    dingtalk_cfg = (
+        DingTalkConfig(
+            enabled=True,
+            app_key="${DINGTALK_APP_KEY}",
+            app_secret="${DINGTALK_APP_SECRET}",
+            webhook_secret="${DINGTALK_WEBHOOK_SECRET}",
+            owner_user_id="${DINGTALK_OWNER_USER_ID}",
+        )
+        if platform_choice == "dingtalk"
+        else DingTalkConfig(enabled=False)
+    )
+
+    wecom_cfg = (
+        WeComConfig(
+            enabled=(platform_choice == "wecom"),
+            notify_enabled=(notifier_choice == "wecom"),
+            corp_id="${WECOM_CORP_ID}",
+            corp_secret="${WECOM_CORP_SECRET}",
+            callback_token="${WECOM_CALLBACK_TOKEN}" if platform_choice == "wecom" else "",
+            owner_user_id="${WECOM_OWNER_USER_ID}",
+        )
+        if (platform_choice == "wecom" or notifier_choice == "wecom")
+        else WeComConfig(enabled=False)
+    )
+
+    ntfy_cfg = (
+        NtfyConfig(enabled=True, topic="${NTFY_TOPIC}", reply_topic="${NTFY_REPLY_TOPIC}")
+        if notifier_choice == "ntfy"
+        else NtfyConfig(enabled=False)
+    )
+
+    bark_cfg = (
+        BarkConfig(enabled=True, device_key="${BARK_DEVICE_KEY}")
+        if notifier_choice == "bark"
+        else BarkConfig(enabled=False)
+    )
+
+    pushover_cfg = (
+        PushoverConfig(enabled=True, app_token="${PUSHOVER_APP_TOKEN}", user_key="${PUSHOVER_USER_KEY}")
+        if notifier_choice == "pushover"
+        else PushoverConfig(enabled=False)
+    )
 
     db_path = str(opts.get("db_path") or DEFAULT_DB_PATH)
     media_dir = str(opts.get("media_dir") or DEFAULT_MEDIA_DIR)
@@ -258,6 +330,13 @@ def run_setup_wizard(
         feishu=feishu_cfg,
         telegram=tg_cfg,
         imessage=imsg_cfg,
+        slack=slack_cfg,
+        discord=discord_cfg,
+        dingtalk=dingtalk_cfg,
+        wecom=wecom_cfg,
+        ntfy=ntfy_cfg,
+        bark=bark_cfg,
+        pushover=pushover_cfg,
     )
 
     saved_path = save_config(cfg, target_cfg)
@@ -275,12 +354,35 @@ def run_setup_wizard(
         say_fn("  export FEISHU_APP_ID=... FEISHU_APP_SECRET=... FEISHU_OWNER_OPEN_ID=...")
     elif platform_choice == "feishu-lark-cli":
         say_fn("  export FEISHU_OWNER_OPEN_ID=ou_...   # run `lark-cli auth login` if needed")
+    elif platform_choice == "slack":
+        say_fn("  export SLACK_BOT_TOKEN=xoxb-... SLACK_OWNER_USER_ID=U...")
+    elif platform_choice == "discord":
+        say_fn("  export DISCORD_BOT_TOKEN=... DISCORD_OWNER_USER_ID=...")
+    elif platform_choice == "telegram":
+        say_fn("  export TELEGRAM_BOT_TOKEN=... TELEGRAM_OWNER_USERNAME=...")
+    elif platform_choice == "dingtalk":
+        say_fn("  export DINGTALK_APP_KEY=... DINGTALK_APP_SECRET=... DINGTALK_WEBHOOK_SECRET=... DINGTALK_OWNER_USER_ID=...")
+    elif platform_choice == "wecom":
+        say_fn("  export WECOM_CORP_ID=... WECOM_CORP_SECRET=... WECOM_CALLBACK_TOKEN=... WECOM_OWNER_USER_ID=...")
     elif platform_choice == "external-plugin":
         say_fn("  watchpost plugins scaffold --kind channel --name my_chat --dest ./plugins/my_chat")
+
     if notifier_choice == "imessage":
         say_fn("  export WATCHPOST_IMESSAGE_HANDLE='+15550100'")
     elif notifier_choice == "telegram":
         say_fn("  export TELEGRAM_BOT_TOKEN=... TELEGRAM_OWNER_CHAT_ID=...")
+    elif notifier_choice == "slack-dm":
+        say_fn("  export SLACK_BOT_TOKEN=xoxb-... SLACK_OWNER_USER_ID=U...")
+    elif notifier_choice == "discord-dm":
+        say_fn("  export DISCORD_BOT_TOKEN=... DISCORD_OWNER_USER_ID=...")
+    elif notifier_choice == "ntfy":
+        say_fn("  export NTFY_TOPIC=... NTFY_REPLY_TOPIC=...")
+    elif notifier_choice == "bark":
+        say_fn("  export BARK_DEVICE_KEY=...")
+    elif notifier_choice == "pushover":
+        say_fn("  export PUSHOVER_APP_TOKEN=... PUSHOVER_USER_KEY=...")
+    elif notifier_choice == "wecom":
+        say_fn("  export WECOM_CORP_ID=... WECOM_CORP_SECRET=... WECOM_AGENT_ID=1000002 WECOM_OWNER_USER_ID=...")
     elif notifier_choice == "external-notifier":
         say_fn("  watchpost plugins scaffold --kind notifier --name my_push --dest ./plugins/my_push")
     say_fn(f"  watchpost run --config {saved_path}")

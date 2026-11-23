@@ -6,10 +6,13 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from watchpost import __version__
+from watchpost.adapters.dingtalk import DingTalkAdapter, verify_dingtalk_signature
 from watchpost.adapters.simulator import SimulatorAdapter
+from watchpost.adapters.wecom import WeComAdapter, verify_wecom_signature
 from watchpost.backends.mock import MockAgentBackend
 from watchpost.config import load_raw_config, save_config
 from watchpost.engine import WatchpostEngine
@@ -84,6 +87,8 @@ def create_app(
                 "/api/quiet",
                 "/api/brief",
                 "/api/simulate/run",
+                "/api/webhooks/dingtalk",
+                "/api/webhooks/wecom",
             ],
         }
 
@@ -237,5 +242,93 @@ def create_app(
     @app.post("/api/simulate/run")
     async def simulate_run() -> dict[str, Any]:
         return await active_engine.run_demo_scenario()
+
+    @app.post("/api/webhooks/dingtalk")
+    async def webhook_dingtalk(request: Request) -> dict[str, Any]:
+        adapter = active_engine.adapters.get("dingtalk")
+        if not isinstance(adapter, DingTalkAdapter):
+            raise HTTPException(status_code=404, detail="DingTalk adapter is not enabled")
+
+        secret = (adapter.config.webhook_secret or adapter.config.app_secret).strip()
+        timestamp = request.headers.get("timestamp", "")
+        sign = request.headers.get("sign", "")
+        if secret:
+            if not verify_dingtalk_signature(timestamp, sign, secret):
+                raise HTTPException(status_code=401, detail="Invalid DingTalk webhook signature")
+        elif not adapter.config.allow_unsigned_webhooks:
+            raise HTTPException(status_code=401, detail="DingTalk webhook secret not configured")
+
+        try:
+            payload = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid DingTalk JSON payload: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="DingTalk payload must be a JSON object")
+        try:
+            msg = adapter.ingest_webhook_payload(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "message_id": msg.message_id}
+
+    @app.get("/api/webhooks/wecom")
+    async def webhook_wecom_verify(
+        msg_signature: str = "",
+        signature: str = "",
+        timestamp: str = "",
+        nonce: str = "",
+        echostr: str = "",
+    ) -> PlainTextResponse:
+        adapter = active_engine.adapters.get("wecom")
+        if not isinstance(adapter, WeComAdapter):
+            raise HTTPException(status_code=404, detail="WeCom adapter is not enabled")
+
+        token = adapter.config.callback_token.strip()
+        sig = msg_signature or signature
+        if token:
+            if not verify_wecom_signature(token, timestamp, nonce, sig, echostr):
+                raise HTTPException(status_code=401, detail="Invalid WeCom verification signature")
+        elif not adapter.config.allow_unsigned_webhooks:
+            raise HTTPException(status_code=401, detail="WeCom callback token not configured")
+        return PlainTextResponse(echostr)
+
+    @app.post("/api/webhooks/wecom")
+    async def webhook_wecom(
+        request: Request,
+        msg_signature: str = "",
+        signature: str = "",
+        timestamp: str = "",
+        nonce: str = "",
+    ) -> dict[str, Any]:
+        adapter = active_engine.adapters.get("wecom")
+        if not isinstance(adapter, WeComAdapter):
+            raise HTTPException(status_code=404, detail="WeCom adapter is not enabled")
+
+        token = adapter.config.callback_token.strip()
+        sig = msg_signature or signature
+        if token:
+            if not verify_wecom_signature(token, timestamp, nonce, sig):
+                raise HTTPException(status_code=401, detail="Invalid WeCom webhook signature")
+        elif not adapter.config.allow_unsigned_webhooks:
+            raise HTTPException(status_code=401, detail="WeCom callback token not configured")
+
+        raw_text = (await request.body()).decode("utf-8", errors="replace").strip()
+        if not raw_text:
+            raise HTTPException(status_code=400, detail="Empty WeCom webhook body")
+        ctype = request.headers.get("content-type", "").lower()
+        if "json" in ctype or raw_text.startswith("{"):
+            try:
+                body: dict[str, Any] | str = await request.json()
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid WeCom JSON body: {exc}") from exc
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="WeCom JSON payload must be an object")
+        else:
+            body = raw_text
+
+        try:
+            msg = adapter.ingest_webhook_payload(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "message_id": msg.message_id}
 
     return app

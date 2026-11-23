@@ -7,9 +7,9 @@ Watches selected chat channels, runs local triage + your coding agent (`Antigrav
 
 ```mermaid
 flowchart LR
-    A["Feishu / External Channel Plugins (watchpost.sdk)"] --> B["Watchpost Daemon (Debouncer · Cross-Channel Memory · Quiet Hours · Whisper ASR)"]
+    A["Feishu · Slack · Discord · Telegram · DingTalk · WeCom · SDK Plugins"] --> B["Watchpost Daemon (Debouncer · Cross-Channel Memory · Quiet Hours · Whisper ASR)"]
     B --> C["Primary Agent (Antigravity agentapi + Stop Hook)\n↳ Auto-Failover Backup (e.g. Codex CLI)"]
-    C --> D["Owner Entrance (iMessage / Telegram / External Notifier Plugins)"]
+    C --> D["Owner Entrance (iMessage · Telegram · Slack/Discord DM · WeCom · ntfy · Bark · Pushover)"]
     D -->|"#N / go / skip / /brief / /mute / /new / voice / image"| B
 ```
 
@@ -20,7 +20,8 @@ flowchart LR
 - **Cross-Channel "Same Incident" Memory:** Feeds a compact recent-incidents digest from sibling channels sharing the same workspace into new threads while isolating personal direct chats.
 - **Zero-Downtime Hot Reload:** Reload channels, personas, Quiet Hours, and debounce settings in milliseconds via `POST /api/reload` or `SIGHUP`, and persist per-channel autonomy changes via `PATCH /api/channels/{id}`.
 - **Native Backends + Automatic Backup (`FallbackBackend`):** First-class `AntigravityBackend` (`agentapi` + `watchpost hook-stop`), `codex`, `claude_code`, and `gemini_cli`.
-- **Extensible Channel & Notifier Plugin SDK (`watchpost.sdk`):** Connect any platform (Slack, Discord, DingTalk, WeCom, ntfy, custom bridges) via `external_adapters` & `external_notifiers`, scaffold with `watchpost plugins scaffold`, and validate with `watchpost plugins check`.
+- **Multi-Platform Work Sources & Owner Entrances:** Native built-in support for **Feishu / Lark**, **Slack**, **Discord**, **Telegram** (outbound + shared-hub inbound), **DingTalk**, **WeCom (企业微信)**, **macOS iMessage**, **ntfy** (1-way + 2-way `reply_topic`), **Bark** (1-tap `copy` draft), and **Pushover**, plus a clean-room WhatsApp stdio SDK template (`examples/whatsapp_plugin_template.py`).
+- **Extensible Channel & Notifier Plugin SDK (`watchpost.sdk`):** Connect custom internal tools or external desktop bridges via `external_adapters` & `external_notifiers`, scaffold with `watchpost plugins scaffold`, and validate with `watchpost plugins check`.
 - **Rich Phone Control & Built-In Sandbox:** Swipe-reply routing, `#N` indexing, **Personal Direct Chat** (`/new`, `/reset`), voice/photo handling, plus interactive `sandbox-ui` (`http://127.0.0.1:8799`).
 
 ## Quickstart
@@ -55,8 +56,9 @@ uv run watchpost install-skill --target claude   # or codex | antigravity
 uv run watchpost plugins scaffold --kind channel --name my_bridge --dest ./plugins/my_bridge
 uv run watchpost plugins check --kind channel --test-fetch --cmd python3 ./plugins/my_bridge/plugin.py
 
-# Or test the included reference templates:
+# Or test the included reference templates (Channel, Notifier, and WhatsApp bridge):
 uv run watchpost plugins check --kind channel --test-fetch --cmd python3 examples/channel_plugin_template.py
+uv run watchpost plugins check --kind channel --test-fetch --cmd python3 examples/whatsapp_plugin_template.py
 uv run watchpost plugins check --kind notifier --cmd python3 examples/notifier_plugin_template.py
 ```
 

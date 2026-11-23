@@ -16,9 +16,14 @@ from typing import Any
 import uvicorn
 
 from watchpost import __version__
+from watchpost.adapters.dingtalk import DingTalkAdapter
+from watchpost.adapters.discord import DiscordAdapter
 from watchpost.adapters.external_plugin import ExternalCommandAdapter
 from watchpost.adapters.feishu import FeishuAdapter
 from watchpost.adapters.local_sandbox import LocalSandboxAdapter
+from watchpost.adapters.slack import SlackAdapter
+from watchpost.adapters.telegram import TelegramInboundAdapter
+from watchpost.adapters.wecom import WeComAdapter
 from watchpost.backends.antigravity import handle_stop_hook_payload
 from watchpost.backends.mock import MockAgentBackend
 from watchpost.config import (
@@ -189,6 +194,26 @@ def _handle_channels(args: argparse.Namespace) -> int:
         adapter_obj: Any = None
         if args.adapter == "feishu":
             adapter_obj = FeishuAdapter(cfg.feishu)
+        elif args.adapter == "slack":
+            adapter_obj = SlackAdapter(cfg.slack)
+        elif args.adapter == "discord":
+            adapter_obj = DiscordAdapter(cfg.discord)
+        elif args.adapter == "telegram":
+            adapter_obj = TelegramInboundAdapter(cfg.telegram)
+        elif args.adapter == "dingtalk":
+            inbox = (
+                Path(cfg.dingtalk.inbox_path).expanduser()
+                if cfg.dingtalk.inbox_path
+                else Path(cfg.db_path).expanduser().parent / "webhooks" / "dingtalk.jsonl"
+            )
+            adapter_obj = DingTalkAdapter(cfg.dingtalk, inbox_path=inbox)
+        elif args.adapter == "wecom":
+            inbox = (
+                Path(cfg.wecom.inbox_path).expanduser()
+                if cfg.wecom.inbox_path
+                else Path(cfg.db_path).expanduser().parent / "webhooks" / "wecom.jsonl"
+            )
+            adapter_obj = WeComAdapter(cfg.wecom, inbox_path=inbox)
         else:
             ext_cfg = next((e for e in cfg.external_adapters if e.name == args.adapter), None)
             if ext_cfg is not None:
@@ -276,8 +301,39 @@ def main(argv: list[str] | None = None) -> int:
     p_setup.add_argument("--lang", default="", choices=["", "zh", "en"], help="Reply language")
     p_setup.add_argument("--backend", default="", choices=["", "antigravity", "claude_code", "codex", "gemini_cli", "mock"])
     p_setup.add_argument("--backup", default=None, help="Backup failover backend (or 'none')")
-    p_setup.add_argument("--platform", default="", choices=["", "feishu-lark-cli", "feishu-api", "external-plugin", "none"])
-    p_setup.add_argument("--notifier", default="", choices=["", "imessage", "telegram", "external-notifier", "none"])
+    p_setup.add_argument(
+        "--platform",
+        default="",
+        choices=[
+            "",
+            "feishu-lark-cli",
+            "feishu-api",
+            "slack",
+            "discord",
+            "telegram",
+            "dingtalk",
+            "wecom",
+            "external-plugin",
+            "none",
+        ],
+    )
+    p_setup.add_argument(
+        "--notifier",
+        default="",
+        choices=[
+            "",
+            "imessage",
+            "telegram",
+            "slack-dm",
+            "discord-dm",
+            "ntfy",
+            "bark",
+            "pushover",
+            "wecom",
+            "external-notifier",
+            "none",
+        ],
+    )
     p_setup.add_argument("--no-quiet-hours", action="store_true", help="Disable Quiet Hours")
     p_setup.add_argument("--quiet-start", default="23:00")
     p_setup.add_argument("--quiet-end", default="08:00")

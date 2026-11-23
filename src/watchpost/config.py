@@ -54,8 +54,92 @@ class TelegramConfig(BaseModel):
     enabled: bool = False
     bot_token: str = ""
     owner_chat_id: str = ""
+    inbound_enabled: bool = False
+    inbound_bot_token: str = ""
+    owner_username: str = ""
+    owner_user_id: str = ""
     base_url: str = "https://api.telegram.org"
     poll_timeout_s: int = 0
+
+
+class SlackConfig(BaseModel):
+    enabled: bool = False
+    dm_enabled: bool = False
+    bot_token: str = ""
+    owner_user_id: str = ""
+    owner_dm_channel_id: str = ""
+    base_url: str = "https://slack.com/api"
+    fetch_thread_replies: bool = True
+
+
+class DiscordConfig(BaseModel):
+    enabled: bool = False
+    dm_enabled: bool = False
+    bot_token: str = ""
+    owner_user_id: str = ""
+    owner_dm_channel_id: str = ""
+    guild_ids: list[str] = Field(default_factory=list)
+    base_url: str = "https://discord.com/api/v10"
+
+
+class DingTalkConfig(BaseModel):
+    enabled: bool = False
+    app_key: str = ""
+    app_secret: str = ""
+    robot_code: str = ""
+    webhook_secret: str = ""
+    owner_user_id: str = ""
+    inbox_path: str = ""
+    allow_unsigned_webhooks: bool = False
+    base_url: str = "https://api.dingtalk.com"
+
+
+class WeComConfig(BaseModel):
+    enabled: bool = False
+    notify_enabled: bool = False
+    corp_id: str = ""
+    corp_secret: str = ""
+    agent_id: int = 0
+    callback_token: str = ""
+    owner_user_id: str = ""
+    owner_name: str = ""
+    inbox_path: str = ""
+    allow_unsigned_webhooks: bool = False
+    base_url: str = "https://qyapi.weixin.qq.com/cgi-bin"
+
+
+class NtfyConfig(BaseModel):
+    enabled: bool = False
+    server_url: str = "https://ntfy.sh"
+    topic: str = ""
+    reply_topic: str = ""
+    token: str = ""
+    priority: str = "default"
+    tags: list[str] = Field(default_factory=list)
+    notify_on_start: bool = False
+
+
+class BarkConfig(BaseModel):
+    enabled: bool = False
+    server_url: str = "https://api.day.app"
+    device_key: str = ""
+    group: str = "Watchpost"
+    sound: str = ""
+    icon: str = ""
+    level: str = "active"
+    auto_copy: bool = False
+    notify_on_start: bool = False
+
+
+class PushoverConfig(BaseModel):
+    enabled: bool = False
+    app_token: str = ""
+    user_key: str = ""
+    device: str = ""
+    sound: str = ""
+    priority: int = 0
+    notify_on_start: bool = False
+    base_url: str = "https://api.pushover.net"
 
 
 class IMessageConfig(BaseModel):
@@ -101,6 +185,13 @@ class WatchpostConfig(BaseModel):
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     imessage: IMessageConfig = Field(default_factory=IMessageConfig)
+    slack: SlackConfig = Field(default_factory=SlackConfig)
+    discord: DiscordConfig = Field(default_factory=DiscordConfig)
+    dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
+    wecom: WeComConfig = Field(default_factory=WeComConfig)
+    ntfy: NtfyConfig = Field(default_factory=NtfyConfig)
+    bark: BarkConfig = Field(default_factory=BarkConfig)
+    pushover: PushoverConfig = Field(default_factory=PushoverConfig)
     external_adapters: list[ExternalAdapterConfig] = Field(default_factory=list)
     external_notifiers: list[ExternalNotifierConfig] = Field(default_factory=list)
     channels: list[ChannelConfig] = Field(default_factory=list)
@@ -125,31 +216,131 @@ def expand_env_placeholders(value: Any, env: Mapping[str, str] | None = None) ->
     return value
 
 
+def _apply_env_fallbacks(
+    section: BaseModel,
+    field_env_pairs: tuple[tuple[str, str], ...],
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    for field_name, env_name in field_env_pairs:
+        cur = getattr(section, field_name, None)
+        val = environ.get(env_name, "").strip()
+        if not cur and val:
+            updates[field_name] = val
+    return updates
+
+
 def resolve_config(cfg: WatchpostConfig, *, env: Mapping[str, str] | None = None) -> WatchpostConfig:
     """Expand `${ENV_VAR}` placeholders, apply standard env fallbacks, and expand user paths."""
     environ = env if env is not None else os.environ
     expanded = expand_env_placeholders(cfg.model_dump(mode="python"), environ)
     resolved = WatchpostConfig.model_validate(expanded)
 
-    feishu_updates: dict[str, Any] = {}
-    if not resolved.feishu.app_id and environ.get("FEISHU_APP_ID"):
-        feishu_updates["app_id"] = environ["FEISHU_APP_ID"]
-    if not resolved.feishu.app_secret and environ.get("FEISHU_APP_SECRET"):
-        feishu_updates["app_secret"] = environ["FEISHU_APP_SECRET"]
-    if not resolved.feishu.user_access_token and environ.get("FEISHU_USER_ACCESS_TOKEN"):
-        feishu_updates["user_access_token"] = environ["FEISHU_USER_ACCESS_TOKEN"]
-    if not resolved.feishu.owner_open_id and environ.get("FEISHU_OWNER_OPEN_ID"):
-        feishu_updates["owner_open_id"] = environ["FEISHU_OWNER_OPEN_ID"]
+    feishu_updates = _apply_env_fallbacks(
+        resolved.feishu,
+        (
+            ("app_id", "FEISHU_APP_ID"),
+            ("app_secret", "FEISHU_APP_SECRET"),
+            ("user_access_token", "FEISHU_USER_ACCESS_TOKEN"),
+            ("owner_open_id", "FEISHU_OWNER_OPEN_ID"),
+        ),
+        environ,
+    )
+    tg_updates = _apply_env_fallbacks(
+        resolved.telegram,
+        (
+            ("bot_token", "TELEGRAM_BOT_TOKEN"),
+            ("owner_chat_id", "TELEGRAM_OWNER_CHAT_ID"),
+            ("inbound_bot_token", "TELEGRAM_INBOUND_BOT_TOKEN"),
+            ("owner_username", "TELEGRAM_OWNER_USERNAME"),
+            ("owner_user_id", "TELEGRAM_OWNER_USER_ID"),
+        ),
+        environ,
+    )
+    imsg_updates = _apply_env_fallbacks(
+        resolved.imessage,
+        (("owner_handle", "WATCHPOST_IMESSAGE_HANDLE"),),
+        environ,
+    )
+    slack_updates = _apply_env_fallbacks(
+        resolved.slack,
+        (
+            ("bot_token", "SLACK_BOT_TOKEN"),
+            ("owner_user_id", "SLACK_OWNER_USER_ID"),
+            ("owner_dm_channel_id", "SLACK_OWNER_DM_CHANNEL_ID"),
+        ),
+        environ,
+    )
+    discord_updates = _apply_env_fallbacks(
+        resolved.discord,
+        (
+            ("bot_token", "DISCORD_BOT_TOKEN"),
+            ("owner_user_id", "DISCORD_OWNER_USER_ID"),
+            ("owner_dm_channel_id", "DISCORD_OWNER_DM_CHANNEL_ID"),
+        ),
+        environ,
+    )
+    dingtalk_updates = _apply_env_fallbacks(
+        resolved.dingtalk,
+        (
+            ("app_key", "DINGTALK_APP_KEY"),
+            ("app_secret", "DINGTALK_APP_SECRET"),
+            ("robot_code", "DINGTALK_ROBOT_CODE"),
+            ("webhook_secret", "DINGTALK_WEBHOOK_SECRET"),
+            ("owner_user_id", "DINGTALK_OWNER_USER_ID"),
+        ),
+        environ,
+    )
+    if resolved.dingtalk.inbox_path:
+        dingtalk_updates["inbox_path"] = str(Path(resolved.dingtalk.inbox_path).expanduser())
 
-    tg_updates: dict[str, Any] = {}
-    if not resolved.telegram.bot_token and environ.get("TELEGRAM_BOT_TOKEN"):
-        tg_updates["bot_token"] = environ["TELEGRAM_BOT_TOKEN"]
-    if not resolved.telegram.owner_chat_id and environ.get("TELEGRAM_OWNER_CHAT_ID"):
-        tg_updates["owner_chat_id"] = environ["TELEGRAM_OWNER_CHAT_ID"]
+    wecom_updates = _apply_env_fallbacks(
+        resolved.wecom,
+        (
+            ("corp_id", "WECOM_CORP_ID"),
+            ("corp_secret", "WECOM_CORP_SECRET"),
+            ("callback_token", "WECOM_CALLBACK_TOKEN"),
+            ("owner_user_id", "WECOM_OWNER_USER_ID"),
+        ),
+        environ,
+    )
+    if not resolved.wecom.agent_id and environ.get("WECOM_AGENT_ID", "").strip():
+        try:
+            wecom_updates["agent_id"] = int(environ["WECOM_AGENT_ID"].strip())
+        except ValueError:
+            pass
+    if resolved.wecom.inbox_path:
+        wecom_updates["inbox_path"] = str(Path(resolved.wecom.inbox_path).expanduser())
 
-    imsg_updates: dict[str, Any] = {}
-    if not resolved.imessage.owner_handle and environ.get("WATCHPOST_IMESSAGE_HANDLE"):
-        imsg_updates["owner_handle"] = environ["WATCHPOST_IMESSAGE_HANDLE"]
+    ntfy_updates = _apply_env_fallbacks(
+        resolved.ntfy,
+        (
+            ("topic", "NTFY_TOPIC"),
+            ("reply_topic", "NTFY_REPLY_TOPIC"),
+            ("token", "NTFY_TOKEN"),
+        ),
+        environ,
+    )
+    if resolved.ntfy.server_url == "https://ntfy.sh" and environ.get("NTFY_SERVER_URL", "").strip():
+        ntfy_updates["server_url"] = environ["NTFY_SERVER_URL"].strip()
+
+    bark_updates = _apply_env_fallbacks(
+        resolved.bark,
+        (("device_key", "BARK_DEVICE_KEY"),),
+        environ,
+    )
+    if resolved.bark.server_url == "https://api.day.app" and environ.get("BARK_SERVER_URL", "").strip():
+        bark_updates["server_url"] = environ["BARK_SERVER_URL"].strip()
+
+    pushover_updates = _apply_env_fallbacks(
+        resolved.pushover,
+        (
+            ("app_token", "PUSHOVER_APP_TOKEN"),
+            ("user_key", "PUSHOVER_USER_KEY"),
+            ("device", "PUSHOVER_DEVICE"),
+        ),
+        environ,
+    )
 
     return resolved.model_copy(
         update={
@@ -158,6 +349,13 @@ def resolve_config(cfg: WatchpostConfig, *, env: Mapping[str, str] | None = None
             "workspace_dir": str(Path(resolved.workspace_dir).expanduser()),
             "feishu": resolved.feishu.model_copy(update=feishu_updates) if feishu_updates else resolved.feishu,
             "telegram": resolved.telegram.model_copy(update=tg_updates) if tg_updates else resolved.telegram,
+            "slack": resolved.slack.model_copy(update=slack_updates) if slack_updates else resolved.slack,
+            "discord": resolved.discord.model_copy(update=discord_updates) if discord_updates else resolved.discord,
+            "dingtalk": resolved.dingtalk.model_copy(update=dingtalk_updates) if dingtalk_updates else resolved.dingtalk,
+            "wecom": resolved.wecom.model_copy(update=wecom_updates) if wecom_updates else resolved.wecom,
+            "ntfy": resolved.ntfy.model_copy(update=ntfy_updates) if ntfy_updates else resolved.ntfy,
+            "bark": resolved.bark.model_copy(update=bark_updates) if bark_updates else resolved.bark,
+            "pushover": resolved.pushover.model_copy(update=pushover_updates) if pushover_updates else resolved.pushover,
             "imessage": resolved.imessage.model_copy(
                 update={
                     **imsg_updates,

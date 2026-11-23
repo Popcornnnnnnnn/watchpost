@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from watchpost.adapters.telegram import TelegramUpdateHub
 from watchpost.config import TelegramConfig
 from watchpost.models import ChatType, ChannelConfig, OwnerAction, ThreadRecord
 from watchpost.notifiers import classify_owner_command, format_start_notice
@@ -56,14 +57,25 @@ class TelegramNotifier:
 
     name = "telegram"
 
-    def __init__(self, config: TelegramConfig, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        config: TelegramConfig,
+        *,
+        hub: TelegramUpdateHub | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
         self._config = config
         self._token = config.bot_token.strip()
         self._owner_chat_id = str(config.owner_chat_id or "").strip()
         self._base_url = f"{config.base_url.rstrip('/')}/bot{self._token}"
+        self._hub = hub
         self._external_client = client
         self._owned_client: httpx.AsyncClient | None = None
         self._offset: int | None = None
+
+    @property
+    def hub(self) -> TelegramUpdateHub | None:
+        return self._hub
 
     def _client(self) -> httpx.AsyncClient:
         if self._external_client is not None:
@@ -76,6 +88,8 @@ class TelegramNotifier:
         if self._owned_client is not None:
             await self._owned_client.aclose()
             self._owned_client = None
+        if self._hub is not None:
+            await self._hub.aclose()
 
     async def send_message(self, text: str) -> str:
         if not self._token or not self._owner_chat_id:
@@ -139,6 +153,11 @@ class TelegramNotifier:
     async def poll_owner_actions(self) -> list[OwnerAction]:
         if not self._token or not self._owner_chat_id:
             return []
+
+        if self._hub is not None:
+            raw_msgs = await self._hub.poll_owner_messages(self._owner_chat_id)
+            return self._parse_owner_messages(raw_msgs)
+
         params: dict[str, Any] = {
             "timeout": max(0, int(self._config.poll_timeout_s)),
             "allowed_updates": '["message"]',
@@ -152,7 +171,7 @@ class TelegramNotifier:
         if not payload.get("ok"):
             raise RuntimeError(f"Telegram getUpdates failed: {payload}")
 
-        actions: list[OwnerAction] = []
+        raw_msgs: list[dict[str, Any]] = []
         for upd in payload.get("result") or []:
             upd_id = upd.get("update_id")
             if isinstance(upd_id, int):
@@ -160,13 +179,18 @@ class TelegramNotifier:
 
             msg = upd.get("message") or {}
             chat_id = str((msg.get("chat") or {}).get("id") or "").strip()
-            sender = msg.get("from") or {}
-            if sender.get("is_bot"):
-                continue
             # Strictly reject messages from any chat other than the configured owner
             if chat_id != self._owner_chat_id:
                 continue
+            raw_msgs.append(msg)
+        return self._parse_owner_messages(raw_msgs)
 
+    def _parse_owner_messages(self, messages: list[dict[str, Any]]) -> list[OwnerAction]:
+        actions: list[OwnerAction] = []
+        for msg in messages:
+            sender = msg.get("from") or {}
+            if sender.get("is_bot"):
+                continue
             text = str(msg.get("text") or "").strip()
             if not text:
                 continue

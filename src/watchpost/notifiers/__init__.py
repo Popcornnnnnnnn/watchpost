@@ -126,6 +126,12 @@ def classify_owner_command(
 _PLATFORM_ZH = {
     "feishu": "飞书",
     "wechat": "微信",
+    "slack": "Slack",
+    "discord": "Discord",
+    "telegram": "Telegram",
+    "dingtalk": "钉钉",
+    "wecom": "企微",
+    "whatsapp": "WhatsApp",
     "simulator": "模拟",
     "local_sandbox": "沙盒",
     "owner_direct": "",
@@ -133,6 +139,12 @@ _PLATFORM_ZH = {
 _PLATFORM_EN = {
     "feishu": "Feishu",
     "wechat": "WeChat",
+    "slack": "Slack",
+    "discord": "Discord",
+    "telegram": "Telegram",
+    "dingtalk": "DingTalk",
+    "wecom": "WeCom",
+    "whatsapp": "WhatsApp",
     "simulator": "Sim",
     "local_sandbox": "Sandbox",
     "owner_direct": "",
@@ -222,16 +234,28 @@ def format_start_notice(
     )
 
 
+from watchpost.notifiers.bark import BarkNotifier
 from watchpost.notifiers.console import ConsoleNotifier
+from watchpost.notifiers.discord import DiscordNotifier
 from watchpost.notifiers.external_plugin import ExternalCommandNotifier
 from watchpost.notifiers.imessage import IMessageNotifier
+from watchpost.notifiers.ntfy import NtfyNotifier
+from watchpost.notifiers.pushover import PushoverNotifier
+from watchpost.notifiers.slack import SlackNotifier
 from watchpost.notifiers.telegram import TelegramNotifier
+from watchpost.notifiers.wecom import WeComNotifier
 
 __all__ = [
+    "BarkNotifier",
     "ConsoleNotifier",
+    "DiscordNotifier",
     "ExternalCommandNotifier",
     "IMessageNotifier",
+    "NtfyNotifier",
+    "PushoverNotifier",
+    "SlackNotifier",
     "TelegramNotifier",
+    "WeComNotifier",
     "classify_owner_command",
     "format_platform_label",
     "format_start_bubbles",

@@ -13,8 +13,13 @@ from typing import Any
 
 import httpx
 
+from watchpost.adapters.dingtalk import DingTalkAdapter
+from watchpost.adapters.discord import DiscordAdapter
 from watchpost.adapters.external_plugin import ExternalCommandAdapter
 from watchpost.adapters.feishu import FeishuAdapter
+from watchpost.adapters.slack import SlackAdapter
+from watchpost.adapters.telegram import TelegramInboundAdapter, TelegramUpdateHub
+from watchpost.adapters.wecom import WeComAdapter
 from watchpost.backends.antigravity import AntigravityBackend
 from watchpost.backends.cli_agent import CLI_PRESETS, CLIAgentBackend
 from watchpost.backends.fallback import FallbackBackend
@@ -23,9 +28,15 @@ from watchpost.config import WatchpostConfig, default_config_path, load_config
 from watchpost.engine import WatchpostEngine
 from watchpost.media import LocalWhisperProcessor
 from watchpost.models import EngineConfig
+from watchpost.notifiers.bark import BarkNotifier
+from watchpost.notifiers.discord import DiscordNotifier
 from watchpost.notifiers.external_plugin import ExternalCommandNotifier
 from watchpost.notifiers.imessage import IMessageNotifier
+from watchpost.notifiers.ntfy import NtfyNotifier
+from watchpost.notifiers.pushover import PushoverNotifier
+from watchpost.notifiers.slack import SlackNotifier
 from watchpost.notifiers.telegram import TelegramNotifier
+from watchpost.notifiers.wecom import WeComNotifier
 from watchpost.ports import AgentBackend, MediaProcessor
 from watchpost.store import WatchpostStore
 
@@ -72,12 +83,171 @@ def _build_single_backend(
     )
 
 
+_NATIVE_ADAPTER_NAMES = frozenset({"feishu", "slack", "discord", "telegram", "dingtalk", "wecom"})
+
+
+def _default_webhook_inbox(cfg: WatchpostConfig, name: str) -> Path:
+    return Path(cfg.db_path).expanduser().parent / "webhooks" / f"{name}.jsonl"
+
+
+def _register_configured_platforms(
+    engine: WatchpostEngine,
+    cfg: WatchpostConfig,
+    *,
+    existing_tg_hub: TelegramUpdateHub | None = None,
+    feishu_client: httpx.AsyncClient | None = None,
+    telegram_client: httpx.AsyncClient | None = None,
+    imessage_send_fn: Any = None,
+    slack_client: httpx.AsyncClient | None = None,
+    discord_client: httpx.AsyncClient | None = None,
+    dingtalk_client: httpx.AsyncClient | None = None,
+    wecom_client: httpx.AsyncClient | None = None,
+    ntfy_client: httpx.AsyncClient | None = None,
+    bark_client: httpx.AsyncClient | None = None,
+    pushover_client: httpx.AsyncClient | None = None,
+    register_imessage: bool = True,
+) -> TelegramUpdateHub | None:
+    """Register enabled native & external adapters/notifiers onto `engine` cleanly."""
+    enabled_adapters = {c.adapter for c in cfg.channels if c.enabled}
+
+    if cfg.feishu.enabled or (
+        "feishu" in enabled_adapters
+        and (
+            cfg.feishu.auth_mode == "lark_cli"
+            or (cfg.feishu.app_id and cfg.feishu.app_secret)
+            or cfg.feishu.user_access_token
+        )
+    ):
+        engine.register_adapter(FeishuAdapter(cfg.feishu, client=feishu_client))
+
+    if (cfg.slack.enabled or "slack" in enabled_adapters) and cfg.slack.bot_token.strip():
+        engine.register_adapter(SlackAdapter(cfg.slack, client=slack_client))
+
+    if (cfg.discord.enabled or "discord" in enabled_adapters) and cfg.discord.bot_token.strip():
+        engine.register_adapter(DiscordAdapter(cfg.discord, client=discord_client))
+
+    if cfg.dingtalk.enabled or "dingtalk" in enabled_adapters:
+        engine.register_adapter(
+            DingTalkAdapter(
+                cfg.dingtalk,
+                inbox_path=Path(cfg.dingtalk.inbox_path).expanduser()
+                if cfg.dingtalk.inbox_path
+                else _default_webhook_inbox(cfg, "dingtalk"),
+                client=dingtalk_client,
+            )
+        )
+
+    if cfg.wecom.enabled or "wecom" in enabled_adapters:
+        engine.register_adapter(
+            WeComAdapter(
+                cfg.wecom,
+                inbox_path=Path(cfg.wecom.inbox_path).expanduser()
+                if cfg.wecom.inbox_path
+                else _default_webhook_inbox(cfg, "wecom"),
+                client=wecom_client,
+            )
+        )
+
+    for ext_cfg in cfg.external_adapters:
+        if ext_cfg.name and ext_cfg.command:
+            engine.register_adapter(ExternalCommandAdapter(ext_cfg))
+
+    # Share one TelegramUpdateHub when inbound adapter + owner notifier use the same bot_token.
+    tg_base = (cfg.telegram.base_url or "https://api.telegram.org").strip().rstrip("/")
+    notify_tok = cfg.telegram.bot_token.strip()
+    inbound_tok = (cfg.telegram.inbound_bot_token or cfg.telegram.bot_token).strip()
+    tg_notify_on = bool(cfg.telegram.enabled and notify_tok and cfg.telegram.owner_chat_id.strip())
+    tg_inbound_on = bool(
+        (cfg.telegram.inbound_enabled or "telegram" in enabled_adapters) and inbound_tok
+    )
+    same_tg_token = bool(tg_notify_on and tg_inbound_on and notify_tok == inbound_tok)
+
+    reused_hub: TelegramUpdateHub | None = None
+    if same_tg_token:
+        if (
+            existing_tg_hub is not None
+            and existing_tg_hub.token == inbound_tok
+            and existing_tg_hub.base_url == tg_base
+        ):
+            reused_hub = existing_tg_hub
+        else:
+            reused_hub = TelegramUpdateHub(
+                inbound_tok,
+                base_url=tg_base,
+                poll_timeout_s=cfg.telegram.poll_timeout_s,
+                client=telegram_client,
+            )
+
+    if tg_inbound_on:
+        inbound_hub = reused_hub
+        if inbound_hub is None and existing_tg_hub is not None:
+            if existing_tg_hub.token == inbound_tok and existing_tg_hub.base_url == tg_base:
+                inbound_hub = existing_tg_hub
+                reused_hub = existing_tg_hub
+        engine.register_adapter(
+            TelegramInboundAdapter(cfg.telegram, hub=inbound_hub, client=telegram_client)
+        )
+
+    if tg_notify_on:
+        engine.register_notifier(
+            TelegramNotifier(
+                cfg.telegram,
+                hub=reused_hub if same_tg_token else None,
+                client=telegram_client,
+            )
+        )
+
+    if register_imessage and cfg.imessage.enabled and (cfg.imessage.owner_handle or cfg.imessage.allowed_handles):
+        engine.register_notifier(IMessageNotifier(cfg.imessage, send_fn=imessage_send_fn))
+
+    if cfg.slack.dm_enabled and cfg.slack.bot_token.strip() and (
+        cfg.slack.owner_dm_channel_id.strip() or cfg.slack.owner_user_id.strip()
+    ):
+        engine.register_notifier(SlackNotifier(cfg.slack, client=slack_client))
+
+    if cfg.discord.dm_enabled and cfg.discord.bot_token.strip() and (
+        cfg.discord.owner_dm_channel_id.strip() or cfg.discord.owner_user_id.strip()
+    ):
+        engine.register_notifier(DiscordNotifier(cfg.discord, client=discord_client))
+
+    if (
+        cfg.wecom.notify_enabled
+        and cfg.wecom.corp_id.strip()
+        and cfg.wecom.corp_secret.strip()
+        and int(cfg.wecom.agent_id or 0) > 0
+        and cfg.wecom.owner_user_id.strip()
+    ):
+        engine.register_notifier(WeComNotifier(cfg.wecom, client=wecom_client))
+
+    if cfg.ntfy.enabled and cfg.ntfy.topic.strip():
+        engine.register_notifier(NtfyNotifier(cfg.ntfy, client=ntfy_client))
+
+    if cfg.bark.enabled and cfg.bark.device_key.strip():
+        engine.register_notifier(BarkNotifier(cfg.bark, client=bark_client))
+
+    if cfg.pushover.enabled and cfg.pushover.app_token.strip() and cfg.pushover.user_key.strip():
+        engine.register_notifier(PushoverNotifier(cfg.pushover, client=pushover_client))
+
+    for ext_ntf in cfg.external_notifiers:
+        if ext_ntf.name and ext_ntf.command:
+            engine.register_notifier(ExternalCommandNotifier(ext_ntf))
+
+    return reused_hub
+
+
 def build_engine_from_config(
     cfg: WatchpostConfig,
     *,
     feishu_client: httpx.AsyncClient | None = None,
     telegram_client: httpx.AsyncClient | None = None,
     imessage_send_fn: Any = None,
+    slack_client: httpx.AsyncClient | None = None,
+    discord_client: httpx.AsyncClient | None = None,
+    dingtalk_client: httpx.AsyncClient | None = None,
+    wecom_client: httpx.AsyncClient | None = None,
+    ntfy_client: httpx.AsyncClient | None = None,
+    bark_client: httpx.AsyncClient | None = None,
+    pushover_client: httpx.AsyncClient | None = None,
 ) -> WatchpostEngine:
     """Construct a fully wired WatchpostEngine from a resolved WatchpostConfig."""
     store = WatchpostStore(Path(cfg.db_path).expanduser())
@@ -133,30 +303,20 @@ def build_engine_from_config(
         media_dir=Path(cfg.media_dir).expanduser(),
     )
 
-    has_feishu_channel = any(c.adapter == "feishu" and c.enabled for c in cfg.channels)
-    if cfg.feishu.enabled or (
-        has_feishu_channel
-        and (
-            cfg.feishu.auth_mode == "lark_cli"
-            or (cfg.feishu.app_id and cfg.feishu.app_secret)
-            or cfg.feishu.user_access_token
-        )
-    ):
-        engine.register_adapter(FeishuAdapter(cfg.feishu, client=feishu_client))
-
-    for ext_cfg in cfg.external_adapters:
-        if ext_cfg.name and ext_cfg.command:
-            engine.register_adapter(ExternalCommandAdapter(ext_cfg))
-
-    if cfg.telegram.enabled and cfg.telegram.bot_token and cfg.telegram.owner_chat_id:
-        engine.register_notifier(TelegramNotifier(cfg.telegram, client=telegram_client))
-
-    if cfg.imessage.enabled and (cfg.imessage.owner_handle or cfg.imessage.allowed_handles):
-        engine.register_notifier(IMessageNotifier(cfg.imessage, send_fn=imessage_send_fn))
-
-    for ext_ntf in cfg.external_notifiers:
-        if ext_ntf.name and ext_ntf.command:
-            engine.register_notifier(ExternalCommandNotifier(ext_ntf))
+    _register_configured_platforms(
+        engine,
+        cfg,
+        feishu_client=feishu_client,
+        telegram_client=telegram_client,
+        imessage_send_fn=imessage_send_fn,
+        slack_client=slack_client,
+        discord_client=discord_client,
+        dingtalk_client=dingtalk_client,
+        wecom_client=wecom_client,
+        ntfy_client=ntfy_client,
+        bark_client=bark_client,
+        pushover_client=pushover_client,
+    )
 
     for ch in cfg.channels:
         store.upsert_channel(ch)
@@ -220,35 +380,42 @@ class WatchpostDaemon:
                 self.engine.store.upsert_channel(ch)
 
             old_to_close: list[Any] = []
-            has_feishu = new_cfg.feishu.enabled or any(
-                c.adapter == "feishu" and c.enabled for c in new_cfg.channels
-            )
-            if "feishu" in self.engine.adapters:
-                old_to_close.append(self.engine.adapters.pop("feishu"))
-            if has_feishu:
-                self.engine.register_adapter(FeishuAdapter(new_cfg.feishu))
+            existing_tg_hub: TelegramUpdateHub | None = None
+            old_tg_adapter = self.engine.adapters.get("telegram")
+            if isinstance(old_tg_adapter, TelegramInboundAdapter):
+                existing_tg_hub = old_tg_adapter.hub
 
-            old_ext_names = [
-                name for name in list(self.engine.adapters) if name not in {"feishu", "simulator"}
-            ]
-            for name in old_ext_names:
-                old_to_close.append(self.engine.adapters.pop(name))
-            for ext_cfg in new_cfg.external_adapters:
-                if ext_cfg.name and ext_cfg.command:
-                    self.engine.register_adapter(ExternalCommandAdapter(ext_cfg))
+            for name in list(self.engine.adapters):
+                if name == "simulator":
+                    continue
+                if name in _NATIVE_ADAPTER_NAMES or name not in {"simulator"}:
+                    old_to_close.append(self.engine.adapters.pop(name))
 
             kept_notifiers = []
+            has_live_imessage = False
             for ntf in self.engine.notifiers:
-                if isinstance(ntf, ExternalCommandNotifier):
-                    old_to_close.append(ntf)
-                else:
+                if isinstance(ntf, IMessageNotifier) and new_cfg.imessage.enabled:
                     kept_notifiers.append(ntf)
+                    has_live_imessage = True
+                    continue
+                if existing_tg_hub is None and isinstance(ntf, TelegramNotifier) and ntf.hub is not None:
+                    existing_tg_hub = ntf.hub
+                old_to_close.append(ntf)
             self.engine.notifiers = kept_notifiers
-            for ext_ntf in new_cfg.external_notifiers:
-                if ext_ntf.name and ext_ntf.command:
-                    self.engine.register_notifier(ExternalCommandNotifier(ext_ntf))
+
+            reused_hub = _register_configured_platforms(
+                self.engine,
+                new_cfg,
+                existing_tg_hub=existing_tg_hub,
+                register_imessage=not has_live_imessage,
+            )
 
             for obj in old_to_close:
+                if reused_hub is not None:
+                    if isinstance(obj, TelegramInboundAdapter) and obj.hub is reused_hub:
+                        obj._owns_hub = False
+                    elif isinstance(obj, TelegramNotifier) and obj.hub is reused_hub:
+                        obj._hub = None
                 aclose = getattr(obj, "aclose", None)
                 if callable(aclose):
                     try:
@@ -533,6 +700,106 @@ def run_doctor(cfg_path: Path | str | None = None) -> dict[str, Any]:
         checks["imessage"] = {"ok": imsg_ok, "detail": detail}
     else:
         checks["imessage"] = {"ok": True, "detail": "disabled"}
+
+    enabled_adapters = {c.adapter for c in cfg.channels if c.enabled}
+    if cfg.telegram.inbound_enabled or "telegram" in enabled_adapters:
+        has_tg_in = bool((cfg.telegram.inbound_bot_token or cfg.telegram.bot_token).strip())
+        checks["telegram_inbound"] = {
+            "ok": has_tg_in,
+            "detail": "configured" if has_tg_in else "enabled but missing inbound_bot_token/bot_token",
+        }
+
+    if cfg.slack.enabled or "slack" in enabled_adapters:
+        has_slack = bool(cfg.slack.bot_token.strip())
+        checks["slack"] = {
+            "ok": has_slack,
+            "detail": "configured" if has_slack else "enabled but missing bot_token",
+        }
+    if cfg.slack.dm_enabled:
+        has_slack_dm = bool(
+            cfg.slack.bot_token.strip()
+            and (cfg.slack.owner_dm_channel_id.strip() or cfg.slack.owner_user_id.strip())
+        )
+        checks["slack_dm"] = {
+            "ok": has_slack_dm,
+            "detail": "configured" if has_slack_dm else "enabled but missing bot_token or owner_dm_channel_id/owner_user_id",
+        }
+
+    if cfg.discord.enabled or "discord" in enabled_adapters:
+        has_discord = bool(cfg.discord.bot_token.strip())
+        checks["discord"] = {
+            "ok": has_discord,
+            "detail": "configured" if has_discord else "enabled but missing bot_token",
+        }
+    if cfg.discord.dm_enabled:
+        has_discord_dm = bool(
+            cfg.discord.bot_token.strip()
+            and (cfg.discord.owner_dm_channel_id.strip() or cfg.discord.owner_user_id.strip())
+        )
+        checks["discord_dm"] = {
+            "ok": has_discord_dm,
+            "detail": "configured" if has_discord_dm else "enabled but missing bot_token or owner_dm_channel_id/owner_user_id",
+        }
+
+    if cfg.dingtalk.enabled or "dingtalk" in enabled_adapters:
+        dt_ok = bool(
+            cfg.dingtalk.webhook_secret.strip()
+            or cfg.dingtalk.app_secret.strip()
+            or cfg.dingtalk.allow_unsigned_webhooks
+        )
+        checks["dingtalk"] = {
+            "ok": dt_ok,
+            "detail": (
+                "webhook receiver ready"
+                if dt_ok
+                else "enabled but missing webhook_secret/app_secret (or allow_unsigned_webhooks)"
+            ),
+        }
+
+    if cfg.wecom.enabled or "wecom" in enabled_adapters:
+        wc_ok = bool(cfg.wecom.callback_token.strip() or cfg.wecom.allow_unsigned_webhooks)
+        checks["wecom"] = {
+            "ok": wc_ok,
+            "detail": (
+                "webhook receiver ready"
+                if wc_ok
+                else "enabled but missing callback_token (or allow_unsigned_webhooks)"
+            ),
+        }
+    if cfg.wecom.notify_enabled:
+        wc_ntf_ok = bool(
+            cfg.wecom.corp_id.strip()
+            and cfg.wecom.corp_secret.strip()
+            and int(cfg.wecom.agent_id or 0) > 0
+            and cfg.wecom.owner_user_id.strip()
+        )
+        checks["wecom_notify"] = {
+            "ok": wc_ntf_ok,
+            "detail": (
+                "configured"
+                if wc_ntf_ok
+                else "enabled but missing corp_id, corp_secret, agent_id, or owner_user_id"
+            ),
+        }
+
+    if cfg.ntfy.enabled:
+        ntfy_ok = bool(cfg.ntfy.topic.strip())
+        checks["ntfy"] = {
+            "ok": ntfy_ok,
+            "detail": f"configured (topic={cfg.ntfy.topic})" if ntfy_ok else "enabled but missing topic",
+        }
+    if cfg.bark.enabled:
+        bark_ok = bool(cfg.bark.device_key.strip())
+        checks["bark"] = {
+            "ok": bark_ok,
+            "detail": "configured" if bark_ok else "enabled but missing device_key",
+        }
+    if cfg.pushover.enabled:
+        po_ok = bool(cfg.pushover.app_token.strip() and cfg.pushover.user_key.strip())
+        checks["pushover"] = {
+            "ok": po_ok,
+            "detail": "configured" if po_ok else "enabled but missing app_token or user_key",
+        }
 
     # Whisper (optional)
     if cfg.whisper.enabled:
