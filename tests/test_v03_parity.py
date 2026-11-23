@@ -1117,3 +1117,121 @@ def test_personal_direct_swipe_reply_stays_natural_without_bot_headers(tmp_path:
             assert "需要注意：" not in joined
 
     asyncio.run(_run())
+
+
+def test_imessage_plain_message_ignores_reply_to_guid_and_routes_to_personal(tmp_path: Path) -> None:
+    chat_db = tmp_path / "chat.db"
+    conn = sqlite3.connect(chat_db)
+    conn.executescript(
+        """
+        CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+        CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT);
+        CREATE TABLE message (
+            ROWID INTEGER PRIMARY KEY,
+            guid TEXT,
+            text TEXT,
+            is_from_me INTEGER DEFAULT 0,
+            handle_id INTEGER,
+            thread_originator_guid TEXT DEFAULT '',
+            reply_to_guid TEXT DEFAULT '',
+            associated_message_type INTEGER DEFAULT 0,
+            item_type INTEGER DEFAULT 0,
+            date_retracted INTEGER DEFAULT 0
+        );
+        CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+        INSERT INTO handle VALUES (1, '+15550100');
+        INSERT INTO chat VALUES (1, '+15550100');
+        INSERT INTO message (ROWID, guid, text, is_from_me, handle_id) VALUES (1, 'guid-seed', 'seed', 1, 1);
+        INSERT INTO chat_message_join VALUES (1, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    async def _run() -> None:
+        ntf = IMessageNotifier(
+            IMessageConfig(enabled=True, owner_handle="+15550100", chat_db_path=str(chat_db)),
+            send_fn=lambda _h, _t: True,
+        )
+        assert await ntf.poll_owner_actions() == []
+
+        c = sqlite3.connect(chat_db)
+        c.execute(
+            "INSERT INTO message (ROWID, guid, text, is_from_me, handle_id, thread_originator_guid, reply_to_guid) "
+            "VALUES (2, 'guid-plain', '查一下本地状态', 0, 1, '', 'guid-work-alert')"
+        )
+        c.execute(
+            "INSERT INTO chat_message_join VALUES (1, 2)"
+        )
+        c.execute(
+            "INSERT INTO message (ROWID, guid, text, is_from_me, handle_id, thread_originator_guid, reply_to_guid) "
+            "VALUES (3, 'guid-swipe', '再看下这个告警', 0, 1, 'guid-work-alert', 'guid-prev')"
+        )
+        c.execute(
+            "INSERT INTO chat_message_join VALUES (1, 3)"
+        )
+        c.commit()
+        c.close()
+
+        actions = await ntf.poll_owner_actions()
+        assert len(actions) == 2
+        assert actions[0].text == "查一下本地状态"
+        assert actions[0].reply_token == ""
+        assert actions[1].text == "再看下这个告警"
+        assert actions[1].reply_token == "guid-work-alert"
+
+        work_ws = tmp_path / "work_ws"
+        personal_ws = tmp_path / "personal_ws"
+        work_ws.mkdir()
+        personal_ws.mkdir()
+
+        store = WatchpostStore(tmp_path / "wp.db")
+        ch_work = ChannelConfig(
+            id="ch_work",
+            adapter="feishu",
+            external_chat_id="oc_work",
+            name="Peer Work",
+            chat_type=ChatType.p2p,
+            trigger_mode=TriggerMode.all,
+            autonomy_mode=AutonomyMode.diagnose_only,
+            workspace_dir=str(work_ws),
+        )
+        store.upsert_channel(ch_work)
+        store.create_or_update_thread(
+            ThreadRecord(
+                id="th_work",
+                channel_id="ch_work",
+                backend="rec",
+                backend_thread_ref="conv_work_1",
+                sender_id="ou_work",
+                sender_name="Peer Work",
+                title="Work alert",
+                status=ThreadStatus.completed,
+            )
+        )
+        store.bind_outbound("imessage", "guid-work-alert", "th_work")
+
+        backend = _RecordingBackend("rec")
+        engine = WatchpostEngine(
+            store,
+            backend,
+            config=EngineConfig(
+                workspace_dir=work_ws,
+                personal_workspace_dir=personal_ws,
+                language="zh",
+            ),
+            notifiers=[ntf],
+        )
+
+        plain_res = await engine.handle_owner_action(actions[0])
+        assert plain_res is not None
+        assert plain_res.channel_id == "personal_direct"
+        assert plain_res.id != "th_work"
+        assert backend.starts[-1][2] == personal_ws
+
+        swipe_res = await engine.handle_owner_action(actions[1])
+        assert swipe_res is not None
+        assert swipe_res.id == "th_work"
+        assert backend.steers[-1][3] == work_ws
+
+    asyncio.run(_run())

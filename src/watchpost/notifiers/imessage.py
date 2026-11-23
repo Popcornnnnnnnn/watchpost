@@ -482,7 +482,6 @@ class IMessageNotifier:
             cols = self._message_columns(conn)
             has_attr = "attributedBody" in cols
             has_thread_guid = "thread_originator_guid" in cols
-            has_reply_to = "reply_to_guid" in cols
             has_assoc = "associated_message_type" in cols
             has_item_type = "item_type" in cols
             has_retracted = "date_retracted" in cols
@@ -490,7 +489,6 @@ class IMessageNotifier:
 
             attr_expr = "m.attributedBody" if has_attr else "NULL AS attributedBody"
             thread_expr = "m.thread_originator_guid" if has_thread_guid else "'' AS thread_originator_guid"
-            reply_expr = "m.reply_to_guid" if has_reply_to else "'' AS reply_to_guid"
             audio_expr = "m.is_audio_message" if has_is_audio else "0 AS is_audio_message"
 
             filters = ["m.ROWID > ?"]
@@ -510,7 +508,7 @@ class IMessageNotifier:
 
             rows = conn.execute(
                 f"""
-                SELECT m.ROWID, m.text, m.is_from_me, {attr_expr}, {thread_expr}, {reply_expr},
+                SELECT m.ROWID, m.text, m.is_from_me, {attr_expr}, {thread_expr},
                        {audio_expr}, h.id AS handle_id, c.chat_identifier AS chat_identifier
                 FROM message m
                 LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -554,10 +552,9 @@ class IMessageNotifier:
                         continue
                     if attachments and not body and self._consume_sent_file_echo(attachments):
                         continue
-                reply_token = (
-                    str(r["thread_originator_guid"] or "").strip()
-                    or str(r["reply_to_guid"] or "").strip()
-                )
+                # macOS Messages sets `reply_to_guid` to the prior bubble on every plain message;
+                # only explicit inline swipe-replies populate `thread_originator_guid`.
+                reply_token = str(r["thread_originator_guid"] or "").strip()
                 action = classify_owner_command(
                     body,
                     notifier=self.name,
