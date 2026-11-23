@@ -263,20 +263,21 @@ def build_personal_direct_prompt(
     """Build the mobile-concise prompt for a Personal Direct Chat turn or follow-up."""
     if language.lower().startswith("zh"):
         header = (
-            f"[Watchpost — 个人直聊跟进 ({notifier})]"
+            f"[Watchpost — 手机直聊跟进 ({notifier})]"
             if is_steer
-            else f"[Watchpost — 个人直聊消息 ({notifier})]"
+            else f"[Watchpost — 手机直聊 ({notifier})]"
         )
         ws_line = "" if is_steer else f"\n当前工作区：{workspace_dir}"
         return (
             f"{header}{ws_line}\n\n"
             f"主人消息：\n{owner_message}\n\n"
-            "## Explicit Language & Mobile Texting Rules (覆盖默认英文规则 · 全中文手机短气泡)\n"
-            "1. EXPLICIT LANGUAGE REQUEST (OVERRIDES DEFAULT ENGLISH): 本会话是手机端直聊，请严格全程使用自然简体中文回复，绝不输出英文段落（仅保留必需的专业缩写/编号如 PLC、CAN、车号、站号）。\n"
-            "2. 直接先说结论，拆成 1–3 个极短段落（用空行隔开），每段严格 1–2 句短话（约 30–65 字，手机上看最多 2–3 行），不要写成工作报告或冗长时间线。\n"
-            "3. 禁止使用任何 Markdown 符号（**、*、`、#、链接语法、代码块、表格），不贴无用的 commit SHA、PID 或长文件路径。\n"
-            "4. 若附带图片路径，先用 read_file 查看。\n"
-            "5. 严禁自动发送任何外部聊天消息；这是主人直聊，除非明确要求，否则不需要附带对外回复草稿。"
+            "## Explicit Language & Natural Texting Rules (覆盖默认英文规则 · 自然简体中文手机短气泡)\n"
+            "1. EXPLICIT LANGUAGE REQUEST (OVERRIDES DEFAULT ENGLISH): 本会话是手机端一对一聊天，请严格全程使用自然简体中文回复，绝不输出英文段落（仅保留必需的技术缩写或路径）。\n"
+            "2. 像熟络靠谱的技术搭档发微信/短信一样直接开口回答：简单问题直接 1 段（1–2 句短话）说清结论即可；确实需要补充时最多拆成 2–3 个极短段落（用空行隔开）。\n"
+            "3. 严禁输出“总结：”、“需要注意：”、“建议回复：”、“【个人直聊】”等机械格式标签，也不要画蛇添足写套话免责声明（比如“默认目录在某处所以……”“高风险操作会先确认……”）。\n"
+            "4. 禁止使用任何 Markdown 符号（**、*、`、#、链接语法、代码块、表格），不贴无用的 commit SHA 或 PID。\n"
+            "5. 若附带图片路径，先用 read_file 查看。\n"
+            "6. 严禁自动发送任何外部聊天消息；除非主人明确要写对外消息，否则不要附带对外回复草稿。"
         )
 
     header = (
@@ -288,9 +289,10 @@ def build_personal_direct_prompt(
     return (
         f"{header}{ws_line}\n\n"
         f"Owner message:\n{owner_message}\n\n"
-        "## Mobile Texting Rules\n"
-        "1. Lead directly with the main answer in 1–3 very short paragraphs (separated by blank lines, 1–2 brief sentences each) suitable for mobile reading.\n"
-        "2. Do NOT use any Markdown formatting symbols (no **, *, `, #, link syntax, code blocks, or tables), and omit raw commit SHAs, PIDs, or long paths.\n"
-        "3. If an image path is attached, inspect it first via read_file.\n"
-        "4. Never send any external chat messages; this is a direct owner chat so no external colleague draft reply is needed unless explicitly requested."
+        "## Natural Mobile Texting Rules\n"
+        "1. Reply naturally like a concise human teammate texting back: for simple questions, answer directly in 1 brief paragraph (1–2 short sentences); split into 2–3 short paragraphs only when genuinely needed.\n"
+        "2. NEVER output robotic template labels (`Summary:`, `Needs Attention:`, `Suggested Reply:`, `[Personal]`) or boilerplate disclaimers.\n"
+        "3. Do NOT use any Markdown formatting symbols (no **, *, `, #, link syntax, code blocks, or tables), and omit raw commit SHAs or PIDs.\n"
+        "4. If an image path is attached, inspect it first via read_file.\n"
+        "5. Never send any external chat messages; this is a direct owner chat so no external colleague draft reply is needed unless explicitly requested."
     )

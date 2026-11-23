@@ -14,7 +14,7 @@ _CJK_OR_PUNCT_START_RE = re.compile(r"^[\u4e00-\u9fff“”‘’（【《]")
 _LEADING_BULLET_RE = re.compile(r"^\s*[-•]\s+")
 
 _SECTION_RE = re.compile(
-    r"(?im)^(?:#{2,3}\s+|)(Summary|Suggested Reply|Needs Your Attention|Needs Attention|总结|建议回复|需关注|需要注意)\s*[:：]?\s*$"
+    r"(?im)^(?:#{2,3}\s+|)(Summary|Suggested Reply|Needs Your Attention|Needs Attention|总结|建议回复|需关注|需要注意)(?:\s*[:：][ \t]*|[ \t]*$)"
 )
 _CODE_FENCE_RE = re.compile(r"(?m)^```[^\n]*\n?")
 _HEADING_RE = re.compile(r"(?m)^#{1,6}\s+")
@@ -150,6 +150,7 @@ def format_completion_bubbles(
     error: str = "",
     language: str = "zh",
     max_bubbles: int = DEFAULT_MAX_BUBBLES,
+    include_header: bool = True,
 ) -> tuple[list[str], str]:
     """Format agent output into short delivery bubbles plus the pure standalone reply draft."""
     is_zh = language.lower().startswith("zh")
@@ -157,6 +158,7 @@ def format_completion_bubbles(
     empty_msg = "已完成，暂无输出。" if is_zh else "Done, no output returned."
     lead_in = "下面这条可直接复制回复：" if is_zh else "Suggested reply to copy:"
 
+    show_header = bool(include_header and channel_name.strip())
     header = (
         f"【{channel_name} · 出错】" if error else f"【{channel_name}】"
     ) if is_zh else (
@@ -165,12 +167,14 @@ def format_completion_bubbles(
     tail_name = channel_name.split("·")[-1].strip()
     redundant_colon_re = (
         re.compile(rf"^{re.escape(tail_name)}\s*[:：]\s*")
-        if tail_name
+        if (show_header and tail_name)
         else None
     )
 
     def _prefix(bubble: str) -> str:
         clean_b = bubble.strip()
+        if not show_header:
+            return clean_b
         if clean_b.startswith(f"【{channel_name}") or clean_b.startswith(f"[{channel_name}"):
             return clean_b
         if redundant_colon_re is not None:

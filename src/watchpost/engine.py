@@ -525,19 +525,31 @@ class WatchpostEngine:
                 raw_text=owner_message,
             )
         )
+        is_personal = channel.adapter == "owner_direct" or channel.id == "personal_direct"
         target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
-        steer_prompt = build_owner_steer_prompt(
-            owner_message,
-            approved_go=approved_go,
-            language=self.config.language,
-        )
+        if is_personal:
+            steer_prompt = build_personal_direct_prompt(
+                owner_message,
+                notifier=thread.sender_id or "imessage",
+                workspace_dir=target_cwd,
+                is_steer=True,
+                language=self.config.language,
+            )
+            steer_title = f"[direct] {channel.name}: {thread.title}"
+        else:
+            steer_prompt = build_owner_steer_prompt(
+                owner_message,
+                approved_go=approved_go,
+                language=self.config.language,
+            )
+            steer_title = f"[{channel.adapter}] {channel.name}: {thread.title}"
         active_thread = self.store.create_or_update_thread(
             thread.model_copy(update={"status": ThreadStatus.active, "updated_at": time.time()})
         )
         try:
             result = await self.backend.steer_thread(
                 active_thread.backend_thread_ref,
-                f"[{channel.adapter}] {channel.name}: {active_thread.title}",
+                steer_title,
                 steer_prompt,
                 cwd=target_cwd,
                 channel=channel,
@@ -552,6 +564,7 @@ class WatchpostEngine:
             result.raw_text,
             error=result.error,
             language=self.config.language,
+            include_header=not is_personal,
         )
         next_status = ThreadStatus.error if result.error else ThreadStatus.completed
         updated = self.store.create_or_update_thread(
@@ -573,6 +586,8 @@ class WatchpostEngine:
                 raw_text=result.raw_text,
             )
         )
+        if is_personal:
+            self.store.set_kv("personal_direct_active_thread_id", updated.id)
         await self._notify_completion_all(channel, updated, all_bubbles)
         return updated
 
@@ -702,6 +717,7 @@ class WatchpostEngine:
                 result.raw_text,
                 error=result.error,
                 language=self.config.language,
+                include_header=False,
             )
             updated = self.store.create_or_update_thread(
                 active_thread.model_copy(
@@ -771,6 +787,7 @@ class WatchpostEngine:
             result.raw_text,
             error=result.error,
             language=self.config.language,
+            include_header=False,
         )
         record = active_record.model_copy(
             update={

@@ -186,7 +186,7 @@ class CLIAgentBackend:
         sec = extract_sections(extracted)
         summary = sec.get("summary") or extracted
         att = sec.get("attention", "").strip()
-        if att.lower() in {"none", "n/a", "-", "无"}:
+        if att.lower() in {"none", "n/a", "-", "无", "暂无", "无需处理", "不需要"}:
             att = ""
         mode = TriageMode.mode_4_bug if att else TriageMode.mode_1_qa
         return AgentResult(

@@ -28,6 +28,11 @@ def test_markdown_strip_and_bilingual_bubble_splitting() -> None:
     assert sec["suggested_reply"] == "先试下重启。"
     assert sec["attention"] == "无"
 
+    inline_sec = extract_sections("总结：当前目录正常。\n\n需要注意：无")
+    assert inline_sec["summary"] == "当前目录正常。"
+    assert inline_sec["attention"] == "无"
+    assert extract_sections("Summary of changes looks good\n\n需要注意的事情很多") == {}
+
     bubbles, draft = format_completion_bubbles(
         "Alex",
         "总结：\n已定位 **超时** 问题。\n\n建议回复：\n我刚调整了超时参数，等空闲确认。\n\n需要注意：\n无",
@@ -38,6 +43,24 @@ def test_markdown_strip_and_bilingual_bubble_splitting() -> None:
     assert "下面这条可直接复制回复：" in bubbles[0]
     assert bubbles[1] == "我刚调整了超时参数，等空闲确认。"
     assert draft == "我刚调整了超时参数，等空闲确认。"
+
+    personal_inline, inline_draft = format_completion_bubbles(
+        "个人直聊",
+        "总结：当前目录正常。\n\n需要注意：无",
+        language="zh",
+        include_header=False,
+    )
+    assert personal_inline == ["当前目录正常。"]
+    assert inline_draft == ""
+
+    personal_plain, plain_draft = format_completion_bubbles(
+        "个人直聊",
+        "目前正常，可以直接改代码。",
+        language="zh",
+        include_header=False,
+    )
+    assert personal_plain == ["目前正常，可以直接改代码。"]
+    assert plain_draft == ""
 
 
 def test_prompts_enforce_autonomy_gates_and_untrusted_boundary() -> None:
@@ -89,7 +112,8 @@ def test_personal_direct_prompt_enforces_chinese_override_and_english_fallback()
     assert "EXPLICIT LANGUAGE REQUEST" in zh_new
     assert "简体中文" in zh_new
     assert "禁止使用任何 Markdown" in zh_new
-    assert "不需要附带对外回复草稿" in zh_new
+    assert "不要附带对外回复草稿" in zh_new
+    assert "严禁输出" in zh_new and "总结：" in zh_new and "需要注意：" in zh_new
     assert "当前工作区：/tmp/ws" in zh_new
 
     zh_steer = build_personal_direct_prompt(
@@ -102,8 +126,9 @@ def test_personal_direct_prompt_enforces_chinese_override_and_english_fallback()
     assert "EXPLICIT LANGUAGE REQUEST" in zh_steer
     assert "简体中文" in zh_steer
     assert "禁止使用任何 Markdown" in zh_steer
-    assert "不需要附带对外回复草稿" in zh_steer
-    assert "个人直聊跟进" in zh_steer
+    assert "不要附带对外回复草稿" in zh_steer
+    assert "严禁输出" in zh_steer and "总结：" in zh_steer and "需要注意：" in zh_steer
+    assert "手机直聊跟进" in zh_steer
     assert "当前工作区" not in zh_steer
 
     en_new = build_personal_direct_prompt(
@@ -115,5 +140,7 @@ def test_personal_direct_prompt_enforces_chinese_override_and_english_fallback()
     )
     assert "EXPLICIT LANGUAGE REQUEST" not in en_new
     assert "简体中文" not in en_new
+    assert "NEVER output robotic template labels" in en_new
+    assert "Summary:" in en_new and "Needs Attention:" in en_new
     assert "Do NOT use any Markdown formatting symbols" in en_new
     assert "Workspace: /tmp/ws" in en_new

@@ -1049,3 +1049,71 @@ def test_summarize_batch_strips_markdown_image_keys() -> None:
     assert "img_v3_" not in mixed_topic
     assert "img_v3_" not in mixed_preview
     assert mixed_imgs == []
+
+
+def test_personal_direct_swipe_reply_stays_natural_without_bot_headers(tmp_path: Path) -> None:
+    class _LabeledBackend(_RecordingBackend):
+        async def start_thread(
+            self,
+            title: str,
+            prompt: str,
+            *,
+            cwd: Path,
+            model: str = "",
+            channel: ChannelConfig | None = None,
+        ) -> tuple[str, AgentResult]:
+            del model, channel
+            self.starts.append((title, prompt, Path(cwd)))
+            return "conv_p_1", CLIAgentBackend._parse_output("总结：有权限，可以直接改。\n\n需要注意：无")
+
+        async def steer_thread(
+            self,
+            backend_thread_ref: str,
+            title: str,
+            message: str,
+            *,
+            cwd: Path,
+            channel: ChannelConfig | None = None,
+        ) -> AgentResult:
+            del channel
+            self.steers.append((backend_thread_ref, title, message, Path(cwd)))
+            return CLIAgentBackend._parse_output("总结：有权限，可以直接改。\n\n需要注意：无")
+
+    async def _run() -> None:
+        store = WatchpostStore(tmp_path / "personal_natural.db")
+        backend = _LabeledBackend("ag")
+        notifier = _RecordingNotifier()
+        engine = WatchpostEngine(
+            store,
+            backend,
+            config=EngineConfig(
+                workspace_dir=tmp_path,
+                personal_workspace_dir=tmp_path,
+                language="zh",
+            ),
+            notifiers=[notifier],
+        )
+
+        p1 = await engine.handle_owner_action(classify_owner_command("现在能改代码吗", notifier="imessage"))  # type: ignore[arg-type]
+        assert p1 is not None and p1.channel_id == "personal_direct"
+        tok = f"tok-{p1.id}-0"
+
+        p2 = await engine.handle_owner_action(
+            classify_owner_command("具体哪个目录？", notifier="imessage", reply_token=tok)  # type: ignore[arg-type]
+        )
+        assert p2 is not None and p2.id == p1.id
+
+        assert len(backend.steers) == 1
+        steer_prompt = backend.steers[0][2]
+        assert "手机直聊跟进" in steer_prompt
+        assert "使用纯文本标题（总结：、建议回复：、需要注意：）" not in steer_prompt
+
+        assert len(notifier.completions) == 2
+        for _tid, bubbles in notifier.completions:
+            joined = "\n".join(bubbles)
+            assert "有权限，可以直接改。" in joined
+            assert "【个人直聊】" not in joined
+            assert "总结：" not in joined
+            assert "需要注意：" not in joined
+
+    asyncio.run(_run())
