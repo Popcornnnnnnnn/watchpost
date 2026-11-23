@@ -42,6 +42,10 @@ class ExternalCommandAdapter:
             return {}
         return json.loads(stdout)
 
+    async def health(self) -> dict[str, Any]:
+        res = await self._invoke("health", {})
+        return dict(res) if isinstance(res, dict) else {"ok": True, "detail": str(res)}
+
     async def list_available_chats(self) -> list[dict[str, str]]:
         res = await self._invoke("list-chats", {})
         items = res if isinstance(res, list) else (res.get("chats") if isinstance(res, dict) else [])

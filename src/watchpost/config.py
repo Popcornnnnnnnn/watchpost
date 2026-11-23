@@ -76,6 +76,13 @@ class ExternalAdapterConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
 
+class ExternalNotifierConfig(BaseModel):
+    name: str
+    command: list[str] = Field(default_factory=list)
+    timeout_s: float = 30.0
+    env: dict[str, str] = Field(default_factory=dict)
+
+
 class WatchpostConfig(BaseModel):
     db_path: str = DEFAULT_DB_PATH
     media_dir: str = DEFAULT_MEDIA_DIR
@@ -95,6 +102,7 @@ class WatchpostConfig(BaseModel):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     imessage: IMessageConfig = Field(default_factory=IMessageConfig)
     external_adapters: list[ExternalAdapterConfig] = Field(default_factory=list)
+    external_notifiers: list[ExternalNotifierConfig] = Field(default_factory=list)
     channels: list[ChannelConfig] = Field(default_factory=list)
 
 
@@ -175,6 +183,16 @@ def resolve_config(cfg: WatchpostConfig, *, env: Mapping[str, str] | None = None
                     }
                 )
                 for ext in resolved.external_adapters
+            ],
+            "external_notifiers": [
+                ext.model_copy(
+                    update={
+                        "command": [
+                            str(Path(part).expanduser()) if part.startswith("~/") else part for part in ext.command
+                        ]
+                    }
+                )
+                for ext in resolved.external_notifiers
             ],
             "channels": [
                 _resolve_channel_entry(ch)

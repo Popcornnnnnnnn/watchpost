@@ -23,6 +23,7 @@ from watchpost.config import WatchpostConfig, default_config_path, load_config
 from watchpost.engine import WatchpostEngine
 from watchpost.media import LocalWhisperProcessor
 from watchpost.models import EngineConfig
+from watchpost.notifiers.external_plugin import ExternalCommandNotifier
 from watchpost.notifiers.imessage import IMessageNotifier
 from watchpost.notifiers.telegram import TelegramNotifier
 from watchpost.ports import AgentBackend, MediaProcessor
@@ -153,6 +154,10 @@ def build_engine_from_config(
     if cfg.imessage.enabled and (cfg.imessage.owner_handle or cfg.imessage.allowed_handles):
         engine.register_notifier(IMessageNotifier(cfg.imessage, send_fn=imessage_send_fn))
 
+    for ext_ntf in cfg.external_notifiers:
+        if ext_ntf.name and ext_ntf.command:
+            engine.register_notifier(ExternalCommandNotifier(ext_ntf))
+
     for ch in cfg.channels:
         store.upsert_channel(ch)
 
@@ -231,6 +236,17 @@ class WatchpostDaemon:
             for ext_cfg in new_cfg.external_adapters:
                 if ext_cfg.name and ext_cfg.command:
                     self.engine.register_adapter(ExternalCommandAdapter(ext_cfg))
+
+            kept_notifiers = []
+            for ntf in self.engine.notifiers:
+                if isinstance(ntf, ExternalCommandNotifier):
+                    old_to_close.append(ntf)
+                else:
+                    kept_notifiers.append(ntf)
+            self.engine.notifiers = kept_notifiers
+            for ext_ntf in new_cfg.external_notifiers:
+                if ext_ntf.name and ext_ntf.command:
+                    self.engine.register_notifier(ExternalCommandNotifier(ext_ntf))
 
             for obj in old_to_close:
                 aclose = getattr(obj, "aclose", None)
@@ -481,6 +497,15 @@ def run_doctor(cfg_path: Path | str | None = None) -> dict[str, Any]:
         cmd0 = ext.command[0] if ext.command else ""
         ext_ok = bool(cmd0 and (Path(cmd0).is_file() or shutil.which(cmd0)))
         checks[f"adapter:{ext.name}"] = {
+            "ok": ext_ok,
+            "detail": f"command={cmd0}" if ext_ok else f"executable not found: {cmd0 or '<empty>'}",
+        }
+
+    # External out-of-process notifiers
+    for ext_ntf in cfg.external_notifiers:
+        cmd0 = ext_ntf.command[0] if ext_ntf.command else ""
+        ext_ok = bool(cmd0 and (Path(cmd0).is_file() or shutil.which(cmd0)))
+        checks[f"notifier:{ext_ntf.name}"] = {
             "ok": ext_ok,
             "detail": f"command={cmd0}" if ext_ok else f"executable not found: {cmd0 or '<empty>'}",
         }

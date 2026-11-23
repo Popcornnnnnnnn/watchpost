@@ -34,9 +34,11 @@ from watchpost.daemon import WatchpostDaemon, build_engine_from_config, run_doct
 from watchpost.engine import WatchpostEngine
 from watchpost.models import AutonomyMode, ChannelConfig, ChatType, EngineConfig, TriggerMode
 from watchpost.notifiers.telegram import detect_owner_chat_id
+from watchpost.plugins import check_plugin, scaffold_plugin
 from watchpost.sandbox import run_interactive_sandbox
 from watchpost.sandbox_ui import create_sandbox_ui_app
 from watchpost.server import create_app
+from watchpost.setup_wizard import run_setup_wizard
 from watchpost.skill_installer import SKILL_TARGETS, install_skill, uninstall_skill
 from watchpost.store import WatchpostStore
 
@@ -264,6 +266,24 @@ def main(argv: list[str] | None = None) -> int:
     p_init_cfg = sub.add_parser("init-config", help="Create starter config.json with env placeholders (0600)")
     p_init_cfg.add_argument("--config", default="", help="Path to config.json")
     p_init_cfg.add_argument("--force", action="store_true", help="Overwrite existing config.json")
+    p_init_cfg.add_argument("--interactive", "-i", action="store_true", help="Run the interactive setup wizard")
+
+    p_setup = sub.add_parser("setup", help="Interactive setup wizard for Watchpost config, DB, and checks")
+    p_setup.add_argument("--config", default="", help="Path to config.json")
+    p_setup.add_argument("--force", action="store_true", help="Overwrite existing config.json")
+    p_setup.add_argument("--non-interactive", action="store_true", help="Use defaults/flags without prompting")
+    p_setup.add_argument("--workspace", default="", help="Workspace directory for agent tasks")
+    p_setup.add_argument("--lang", default="", choices=["", "zh", "en"], help="Reply language")
+    p_setup.add_argument("--backend", default="", choices=["", "antigravity", "claude_code", "codex", "gemini_cli", "mock"])
+    p_setup.add_argument("--backup", default=None, help="Backup failover backend (or 'none')")
+    p_setup.add_argument("--platform", default="", choices=["", "feishu-lark-cli", "feishu-api", "external-plugin", "none"])
+    p_setup.add_argument("--notifier", default="", choices=["", "imessage", "telegram", "external-notifier", "none"])
+    p_setup.add_argument("--no-quiet-hours", action="store_true", help="Disable Quiet Hours")
+    p_setup.add_argument("--quiet-start", default="23:00")
+    p_setup.add_argument("--quiet-end", default="08:00")
+    p_setup.add_argument("--api-port", type=int, default=8787)
+    p_setup.add_argument("--db", default="", help="Optional SQLite DB path override")
+    p_setup.add_argument("--media-dir", default="", help="Optional media directory override")
 
     p_run = sub.add_parser("run", help="Start continuous headless Watchpost daemon")
     p_run.add_argument("--config", default="", help="Path to config.json")
@@ -312,6 +332,27 @@ def main(argv: list[str] | None = None) -> int:
     p_ch_rm = ch_sub.add_parser("remove", help="Remove an enrolled channel from config.json")
     p_ch_rm.add_argument("--config", default="", help="Path to config.json")
     p_ch_rm.add_argument("--id", required=True)
+
+    p_plg = sub.add_parser("plugins", help="List, scaffold starter code for, or check external plugins")
+    plg_sub = p_plg.add_subparsers(dest="plugins_cmd", required=True)
+
+    p_plg_list = plg_sub.add_parser("list", help="List configured external adapters and notifiers")
+    p_plg_list.add_argument("--config", default="", help="Path to config.json")
+    p_plg_list.add_argument("--json", action="store_true")
+
+    p_plg_scaf = plg_sub.add_parser("scaffold", help="Generate a starter Watchpost plugin via watchpost.sdk")
+    p_plg_scaf.add_argument("--kind", required=True, choices=["channel", "notifier"])
+    p_plg_scaf.add_argument("--name", required=True, help="Plugin slug (lowercase [a-z][a-z0-9_-]*)")
+    p_plg_scaf.add_argument("--dest", required=True, help="Output directory")
+    p_plg_scaf.add_argument("--force", action="store_true")
+    p_plg_scaf.add_argument("--json", action="store_true")
+
+    p_plg_chk = plg_sub.add_parser("check", help="Run conformance checks on an external plugin executable")
+    p_plg_chk.add_argument("--kind", required=True, choices=["channel", "notifier"])
+    p_plg_chk.add_argument("--cmd", required=True, nargs="+", help="Plugin executable and optional arguments")
+    p_plg_chk.add_argument("--test-fetch", action="store_true", help="Also validate sample fetch-recent messages")
+    p_plg_chk.add_argument("--timeout", type=float, default=15.0)
+    p_plg_chk.add_argument("--json", action="store_true")
 
     p_tg = sub.add_parser("telegram-whoami", help="Discover recent Telegram chat IDs talking to your bot")
     p_tg.add_argument("--config", default="", help="Path to config.json")
@@ -387,6 +428,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "init-config":
         cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
+        if args.interactive:
+            rc, _saved = run_setup_wizard(config_path=cfg_path, force=args.force, interactive=True)
+            return rc
         try:
             saved = init_config_file(cfg_path, overwrite=args.force)
         except FileExistsError as exc:
@@ -394,6 +438,30 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Wrote starter Watchpost config (0600) to {saved}")
         return 0
+
+    if args.command == "setup":
+        cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
+        defaults = {
+            "workspace": args.workspace,
+            "lang": args.lang,
+            "backend": args.backend,
+            "backup": args.backup,
+            "platform": args.platform,
+            "notifier": args.notifier,
+            "quiet_hours": not args.no_quiet_hours,
+            "quiet_start": args.quiet_start,
+            "quiet_end": args.quiet_end,
+            "api_port": args.api_port,
+            "db_path": args.db,
+            "media_dir": args.media_dir,
+        }
+        rc, _saved = run_setup_wizard(
+            config_path=cfg_path,
+            force=args.force,
+            interactive=not args.non_interactive,
+            defaults=defaults,
+        )
+        return rc
 
     if args.command == "run":
         cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
@@ -425,6 +493,67 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "channels":
         return _handle_channels(args)
+
+    if args.command == "plugins":
+        if args.plugins_cmd == "list":
+            cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
+            cfg = load_raw_config(cfg_path)
+            payload = {
+                "external_adapters": [e.model_dump(mode="json") for e in cfg.external_adapters],
+                "external_notifiers": [e.model_dump(mode="json") for e in cfg.external_notifiers],
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+            else:
+                print("External Channel Plugins:")
+                for item in cfg.external_adapters:
+                    print(f"  - {item.name}: {' '.join(item.command)}")
+                if not cfg.external_adapters:
+                    print("  (none)")
+                print("External Notifier Plugins:")
+                for item in cfg.external_notifiers:
+                    print(f"  - {item.name}: {' '.join(item.command)}")
+                if not cfg.external_notifiers:
+                    print("  (none)")
+            return 0
+
+        if args.plugins_cmd == "scaffold":
+            try:
+                res = scaffold_plugin(
+                    kind=args.kind,
+                    name=args.name,
+                    dest=Path(args.dest),
+                    force=args.force,
+                )
+            except (FileExistsError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            if args.json:
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+            else:
+                print(f"Scaffolded {res['kind']} plugin '{res['name']}':")
+                print(f"  script: {res['script_path']}")
+                print(f"  readme: {res['readme_path']}")
+            return 0
+
+        if args.plugins_cmd == "check":
+            res = asyncio.run(
+                check_plugin(
+                    kind=args.kind,
+                    command=list(args.cmd),
+                    test_fetch=args.test_fetch,
+                    timeout_s=args.timeout,
+                )
+            )
+            if args.json:
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+            else:
+                print(f"Plugin Check ({res['kind']}) — {'OK' if res['ok'] else 'FAILED'}")
+                for chk in res["checks"]:
+                    mark = "PASS" if chk["ok"] else "FAIL"
+                    print(f"  [{mark}] {chk['name']}: {chk['detail']}")
+            return 0 if res["ok"] else 1
+        return 1
 
     if args.command == "telegram-whoami":
         token = args.token.strip()

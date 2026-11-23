@@ -223,11 +223,13 @@ def format_start_notice(
 
 
 from watchpost.notifiers.console import ConsoleNotifier
+from watchpost.notifiers.external_plugin import ExternalCommandNotifier
 from watchpost.notifiers.imessage import IMessageNotifier
 from watchpost.notifiers.telegram import TelegramNotifier
 
 __all__ = [
     "ConsoleNotifier",
+    "ExternalCommandNotifier",
     "IMessageNotifier",
     "TelegramNotifier",
     "classify_owner_command",
