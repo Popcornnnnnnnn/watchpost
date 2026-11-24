@@ -663,38 +663,47 @@ class WatchpostDaemon:
                 webhook_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
                 webhook_task = asyncio.create_task(webhook_server.serve())
 
-            prev_bg = self.engine.background_owner_actions
-            self.engine.background_owner_actions = True
-            next_chan_at = 0.0
-            next_owner_at = 0.0
             next_prune_at = time.monotonic() + 21600.0
 
-            try:
+            async def _channel_loop() -> None:
+                nonlocal next_prune_at
                 while not stopper.is_set():
-                    now = time.monotonic()
                     chan_interval = max(1.0, float(self.config.poll_interval_s))
-                    owner_interval = max(0.5, float(self.config.owner_poll_interval_s))
-                    if now >= next_chan_at:
-                        await self.engine.poll_all_channels(seed_if_empty=False, debounced=True)
-                        await self.engine.flush_quiet_digest_if_due()
-                        next_chan_at = now + chan_interval
-                    if now >= next_owner_at:
-                        await self.engine.poll_owner_actions_once()
-                        next_owner_at = now + owner_interval
-                    if now >= next_prune_at:
+                    await self.engine.poll_all_channels(seed_if_empty=False, debounced=True)
+                    await self.engine.flush_quiet_digest_if_due()
+                    if time.monotonic() >= next_prune_at:
                         prune_old_media(
                             self.engine.media_dir,
                             max_age_days=int(getattr(self.engine.config, "media_retention_days", 14) or 14),
                         )
-                        next_prune_at = now + 21600.0
-
-                    wake_in = max(0.1, min(next_chan_at - time.monotonic(), next_owner_at - time.monotonic(), 1.0))
+                        next_prune_at = time.monotonic() + 21600.0
                     try:
-                        await asyncio.wait_for(stopper.wait(), timeout=wake_in)
+                        await asyncio.wait_for(stopper.wait(), timeout=chan_interval)
                     except asyncio.TimeoutError:
                         pass
+
+            async def _owner_loop() -> None:
+                while not stopper.is_set():
+                    owner_interval = max(0.5, float(self.config.owner_poll_interval_s))
+                    await self.engine.poll_owner_actions_once()
+                    try:
+                        await asyncio.wait_for(stopper.wait(), timeout=owner_interval)
+                    except asyncio.TimeoutError:
+                        pass
+
+            chan_task = asyncio.create_task(_channel_loop())
+            owner_task = asyncio.create_task(_owner_loop())
+            stop_task = asyncio.create_task(stopper.wait())
+            try:
+                done_wait, _ = await asyncio.wait(
+                    [stop_task, chan_task, owner_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in done_wait:
+                    if t is not stop_task and not t.cancelled() and t.exception() is not None:
+                        raise t.exception()  # type: ignore[misc]
             finally:
-                self.engine.background_owner_actions = prev_bg
+                stop_task.cancel()
                 for srv, tsk in ((api_server, api_task), (webhook_server, webhook_task)):
                     if srv is not None:
                         srv.should_exit = True
@@ -703,6 +712,10 @@ class WatchpostDaemon:
                             await asyncio.wait_for(tsk, timeout=3.0)
                         except Exception:
                             tsk.cancel()
+                _done_loops, still_loops = await asyncio.wait([chan_task, owner_task], timeout=5.0)
+                for lt in still_loops:
+                    lt.cancel()
+                await asyncio.gather(chan_task, owner_task, return_exceptions=True)
                 await self.engine.wait_background_tasks(timeout_s=5.0)
                 await self.engine.flush_all()
                 await self.close_resources()

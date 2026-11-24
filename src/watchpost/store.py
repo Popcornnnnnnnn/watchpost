@@ -572,10 +572,11 @@ class WatchpostStore:
                 conn.execute(
                     """
                     UPDATE threads
-                    SET status = ?, updated_at = ?
+                    SET status = CASE WHEN pending_go = 1 AND ? IN ('completed', 'error') THEN 'awaiting_go' ELSE ? END,
+                        updated_at = ?
                     WHERE id = ?
                     """,
-                    (status.value, now, thread_id),
+                    (status.value, status.value, now, thread_id),
                 )
             row = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
         return _row_to_thread(row) if row else None

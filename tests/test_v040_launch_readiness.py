@@ -1067,3 +1067,111 @@ def test_pr2_interleaved_steer_cannot_restore_go_and_orphan_descendant_killed(tm
             assert not alive
 
         asyncio.run(_run_orphan_kill())
+
+
+def test_pr3_newer_awaiting_go_preserved_and_cancel_defers_offset(tmp_path: Path) -> None:
+    # 1. Older approved turn completing (or raising) must NOT clobber newer awaiting_go/pending_go=True
+    class HeldApprovedBackend:
+        name = "heldgo"
+
+        def __init__(self, *, fail_exc: bool = False) -> None:
+            self.fail_exc = fail_exc
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def start_thread(self, title: str, prompt: str, *, cwd: Path, model: str = "", channel=None):
+            del title, prompt, cwd, model, channel
+            return "r0", AgentResult(raw_text="OK")
+
+        async def steer_thread(
+            self,
+            backend_thread_ref: str,
+            title: str,
+            message: str,
+            *,
+            cwd: Path,
+            channel=None,
+            approved_go: bool = False,
+        ):
+            del backend_thread_ref, title, message, cwd, channel, approved_go
+            self.entered.set()
+            await self.release.wait()
+            if self.fail_exc:
+                raise RuntimeError("boom during approved turn")
+            return AgentResult(raw_text="Summary:\nDone.\n\nSuggested Reply:\nOK.\n\nNeeds Attention:\nNone")
+
+    for should_fail in (False, True):
+        sub = tmp_path / f"case_{should_fail}"
+        sub.mkdir()
+        store = WatchpostStore(sub / "wp.db")
+        be = HeldApprovedBackend(fail_exc=should_fail)
+        eng = WatchpostEngine(store, be, config=EngineConfig(workspace_dir=sub, language="en"))
+        th = _seed_thread(store, sub, thread_id="th-old-go", pending_go=True)
+
+        async def _verify_preserve() -> None:
+            t_go = asyncio.create_task(eng.steer_from_owner(th.id, "go", approved_go=True))
+            await be.entered.wait()
+            assert store.get_thread(th.id).pending_go is False
+
+            # Simulate a newer inbound proposal arriving on the same thread while older turn finishes
+            cur = store.get_thread(th.id)
+            assert cur is not None
+            store.create_or_update_thread(
+                cur.model_copy(update={"pending_go": True, "status": ThreadStatus.awaiting_go})
+            )
+            be.release.set()
+            if should_fail:
+                with pytest.raises(RuntimeError, match="boom"):
+                    await t_go
+            else:
+                await t_go
+
+            after = store.get_thread(th.id)
+            assert after is not None
+            assert after.pending_go is True
+            assert after.status == ThreadStatus.awaiting_go
+
+        asyncio.run(_verify_preserve())
+
+    # 2. Cancelling poll_owner_actions_once mid-action must NOT commit Telegram offset
+    store2 = WatchpostStore(tmp_path / "cancel_off.db")
+    ws2 = tmp_path / "ws2"
+    ws2.mkdir()
+
+    class _CancelSpyBackend(HeldApprovedBackend):
+        async def start_thread(self, title: str, prompt: str, *, cwd: Path, model: str = "", channel=None):
+            del title, prompt, cwd, model, channel
+            self.entered.set()
+            await self.release.wait()
+            return "r-d", AgentResult(raw_text="Direct")
+
+    async def _verify_cancel_no_commit() -> None:
+        be_c = _CancelSpyBackend()
+        eng_c = WatchpostEngine(
+            store2,
+            be_c,
+            config=EngineConfig(workspace_dir=ws2, personal_workspace_dir=ws2, language="en"),
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [{"update_id": 88, "message": {"chat": {"id": 42}, "from": {"is_bot": False}, "text": "check repo"}}],
+                },
+            ) if r.url.path.endswith("/getUpdates") else httpx.Response(200, json={"ok": True, "result": True})
+        )) as client:
+            ntf = TelegramNotifier(
+                TelegramConfig(enabled=True, bot_token="888:tokCancel", owner_chat_id="42"),
+                store=store2,
+                client=client,
+            )
+            eng_c.register_notifier(ntf)
+            poll_task = asyncio.create_task(eng_c.poll_owner_actions_once())
+            await be_c.entered.wait()
+            poll_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await poll_task
+            assert store2.get_kv(ntf._offset_kv_key) is None  # noqa: SLF001
+
+    asyncio.run(_verify_cancel_no_commit())

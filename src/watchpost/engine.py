@@ -1005,7 +1005,7 @@ class WatchpostEngine:
             self.store.set_thread_status(
                 thread.id,
                 status=ThreadStatus.active,
-                clear_pending_go=approved_go,
+                clear_pending_go=False,
             )
             or thread
         )
@@ -1025,7 +1025,7 @@ class WatchpostEngine:
             self.store.set_thread_status(
                 thread.id,
                 status=ThreadStatus.error,
-                clear_pending_go=approved_go,
+                clear_pending_go=False,
             )
             raise
         all_bubbles, draft_reply = format_completion_bubbles(
@@ -1040,7 +1040,7 @@ class WatchpostEngine:
             self.store.set_thread_status(
                 thread.id,
                 status=next_status,
-                clear_pending_go=approved_go,
+                clear_pending_go=False,
             )
             or thread.model_copy(
                 update={
@@ -1651,6 +1651,7 @@ class WatchpostEngine:
             except Exception as exc:
                 logger.warning("Notifier %s poll_owner_actions failed: %s", ntf.name, redact_secrets(str(exc)))
                 continue
+            before_tasks = set(self._bg_tasks)
             for action in actions:
                 try:
                     await self.handle_owner_action(action)
@@ -1664,6 +1665,9 @@ class WatchpostEngine:
                         else f"Failed handling command ({action.kind}): {safe_err[:180]}"
                     )
                     await self._send_owner_reply(action.notifier, err_notice)
+            spawned = [t for t in self._bg_tasks if t not in before_tasks and not t.done()]
+            if spawned:
+                await asyncio.gather(*spawned)
             commit_fn = getattr(ntf, "commit_offset", None)
             if callable(commit_fn):
                 try:
