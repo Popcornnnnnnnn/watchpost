@@ -5,11 +5,9 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import os
 import sqlite3
 import stat
 import sys
-import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -452,7 +450,7 @@ def test_imessage_allowed_handles_filters_and_attachments(tmp_path: Path) -> Non
             IMessageConfig(
                 enabled=True,
                 owner_handle="+1 555-010-0001",
-                allowed_handles=["+86 155-5010-0222", "15550100222"],
+                allowed_handles=["+1 555-010-0222", "15550100222"],
                 chat_db_path=str(db_path),
             ),
             send_fn=lambda _h, _t: True,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -22,18 +23,75 @@ from watchpost.config import (
     TelegramConfig,
     WatchpostConfig,
     WeComConfig,
+    load_dotenv_file,
     save_config,
 )
 from watchpost.daemon import run_doctor
 from watchpost.models import QuietHoursConfig
+from watchpost.security import atomic_write_text
 from watchpost.store import WatchpostStore
+
+_VALID_PLATFORMS = frozenset(
+    {
+        "feishu-lark-cli",
+        "feishu-api",
+        "slack",
+        "discord",
+        "telegram",
+        "dingtalk",
+        "wecom",
+        "external-plugin",
+        "none",
+    }
+)
+_VALID_NOTIFIERS = frozenset(
+    {
+        "imessage",
+        "telegram",
+        "slack-dm",
+        "discord-dm",
+        "ntfy",
+        "bark",
+        "pushover",
+        "wecom",
+        "external-notifier",
+        "none",
+    }
+)
+
+
+def _env_keys_for(platform_choice: str, notifier_choice: str) -> list[str]:
+    keys: list[str] = []
+    plat_map = {
+        "feishu-lark-cli": ["FEISHU_OWNER_OPEN_ID"],
+        "feishu-api": ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_OWNER_OPEN_ID"],
+        "slack": ["SLACK_BOT_TOKEN", "SLACK_OWNER_USER_ID"],
+        "discord": ["DISCORD_BOT_TOKEN", "DISCORD_OWNER_USER_ID"],
+        "telegram": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_USERNAME"],
+        "dingtalk": ["DINGTALK_APP_KEY", "DINGTALK_APP_SECRET", "DINGTALK_WEBHOOK_SECRET", "DINGTALK_OWNER_USER_ID"],
+        "wecom": ["WECOM_CORP_ID", "WECOM_CORP_SECRET", "WECOM_CALLBACK_TOKEN", "WECOM_OWNER_USER_ID"],
+    }
+    ntf_map = {
+        "imessage": ["WATCHPOST_IMESSAGE_HANDLE"],
+        "slack-dm": ["SLACK_BOT_TOKEN", "SLACK_OWNER_USER_ID"],
+        "discord-dm": ["DISCORD_BOT_TOKEN", "DISCORD_OWNER_USER_ID"],
+        "ntfy": ["NTFY_TOPIC", "NTFY_REPLY_TOPIC"],
+        "bark": ["BARK_DEVICE_KEY"],
+        "pushover": ["PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY"],
+        "wecom": ["WECOM_CORP_ID", "WECOM_CORP_SECRET", "WECOM_AGENT_ID", "WECOM_OWNER_USER_ID"],
+    }
+    for k in [*plat_map.get(platform_choice, []), *ntf_map.get(notifier_choice, [])]:
+        if k not in keys:
+            keys.append(k)
+    return keys
 
 
 def detect_environment() -> dict[str, Any]:
     """Detect local OS, agent CLIs, chat CLI tools, and Whisper binaries."""
     ag_bin = shutil.which("agentapi")
     if not ag_bin:
-        cand = Path.home() / ".gemini" / "antigravity" / "bin" / "agentapi"
+        ag_home = Path(os.environ.get("ANTIGRAVITY_HOME", "").strip() or (Path.home() / ".gemini" / "antigravity")).expanduser()
+        cand = ag_home / "bin" / "agentapi"
         if cand.is_file():
             ag_bin = str(cand)
 
@@ -50,7 +108,7 @@ def detect_environment() -> dict[str, Any]:
     rec_backend = next(iter(detected_backends), "claude_code")
     rec_backup = "codex" if ("codex" in detected_backends and rec_backend != "codex") else ""
     lark_cli = shutil.which("lark-cli")
-    rec_platform = "feishu-lark-cli" if lark_cli else "feishu-api"
+    rec_platform = "feishu-lark-cli" if lark_cli else "slack"
     rec_notifier = "telegram"
 
     return {
@@ -135,9 +193,9 @@ def run_setup_wizard(
     ws_default = str(opts.get("workspace") or env_info["workspace_dir"])
     workspace_dir = _ask("Workspace directory", ws_default, interactive=interactive, input_fn=ask_fn)
 
-    lang_default = str(opts.get("lang") or "zh")
-    lang_raw = _ask("Reply language (zh/en)", lang_default, interactive=interactive, input_fn=ask_fn).lower()
-    language = "en" if lang_raw.startswith("en") else "zh"
+    lang_default = str(opts.get("lang") or "en")
+    lang_raw = _ask("Reply language (en/zh)", lang_default, interactive=interactive, input_fn=ask_fn).lower()
+    language = "zh" if lang_raw.startswith("zh") else "en"
 
     valid_backends = {"antigravity", "claude_code", "codex", "gemini_cli", "mock"}
     be_default = str(opts.get("backend") or env_info["recommended_backend"])
@@ -165,19 +223,25 @@ def run_setup_wizard(
 
     plat_default = str(opts.get("platform") or env_info["recommended_platform"])
     platform_choice = _ask(
-        "Work chat source (feishu-lark-cli/feishu-api/slack/discord/telegram/dingtalk/wecom/external-plugin/none)",
+        "Work chat source (slack/discord/telegram/feishu-lark-cli/feishu-api/dingtalk/wecom/external-plugin/none)",
         plat_default,
         interactive=interactive,
         input_fn=ask_fn,
     ).strip().lower()
+    if platform_choice not in _VALID_PLATFORMS:
+        say_fn(f"Unsupported platform: {platform_choice!r}")
+        return 1, None
 
     ntf_default = str(opts.get("notifier") or env_info["recommended_notifier"])
     notifier_choice = _ask(
-        "Owner phone/desktop entrance (imessage/telegram/slack-dm/discord-dm/ntfy/bark/pushover/wecom/external-notifier/none)",
+        "Owner phone/desktop entrance (telegram/imessage/slack-dm/discord-dm/ntfy/bark/pushover/wecom/external-notifier/none)",
         ntf_default,
         interactive=interactive,
         input_fn=ask_fn,
     ).strip().lower()
+    if notifier_choice not in _VALID_NOTIFIERS:
+        say_fn(f"Unsupported notifier: {notifier_choice!r}")
+        return 1, None
 
     quiet_default = bool(opts.get("quiet_hours", True))
     quiet_enabled = _ask_yes_no(
@@ -203,6 +267,19 @@ def run_setup_wizard(
         api_port = max(0, min(int(port_raw), 65535))
     except ValueError:
         api_port = 8787
+
+    webhook_port = int(opts.get("webhook_port", 0) or 0)
+    if platform_choice in {"dingtalk", "wecom"} and interactive and "webhook_port" not in opts:
+        wh_raw = _ask(
+            "Dedicated webhook port for public tunnels (0 to share control API port)",
+            "8788",
+            interactive=True,
+            input_fn=ask_fn,
+        )
+        try:
+            webhook_port = max(0, min(int(wh_raw), 65535))
+        except ValueError:
+            webhook_port = 8788
 
     if platform_choice == "feishu-lark-cli":
         feishu_cfg = FeishuConfig(
@@ -309,7 +386,6 @@ def run_setup_wizard(
 
     db_path = str(opts.get("db_path") or DEFAULT_DB_PATH)
     media_dir = str(opts.get("media_dir") or DEFAULT_MEDIA_DIR)
-    codex_sandbox = "read-only" if (backend_preset == "codex" or backup_preset == "codex") else ""
 
     cfg = WatchpostConfig(
         db_path=db_path,
@@ -320,6 +396,7 @@ def run_setup_wizard(
         ack_on_receive=False,
         language=language,
         api_port=api_port,
+        webhook_port=webhook_port,
         quiet_hours=QuietHoursConfig(
             enabled=quiet_enabled,
             start=quiet_start,
@@ -328,7 +405,7 @@ def run_setup_wizard(
         backend=BackendConfig(
             preset=backend_preset,
             backup_preset=backup_preset,
-            codex_sandbox=codex_sandbox,
+            codex_sandbox="",
         ),
         feishu=feishu_cfg,
         telegram=tg_cfg,
@@ -343,6 +420,26 @@ def run_setup_wizard(
     )
 
     saved_path = save_config(cfg, target_cfg)
+    env_keys = _env_keys_for(platform_choice, notifier_choice)
+    if interactive and env_keys:
+        if _ask_yes_no(
+            f"Save credentials to 0600 .env file ({target_cfg.parent / '.env'}) now?",
+            False,
+            interactive=True,
+            input_fn=ask_fn,
+        ):
+            env_path = target_cfg.parent / ".env"
+            existing_env = load_dotenv_file(env_path)
+            for key in env_keys:
+                cur_val = os.environ.get(key, "") or existing_env.get(key, "")
+                entered = ask_fn(f"  {key} [{'set' if cur_val else 'blank'}]: ").strip()
+                if entered:
+                    existing_env[key] = entered
+            if existing_env:
+                lines = [f"{k}={v}" for k, v in sorted(existing_env.items())]
+                atomic_write_text(env_path, "\n".join(lines) + "\n", mode=0o600)
+                say_fn(f"Saved credentials (0600): {env_path}")
+
     WatchpostStore(Path(db_path).expanduser())
     report = run_doctor(saved_path)
 

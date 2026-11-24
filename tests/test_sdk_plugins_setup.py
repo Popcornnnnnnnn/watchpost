@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -304,6 +304,7 @@ def test_setup_wizard_interactive_and_non_interactive_and_init_config_flag(
             "23:00",  # quiet start
             "08:00",  # quiet end
             "8787",  # api port
+            "n",  # skip .env write in wizard test
         ]
     )
     logs: list[str] = []
@@ -382,10 +383,10 @@ def test_telegram_setup_preserves_channels_uploads_avatar_and_hot_swaps_daemon(
 ) -> None:
     import httpx
     from watchpost.cli import run_telegram_setup
-    from watchpost.config import BackendConfig, IMessageConfig, TelegramConfig
+    from watchpost.config import BackendConfig, IMessageConfig
     from watchpost.daemon import WatchpostDaemon, build_engine_from_config
-    from watchpost.engine import WatchpostEngine
     from watchpost.notifiers import classify_owner_command
+    from watchpost.notifiers.telegram import telegram_owner_offset_key
     from watchpost.setup_wizard import detect_environment
 
     assert detect_environment()["recommended_notifier"] == "telegram"
@@ -420,6 +421,7 @@ def test_telegram_setup_preserves_channels_uploads_avatar_and_hot_swaps_daemon(
     )
 
     seen_requests: list[str] = []
+    printed_lines: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -427,12 +429,15 @@ def test_telegram_setup_preserves_channels_uploads_avatar_and_hot_swaps_daemon(
         if path.endswith("/getMe"):
             return httpx.Response(200, json={"ok": True, "result": {"id": 123, "username": "wp_live_bot", "first_name": "Watchpost"}})
         if path.endswith("/getUpdates"):
+            joined = "\n".join(printed_lines)
+            m = re.search(r"\?start=([A-Za-z0-9_-]+)", joined)
+            start_text = f"/start {m.group(1)}" if m else "/start"
             return httpx.Response(
                 200,
                 json={
                     "ok": True,
                     "result": [
-                        {"update_id": 77, "message": {"message_id": 1, "chat": {"id": 555123, "type": "private"}, "text": "/start"}}
+                        {"update_id": 77, "message": {"message_id": 1, "chat": {"id": 555123, "type": "private", "first_name": "Jack", "username": "jack"}, "text": start_text}}
                     ],
                 },
             )
@@ -454,7 +459,7 @@ def test_telegram_setup_preserves_channels_uploads_avatar_and_hot_swaps_daemon(
                 wait_s=0.1,
                 no_reload=True,
                 send_test=True,
-                print_fn=lambda _m: None,
+                print_fn=printed_lines.append,
                 client=client,
             )
             assert res["ok"] is True
@@ -498,7 +503,7 @@ def test_telegram_setup_preserves_channels_uploads_avatar_and_hot_swaps_daemon(
             assert reload_res["reloaded"] is True
             assert any(n.name == "telegram" for n in daemon.engine.notifiers)
             assert sum(1 for p in seen_requests if p.endswith("/setMyCommands")) > cmds_before
-            assert daemon.engine.store.get_kv("telegram_owner_update_offset") == 78
+            assert daemon.engine.store.get_kv(telegram_owner_offset_key("123456:TESTTOKEN")) == 78
 
             # Verify cleaned /status & /help outputs omit noisy labels
             sent_texts: list[str] = []
@@ -533,11 +538,15 @@ def test_telegram_setup_preserves_channels_uploads_avatar_and_hot_swaps_daemon(
 
     asyncio.run(_run())
 
-    # Verify live doctor check with mocked get_bot_info
+    # Verify live doctor check with mocked get_bot_info + get_webhook_info
     async def _fake_bot_info(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"id": 123, "username": "wp_live_bot", "first_name": "Watchpost"}
 
+    async def _fake_webhook_info(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"url": ""}
+
     monkeypatch.setattr("watchpost.daemon.get_bot_info", _fake_bot_info)
+    monkeypatch.setattr("watchpost.daemon.get_webhook_info", _fake_webhook_info)
     doc = run_doctor(cfg_path, live=True)
     assert doc["ok"] is True
     assert "@wp_live_bot, API reachable" in doc["checks"]["telegram"]["detail"]

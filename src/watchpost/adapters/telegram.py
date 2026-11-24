@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import datetime
+import hashlib
+import logging
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 import httpx
@@ -19,8 +22,16 @@ from watchpost.models import (
     Mention,
     NormalizedMessage,
 )
+from watchpost.security import redact_secrets
 
+logger = logging.getLogger("watchpost.adapters.telegram")
 _SAFE_STEM_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def telegram_hub_offset_key(bot_token: str) -> str:
+    """Return a bot-token-scoped cursor key for shared TelegramUpdateHub state."""
+    digest = hashlib.sha256((bot_token or "").strip().encode("utf-8")).hexdigest()[:12]
+    return f"telegram_update_offset:{digest}"
 
 
 def _format_ts_ms(create_ms: int) -> str:
@@ -77,12 +88,20 @@ class TelegramUpdateHub:
         self._poll_timeout_s = max(0, int(poll_timeout_s))
         self._proxy_url = proxy_url.strip()
         self._store = store
-        self._offset_kv_key = offset_kv_key.strip() or "telegram_update_offset"
+        raw_kv_key = offset_kv_key.strip() or "telegram_update_offset"
+        self._offset_kv_key = (
+            telegram_hub_offset_key(self._token)
+            if raw_kv_key == "telegram_update_offset" and self._token
+            else raw_kv_key
+        )
         self._external_client = client
         self._owned_client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()
         saved_off = self._store.get_kv(self._offset_kv_key) if self._store is not None else None
         self._offset: int | None = int(saved_off) if isinstance(saved_off, int) and saved_off > 0 else None
+        self._pending_offset: int | None = None
+        self._backoff_s = 0.0
+        self._backoff_until = 0.0
         self._owner_queues: dict[str, deque[dict[str, Any]]] = {}
         self._owner_callbacks: dict[str, deque[dict[str, Any]]] = {}
         self._chat_messages: dict[str, list[dict[str, Any]]] = {}
@@ -104,6 +123,7 @@ class TelegramUpdateHub:
             self._owned_client = httpx.AsyncClient(
                 timeout=max(15.0, float(self._poll_timeout_s) + 10.0),
                 proxy=self._proxy_url or None,
+                trust_env=False,
             )
         return self._owned_client
 
@@ -115,6 +135,13 @@ class TelegramUpdateHub:
     def _persist_offset(self) -> None:
         if self._store is not None and self._offset is not None:
             self._store.set_kv(self._offset_kv_key, int(self._offset))
+            self._pending_offset = None
+
+    def commit_offset(self) -> None:
+        """Persist any deferred update cursor after downstream dispatch completes."""
+        if self._pending_offset is not None and self._store is not None:
+            self._offset = max(self._offset or 0, self._pending_offset)
+            self._persist_offset()
 
     def _record_message(self, msg: dict[str, Any]) -> None:
         chat = msg.get("chat") or {}
@@ -166,12 +193,15 @@ class TelegramUpdateHub:
         async with self._lock:
             if self._offset is not None:
                 return 0
-            resp = await self._client().get(
-                f"{self._api_url}/getUpdates",
-                params={"timeout": 0, "allowed_updates": '["message","callback_query"]'},
-            )
-            resp.raise_for_status()
-            payload = resp.json()
+            try:
+                resp = await self._client().get(
+                    f"{self._api_url}/getUpdates",
+                    params={"timeout": 0, "allowed_updates": '["message","callback_query"]'},
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as exc:
+                raise RuntimeError(redact_secrets(str(exc))) from exc
             if not isinstance(payload, dict) or not payload.get("ok"):
                 return 0
             results = payload.get("result") or []
@@ -184,21 +214,62 @@ class TelegramUpdateHub:
                 self._persist_offset()
             return len(results)
 
-    async def sync(self) -> int:
+    async def sync(self, *, defer_commit: bool = False) -> int:
         if not self._token:
             return 0
         async with self._lock:
+            if time.monotonic() < self._backoff_until:
+                return 0
             params: dict[str, Any] = {
                 "timeout": self._poll_timeout_s,
                 "allowed_updates": '["message","callback_query"]',
             }
             if self._offset is not None:
                 params["offset"] = self._offset
-            resp = await self._client().get(f"{self._api_url}/getUpdates", params=params)
-            resp.raise_for_status()
-            payload = resp.json()
+            try:
+                resp = await self._client().get(f"{self._api_url}/getUpdates", params=params)
+            except httpx.TransportError as exc:
+                self._backoff_s = min(60.0, max(2.0, self._backoff_s * 2.0 if self._backoff_s else 2.0))
+                self._backoff_until = time.monotonic() + self._backoff_s
+                logger.warning(
+                    "Telegram hub getUpdates transport error (backing off %.0fs): %s",
+                    self._backoff_s,
+                    redact_secrets(str(exc)),
+                )
+                return 0
+
+            if resp.status_code in {409, 429, 500, 502, 503, 504}:
+                retry_after = 0.0
+                if resp.status_code == 429:
+                    try:
+                        retry_after = float(resp.headers.get("Retry-After") or 0.0)
+                    except ValueError:
+                        retry_after = 0.0
+                self._backoff_s = min(60.0, max(2.0, retry_after or (self._backoff_s * 2.0 if self._backoff_s else 2.0)))
+                self._backoff_until = time.monotonic() + self._backoff_s
+                if resp.status_code == 409:
+                    logger.warning(
+                        "Telegram hub getUpdates 409 Conflict (another instance or webhook active; backing off %.0fs)",
+                        self._backoff_s,
+                    )
+                else:
+                    logger.warning(
+                        "Telegram hub getUpdates HTTP %d (backing off %.0fs)",
+                        resp.status_code,
+                        self._backoff_s,
+                    )
+                return 0
+
+            try:
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as exc:
+                raise RuntimeError(redact_secrets(str(exc))) from exc
             if not isinstance(payload, dict) or not payload.get("ok"):
-                raise RuntimeError(f"Telegram getUpdates failed: {payload}")
+                raise RuntimeError(redact_secrets(f"Telegram getUpdates failed: {payload}"))
+
+            self._backoff_s = 0.0
+            self._backoff_until = 0.0
             prev_offset = self._offset
             count = 0
             for upd in payload.get("result") or []:
@@ -214,11 +285,14 @@ class TelegramUpdateHub:
                     self._record_callback_query(cb)
                     count += 1
             if self._offset != prev_offset:
-                self._persist_offset()
+                if defer_commit:
+                    self._pending_offset = self._offset
+                else:
+                    self._persist_offset()
             return count
 
-    async def poll_owner_messages(self, owner_chat_id: str) -> list[dict[str, Any]]:
-        await self.sync()
+    async def poll_owner_messages(self, owner_chat_id: str, *, defer_commit: bool = False) -> list[dict[str, Any]]:
+        await self.sync(defer_commit=defer_commit)
         queue = self._owner_queues.get(owner_chat_id.strip())
         if not queue:
             return []
@@ -226,8 +300,8 @@ class TelegramUpdateHub:
         queue.clear()
         return drained
 
-    async def poll_owner_callbacks(self, owner_chat_id: str) -> list[dict[str, Any]]:
-        await self.sync()
+    async def poll_owner_callbacks(self, owner_chat_id: str, *, defer_commit: bool = False) -> list[dict[str, Any]]:
+        await self.sync(defer_commit=defer_commit)
         queue = self._owner_callbacks.get(owner_chat_id.strip())
         if not queue:
             return []
@@ -257,16 +331,22 @@ class TelegramUpdateHub:
         ]
 
     async def download_file(self, file_id: str) -> tuple[bytes, str]:
-        resp = await self._client().get(f"{self._api_url}/getFile", params={"file_id": file_id})
-        resp.raise_for_status()
-        payload = resp.json()
+        try:
+            resp = await self._client().get(f"{self._api_url}/getFile", params={"file_id": file_id})
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise RuntimeError(redact_secrets(str(exc))) from exc
         if not isinstance(payload, dict) or not payload.get("ok"):
-            raise RuntimeError(f"Telegram getFile failed: {payload}")
+            raise RuntimeError(redact_secrets(f"Telegram getFile failed: {payload}"))
         file_path = str((payload.get("result") or {}).get("file_path") or "").lstrip("/")
         if not file_path:
             raise RuntimeError(f"Telegram getFile returned empty file_path for {file_id}")
-        dl = await self._client().get(f"{self._file_base}/{file_path}", follow_redirects=True)
-        dl.raise_for_status()
+        try:
+            dl = await self._client().get(f"{self._file_base}/{file_path}", follow_redirects=True)
+            dl.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(redact_secrets(str(exc))) from exc
         return dl.content, Path(file_path).name
 
 

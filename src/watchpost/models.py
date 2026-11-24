@@ -175,10 +175,11 @@ class QuietHoursConfig(BaseModel):
 
 class EngineConfig(BaseModel):
     workspace_dir: Path = Field(default_factory=lambda: Path("."))
-    language: str = "zh"
+    language: str = "en"
     debounce_s: float = 25.0
     max_debounce_s: float = 60.0
     media_retention_days: int = 14
+    max_concurrent_turns: int = 3
     personal_workspace_dir: Path | None = None
     personal_session_ttl_s: int = 3600
     ack_on_receive: bool = True

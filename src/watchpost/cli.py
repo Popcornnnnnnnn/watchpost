@@ -6,13 +6,18 @@ import argparse
 import asyncio
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
+import secrets
+import shlex
 import signal
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as _xml_escape
 
 import httpx
 import uvicorn
@@ -50,6 +55,7 @@ from watchpost.notifiers.telegram import (
 from watchpost.plugins import check_plugin, scaffold_plugin
 from watchpost.sandbox import run_interactive_sandbox
 from watchpost.sandbox_ui import create_sandbox_ui_app
+from watchpost.security import RedactingLogFilter, api_token_path, atomic_write_text, redact_secrets
 from watchpost.server import create_app
 from watchpost.setup_wizard import run_setup_wizard
 from watchpost.skill_installer import SKILL_TARGETS, install_skill, uninstall_skill
@@ -109,7 +115,17 @@ async def _run_daemon_cli(
         if log_file.strip():
             log_path = Path(log_file).expanduser()
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+            handlers.append(
+                RotatingFileHandler(
+                    log_path,
+                    maxBytes=10 * 1024 * 1024,
+                    backupCount=5,
+                    encoding="utf-8",
+                )
+            )
+        redactor = RedactingLogFilter()
+        for h in handlers:
+            h.addFilter(redactor)
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -225,7 +241,7 @@ async def run_telegram_setup(
         bot_info = await get_bot_info(bot_token, base_url=base_url, proxy_url=eff_proxy, client=client)
     except Exception as exc:
         raise RuntimeError(
-            f"Failed reaching Telegram API getMe ({exc}); verify network/Clash TUN or pass --proxy-url"
+            f"Failed reaching Telegram API getMe ({redact_secrets(str(exc))}); verify network/Clash TUN or pass --proxy-url"
         ) from exc
 
     bot_username = str(bot_info.get("username") or "").strip()
@@ -245,26 +261,23 @@ async def run_telegram_setup(
     )
 
     owner_chat_id = chat_id.strip()
-    if not owner_chat_id:
-        existing_chats = await detect_owner_chat_id(
-            bot_token,
-            base_url=base_url,
-            proxy_url=eff_proxy,
-            client=client,
-        )
-        picked = next((c for c in existing_chats if c.get("type") == "private"), None) or (
-            existing_chats[0] if existing_chats else None
-        )
-        if picked is not None:
-            owner_chat_id = str(picked.get("chat_id") or "").strip()
-
+    paired_info: dict[str, str] = {}
+    pair_nonce = ""
     if not owner_chat_id and wait_s > 0:
+        pair_nonce = f"wp_{secrets.token_urlsafe(8)}"
         if bot_username:
-            print_fn(f"Open https://t.me/{bot_username}?start=watchpost and tap Start (waiting up to {int(wait_s)}s)...")
+            print_fn(
+                f"Open https://t.me/{bot_username}?start={pair_nonce} in Telegram and tap Start "
+                f"(waiting up to {int(wait_s)}s)..."
+            )
         else:
-            print_fn(f"Send any message to your bot in Telegram (waiting up to {int(wait_s)}s)...")
+            print_fn(
+                f"Send `/start {pair_nonce}` to your bot in a private Telegram chat "
+                f"(waiting up to {int(wait_s)}s)..."
+            )
         waited = await wait_for_owner_chat_id(
             bot_token,
+            expected_nonce=pair_nonce,
             timeout_s=wait_s,
             base_url=base_url,
             proxy_url=eff_proxy,
@@ -272,6 +285,7 @@ async def run_telegram_setup(
         )
         if waited is not None:
             owner_chat_id = str(waited.get("chat_id") or "").strip()
+            paired_info = waited
 
     if not owner_chat_id:
         existing_cid = resolved_cfg.telegram.owner_chat_id.strip()
@@ -279,10 +293,22 @@ async def run_telegram_setup(
             owner_chat_id = existing_cid
 
     if not owner_chat_id:
-        hint = f"https://t.me/{bot_username}?start=watchpost" if bot_username else "your bot in Telegram"
-        raise RuntimeError(
-            f"No Telegram owner chat discovered yet. Open {hint}, tap Start, and re-run `watchpost telegram-setup`."
+        hint = (
+            f"https://t.me/{bot_username}?start={pair_nonce}"
+            if (bot_username and pair_nonce)
+            else f"https://t.me/{bot_username}"
+            if bot_username
+            else "your bot in a private Telegram chat"
         )
+        raise RuntimeError(
+            f"No matching private Telegram pairing message received. Open {hint}, send `/start {pair_nonce or '<token>'}`, "
+            "or pass --chat-id explicitly."
+        )
+
+    if paired_info:
+        p_name = paired_info.get("name") or paired_info.get("username") or owner_chat_id
+        p_user = f" (@{paired_info['username']})" if paired_info.get("username") else ""
+        print_fn(f"Paired Telegram owner: {p_name}{p_user} [chat_id={owner_chat_id}]")
 
     personal_ws = raw_cfg.personal_workspace_dir or raw_cfg.imessage.personal_workspace_dir or raw_cfg.workspace_dir
     personal_ttl = (
@@ -296,10 +322,15 @@ async def run_telegram_setup(
         else bool(raw_cfg.imessage.ack_on_receive)
     )
 
+    saved_bot_token = (
+        raw_cfg.telegram.bot_token
+        if (not token.strip() and raw_cfg.telegram.bot_token.strip().startswith("${"))
+        else bot_token
+    )
     updated_tg = raw_cfg.telegram.model_copy(
         update={
             "enabled": True,
-            "bot_token": bot_token,
+            "bot_token": saved_bot_token,
             "owner_chat_id": owner_chat_id,
             "base_url": base_url,
             "proxy_url": eff_proxy,
@@ -340,8 +371,17 @@ async def run_telegram_setup(
     reloaded = False
     if not no_reload and int(updated_cfg.api_port or 0) > 0 and client is None:
         try:
+            tok_file = api_token_path(updated_cfg.db_path)
+            headers: dict[str, str] = {}
+            if tok_file.is_file():
+                bearer = tok_file.read_text(encoding="utf-8", errors="replace").strip()
+                if bearer:
+                    headers["Authorization"] = f"Bearer {bearer}"
             async with httpx.AsyncClient(timeout=3.0, trust_env=False) as local_http:
-                resp = await local_http.post(f"http://127.0.0.1:{int(updated_cfg.api_port)}/api/reload")
+                resp = await local_http.post(
+                    f"http://127.0.0.1:{int(updated_cfg.api_port)}/api/reload",
+                    headers=headers,
+                )
                 reloaded = resp.status_code == 200
         except Exception:
             reloaded = False
@@ -457,6 +497,141 @@ def _handle_channels(args: argparse.Namespace) -> int:
         save_config(cfg, cfg_path)
         print(f"Removed channel {args.id} from {cfg_path}")
         return 0
+
+    return 1
+
+
+def _render_launchd_plist(
+    *,
+    label: str,
+    python_bin: str,
+    config_path: Path,
+    log_path: Path,
+    path_env: str,
+) -> str:
+    args = [python_bin, "-m", "watchpost", "run", "--config", str(config_path), "--log-file", str(log_path)]
+    args_xml = "\n".join(f"        <string>{_xml_escape(a)}</string>" for a in args)
+    out_log = log_path.with_suffix(".stdout.log")
+    err_log = log_path.with_suffix(".stderr.log")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        f"    <key>Label</key>\n    <string>{_xml_escape(label)}</string>\n"
+        "    <key>ProgramArguments</key>\n    <array>\n"
+        f"{args_xml}\n"
+        "    </array>\n"
+        "    <key>EnvironmentVariables</key>\n    <dict>\n"
+        f"        <key>PATH</key>\n        <string>{_xml_escape(path_env)}</string>\n"
+        "    </dict>\n"
+        "    <key>RunAtLoad</key>\n    <true/>\n"
+        "    <key>KeepAlive</key>\n    <true/>\n"
+        f"    <key>StandardOutPath</key>\n    <string>{_xml_escape(str(out_log))}</string>\n"
+        f"    <key>StandardErrorPath</key>\n    <string>{_xml_escape(str(err_log))}</string>\n"
+        "</dict>\n"
+        "</plist>\n"
+    )
+
+
+def _render_systemd_unit(
+    *,
+    python_bin: str,
+    config_path: Path,
+    log_path: Path,
+    path_env: str,
+) -> str:
+    cmd = " ".join(
+        shlex.quote(p)
+        for p in (python_bin, "-m", "watchpost", "run", "--config", str(config_path), "--log-file", str(log_path))
+    )
+    return (
+        "[Unit]\n"
+        "Description=Watchpost headless local coding agent bridge\n"
+        "After=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"Environment=PATH={path_env}\n"
+        f"ExecStart={cmd}\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def _handle_service(args: argparse.Namespace) -> int:
+    target = str(getattr(args, "target", "auto") or "auto").strip().lower()
+    if target == "auto":
+        target = "launchd" if sys.platform == "darwin" else "systemd"
+    cfg_path = Path(args.config).expanduser().resolve() if args.config else default_config_path().resolve()
+    default_log = (
+        Path.home() / "Library" / "Logs" / "watchpost.log"
+        if target == "launchd"
+        else Path.home() / ".local" / "state" / "watchpost" / "watchpost.log"
+    )
+    log_path = Path(args.log_file).expanduser().resolve() if args.log_file else default_log
+    label = str(getattr(args, "label", "dev.watchpost.daemon") or "dev.watchpost.daemon").strip()
+    path_env = os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+
+    if target == "launchd":
+        unit_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        content = _render_launchd_plist(
+            label=label,
+            python_bin=sys.executable,
+            config_path=cfg_path,
+            log_path=log_path,
+            path_env=path_env,
+        )
+    else:
+        unit_name = f"{label}.service" if not label.endswith(".service") else label
+        unit_path = Path.home() / ".config" / "systemd" / "user" / unit_name
+        content = _render_systemd_unit(
+            python_bin=sys.executable,
+            config_path=cfg_path,
+            log_path=log_path,
+            path_env=path_env,
+        )
+
+    if args.service_cmd == "install":
+        if args.print_only:
+            print(content, end="")
+            return 0
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(unit_path, content, mode=0o644)
+        print(f"Installed service definition ({target}): {unit_path}")
+        if target == "launchd":
+            uid = os.getuid()
+            subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(unit_path)], check=False)
+            res = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(unit_path)], check=False)
+            return int(res.returncode)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        res = subprocess.run(["systemctl", "--user", "enable", "--now", unit_path.name], check=False)
+        return int(res.returncode)
+
+    if args.service_cmd == "uninstall":
+        if not args.print_only:
+            if target == "launchd":
+                uid = os.getuid()
+                subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(unit_path)], check=False)
+            else:
+                subprocess.run(["systemctl", "--user", "disable", "--now", unit_path.name], check=False)
+            unit_path.unlink(missing_ok=True)
+            if target == "systemd":
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        print(f"Uninstalled service ({target}): {unit_path}")
+        return 0
+
+    if args.service_cmd == "status":
+        print(f"Service ({target}): {unit_path} ({'installed' if unit_path.is_file() else 'not installed'})")
+        if args.print_only or not unit_path.is_file():
+            return 0 if unit_path.is_file() else 1
+        if target == "launchd":
+            res = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], check=False)
+            return int(res.returncode)
+        res = subprocess.run(["systemctl", "--user", "status", unit_path.name, "--no-pager"], check=False)
+        return int(res.returncode)
 
     return 1
 
@@ -620,6 +795,16 @@ def main(argv: list[str] | None = None) -> int:
     p_skill.add_argument("--dest", default="", help="Optional custom skill directory path")
     p_skill.add_argument("--uninstall", action="store_true", help="Remove installed skill instead of installing")
 
+    p_svc = sub.add_parser("service", help="Install, inspect, or remove a persistent background user service")
+    svc_sub = p_svc.add_subparsers(dest="service_cmd", required=True)
+    for svc_action in ("install", "uninstall", "status"):
+        sp = svc_sub.add_parser(svc_action, help=f"{svc_action.capitalize()} Watchpost background service")
+        sp.add_argument("--config", default="", help="Path to config.json")
+        sp.add_argument("--log-file", default="", help="Log file path")
+        sp.add_argument("--label", default="dev.watchpost.daemon", help="LaunchAgent label or systemd unit stem")
+        sp.add_argument("--target", default="auto", choices=["auto", "launchd", "systemd"])
+        sp.add_argument("--print-only", action="store_true", help="Print service unit without running launchctl/systemctl")
+
     p_sb = sub.add_parser("sandbox", help="Interactive sandbox where you simulate colleagues + phone replies")
     p_sb.add_argument(
         "--backend",
@@ -635,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
         default="diagnose_only",
         choices=["assistant_only", "diagnose_only", "auto_fix"],
     )
-    p_sb.add_argument("--lang", default="zh", help="Output language ('zh' or 'en')")
+    p_sb.add_argument("--lang", default="en", help="Output language ('en' or 'zh')")
     p_sb.add_argument("--persona", default="", help="Optional custom channel persona text")
 
     p_sbs = sub.add_parser("sandbox-send", help="Append one external message into a persistent --dir sandbox")
@@ -664,17 +849,17 @@ def main(argv: list[str] | None = None) -> int:
         choices=["assistant_only", "diagnose_only", "auto_fix"],
     )
     p_sbui.add_argument("--debounce", type=float, default=5.0, help="Burst debounce window in seconds")
-    p_sbui.add_argument("--lang", default="zh", help="Output language ('zh' or 'en')")
+    p_sbui.add_argument("--lang", default="en", help="Output language ('en' or 'zh')")
 
     p_demo = sub.add_parser("demo", help="Run offline head-start simulation scenario")
     p_demo.add_argument("--db", default="", help="Optional persistent DB path (defaults to temporary)")
-    p_demo.add_argument("--lang", default="zh", help="Output language ('zh' or 'en')")
+    p_demo.add_argument("--lang", default="en", help="Output language ('en' or 'zh')")
 
     p_serve = sub.add_parser("serve", help="Start headless Watchpost JSON control API server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8787)
     p_serve.add_argument("--db", default="./data/watchpost.db")
-    p_serve.add_argument("--lang", default="zh")
+    p_serve.add_argument("--lang", default="en")
 
     args = parser.parse_args(argv)
 
@@ -830,7 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except Exception as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            print(f"Error: {redact_secrets(str(exc))}", file=sys.stderr)
             return 1
         prof = res["profile"]
         print(
@@ -842,6 +1027,9 @@ def main(argv: list[str] | None = None) -> int:
         if not res["reloaded"]:
             print(f"Next: start Watchpost with `watchpost run --config {res['config_path']}`")
         return 0
+
+    if args.command == "service":
+        return _handle_service(args)
 
     if args.command == "telegram-whoami":
         token = args.token.strip()

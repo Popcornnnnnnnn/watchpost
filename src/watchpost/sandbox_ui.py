@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 from contextlib import asynccontextmanager
-import json
 import re
 import secrets
 from datetime import datetime

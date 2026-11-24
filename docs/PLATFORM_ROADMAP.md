@@ -29,7 +29,8 @@ Watchpost separates **core intelligence** (debouncing, Bucket 1/2 context, 4-mod
 
 ## Webhook & Plugin Notes
 
-- **Webhook endpoints on `watchpost run --api-port 8787`:**
+- **Isolated tunnel listener (`webhook_port`):** Set `webhook_port` (for example `8788`) in `config.json` when exposing DingTalk or WeCom callbacks over a reverse tunnel (`create_webhook_app`), keeping `/api/*` control routes restricted to Bearer-authenticated `127.0.0.1:api_port`.
+- **Signed webhook verification:**
   - `POST /api/webhooks/dingtalk` verifies `timestamp` + HMAC-SHA256 `sign` against `dingtalk.webhook_secret` (or `app_secret`) and persists normalized messages into the local webhook inbox.
-  - `GET /api/webhooks/wecom` and `POST /api/webhooks/wecom` verify SHA1 `msg_signature` against `wecom.callback_token` (or pass plaintext XML/JSON after an upstream AES decryption proxy).
+  - `GET /api/webhooks/wecom` and `POST /api/webhooks/wecom` verify SHA1 `msg_signature` against `wecom.callback_token`; inbound bodies expect plaintext XML or JSON (use WeCom plaintext callback mode or terminate AES callback decryption in an upstream proxy before forwarding to Watchpost).
 - **Custom bridges (`watchpost.sdk`):** Any additional platform can be added without modifying Watchpost core via `watchpost plugins scaffold` and verified via `watchpost plugins check`.

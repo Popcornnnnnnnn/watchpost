@@ -13,6 +13,7 @@ from typing import Any
 
 from watchpost.backends.cli_agent import CLIAgentBackend
 from watchpost.models import AgentResult, ChannelConfig
+from watchpost.security import kill_process_tree
 from watchpost.store import WatchpostStore
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
@@ -115,7 +116,8 @@ class AntigravityBackend:
 
     def _build_env(self) -> dict[str, str]:
         env = os.environ.copy()
-        extra_dir = str(Path.home() / ".gemini" / "antigravity" / "bin")
+        ag_home = Path(os.environ.get("ANTIGRAVITY_HOME", "").strip() or (Path.home() / ".gemini" / "antigravity")).expanduser()
+        extra_dir = str(ag_home / "bin")
         cur_path = env.get("PATH", "")
         if extra_dir not in cur_path:
             env["PATH"] = f"{extra_dir}:{cur_path}" if cur_path else extra_dir
@@ -130,8 +132,13 @@ class AntigravityBackend:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=(os.name == "posix"),
         )
-        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=self.spawn_timeout_s)
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=self.spawn_timeout_s)
+        except asyncio.TimeoutError:
+            await kill_process_tree(proc)
+            raise
         return (
             out_b.decode("utf-8", errors="replace").strip(),
             err_b.decode("utf-8", errors="replace").strip(),

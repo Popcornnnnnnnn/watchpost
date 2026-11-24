@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping
 from pydantic import BaseModel, Field
 
 from watchpost.models import ChannelConfig, QuietHoursConfig
+from watchpost.security import atomic_write_text
 
 _ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -175,12 +176,13 @@ class WatchpostConfig(BaseModel):
     personal_workspace_dir: str = ""
     personal_session_ttl_s: int = 0
     ack_on_receive: bool | None = None
-    language: str = "zh"
+    language: str = "en"
     poll_interval_s: float = 10.0
     owner_poll_interval_s: float = 3.0
     debounce_s: float = 25.0
     max_debounce_s: float = 60.0
     api_port: int = 0
+    webhook_port: int = 0
     quiet_hours: QuietHoursConfig = Field(default_factory=QuietHoursConfig)
     cross_channel_window_s: int = 7200
     cross_channel_max_items: int = 5
@@ -424,6 +426,30 @@ def _resolve_channel_entry(ch: ChannelConfig) -> ChannelConfig:
     )
 
 
+def load_dotenv_file(path: Path | str) -> dict[str, str]:
+    """Parse KEY=VALUE pairs from an optional .env file next to config.json."""
+    env_path = Path(path).expanduser()
+    if not env_path.is_file():
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+            val = val[1:-1]
+        if key:
+            parsed[key] = val
+    return parsed
+
+
 def load_raw_config(path: Path | str | None = None) -> WatchpostConfig:
     """Load config JSON without expanding env placeholders (safe for round-trip mutations)."""
     cfg_path = Path(path).expanduser() if path else default_config_path()
@@ -434,19 +460,66 @@ def load_raw_config(path: Path | str | None = None) -> WatchpostConfig:
 
 
 def load_config(path: Path | str | None = None, *, env: Mapping[str, str] | None = None) -> WatchpostConfig:
-    """Load config JSON and resolve placeholders, env fallbacks, and paths."""
-    raw = load_raw_config(path)
-    return resolve_config(raw, env=env)
+    """Load config JSON and resolve placeholders, optional .env values, env fallbacks, and paths."""
+    cfg_path = Path(path).expanduser() if path else default_config_path()
+    raw = load_raw_config(cfg_path)
+    if env is None:
+        dotenv_vals = load_dotenv_file(cfg_path.parent / ".env")
+        merged_env: Mapping[str, str] = {**dotenv_vals, **os.environ}
+    else:
+        merged_env = env
+    return resolve_config(raw, env=merged_env)
+
+
+def find_unresolved_placeholders(
+    raw_cfg: WatchpostConfig,
+    env: Mapping[str, str] | None = None,
+    *,
+    config_path: Path | str | None = None,
+) -> list[tuple[str, str]]:
+    """Return (section.field, ENV_NAME) for enabled sections with unset/empty ${VAR} placeholders."""
+    if env is None:
+        base_dir = Path(config_path).expanduser().parent if config_path else default_config_path().parent
+        environ: Mapping[str, str] = {**load_dotenv_file(base_dir / ".env"), **os.environ}
+    else:
+        environ = env
+
+    enabled_adapters = {c.adapter for c in raw_cfg.channels if c.enabled}
+    sections: list[tuple[str, BaseModel, bool]] = [
+        ("feishu", raw_cfg.feishu, bool(raw_cfg.feishu.enabled or "feishu" in enabled_adapters)),
+        (
+            "telegram",
+            raw_cfg.telegram,
+            bool(raw_cfg.telegram.enabled or raw_cfg.telegram.inbound_enabled or "telegram" in enabled_adapters),
+        ),
+        ("imessage", raw_cfg.imessage, bool(raw_cfg.imessage.enabled)),
+        ("slack", raw_cfg.slack, bool(raw_cfg.slack.enabled or raw_cfg.slack.dm_enabled or "slack" in enabled_adapters)),
+        ("discord", raw_cfg.discord, bool(raw_cfg.discord.enabled or raw_cfg.discord.dm_enabled or "discord" in enabled_adapters)),
+        ("dingtalk", raw_cfg.dingtalk, bool(raw_cfg.dingtalk.enabled or "dingtalk" in enabled_adapters)),
+        ("wecom", raw_cfg.wecom, bool(raw_cfg.wecom.enabled or raw_cfg.wecom.notify_enabled or "wecom" in enabled_adapters)),
+        ("ntfy", raw_cfg.ntfy, bool(raw_cfg.ntfy.enabled)),
+        ("bark", raw_cfg.bark, bool(raw_cfg.bark.enabled)),
+        ("pushover", raw_cfg.pushover, bool(raw_cfg.pushover.enabled)),
+    ]
+    missing: list[tuple[str, str]] = []
+    for sec_name, sec_model, active in sections:
+        if not active:
+            continue
+        for fname, val in sec_model.model_dump(mode="python").items():
+            if not isinstance(val, str):
+                continue
+            for m in _ENV_PLACEHOLDER_RE.finditer(val):
+                env_name = m.group(1)
+                if not str(environ.get(env_name, "")).strip():
+                    missing.append((f"{sec_name}.{fname}", env_name))
+    return missing
 
 
 def save_config(cfg: WatchpostConfig, path: Path | str) -> Path:
-    """Persist Watchpost config cleanly with restrictive 0600 file permissions."""
+    """Persist Watchpost config atomically with restrictive 0600 file permissions."""
     cfg_path = Path(path).expanduser()
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(cfg.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n"
-    cfg_path.write_text(payload, encoding="utf-8")
-    os.chmod(cfg_path, 0o600)
-    return cfg_path
+    return atomic_write_text(cfg_path, payload, mode=0o600)
 
 
 def starter_template_config() -> WatchpostConfig:

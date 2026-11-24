@@ -10,6 +10,7 @@ from typing import Any
 
 from watchpost.config import ExternalAdapterConfig
 from watchpost.models import ChannelConfig, MediaArtifact, NormalizedMessage
+from watchpost.security import kill_process_tree
 
 
 class ExternalCommandAdapter:
@@ -31,9 +32,14 @@ class ExternalCommandAdapter:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=(os.name == "posix"),
         )
         stdin_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        out_b, err_b = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=self._config.timeout_s)
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=self._config.timeout_s)
+        except asyncio.TimeoutError:
+            await kill_process_tree(proc)
+            raise
         stdout = out_b.decode("utf-8", errors="replace").strip()
         stderr = err_b.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0:

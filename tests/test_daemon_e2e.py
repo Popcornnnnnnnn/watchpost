@@ -12,6 +12,7 @@ import httpx
 from watchpost.config import BackendConfig, FeishuConfig, TelegramConfig, WatchpostConfig
 from watchpost.daemon import WatchpostDaemon, build_engine_from_config
 from watchpost.models import ChannelConfig, ChatType, ThreadRecord, ThreadStatus, TriageMode, TriggerMode
+from watchpost.notifiers.telegram import telegram_owner_offset_key
 
 
 def test_daemon_feishu_to_telegram_to_owner_go_end_to_end() -> None:
@@ -231,7 +232,7 @@ def test_daemon_telegram_top_level_personal_direct_typing_and_button_skip() -> N
             stop_ev.set()
             await daemon.run_forever(stop_event=stop_ev, seed_on_start=True)
             assert len(tg_commands) == 1
-            assert engine.store.get_kv("telegram_owner_update_offset") == 91
+            assert engine.store.get_kv(telegram_owner_offset_key("tg_tok")) == 91
 
             # Plain Telegram text routes into Personal Direct Chat using top-level personal_workspace_dir
             tg_updates.append(

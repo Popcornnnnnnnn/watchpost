@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
+import socket
+import stat
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+if os.name == "posix":
+    import fcntl
+else:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 from watchpost.adapters.dingtalk import DingTalkAdapter
 from watchpost.adapters.discord import DiscordAdapter
@@ -24,9 +32,15 @@ from watchpost.backends.antigravity import AntigravityBackend
 from watchpost.backends.cli_agent import CLI_PRESETS, CLIAgentBackend
 from watchpost.backends.fallback import FallbackBackend
 from watchpost.backends.mock import MockAgentBackend
-from watchpost.config import WatchpostConfig, default_config_path, load_config
+from watchpost.config import (
+    WatchpostConfig,
+    default_config_path,
+    find_unresolved_placeholders,
+    load_config,
+    load_raw_config,
+)
 from watchpost.engine import WatchpostEngine
-from watchpost.media import LocalWhisperProcessor
+from watchpost.media import LocalWhisperProcessor, prune_old_media
 from watchpost.models import EngineConfig
 from watchpost.notifiers.bark import BarkNotifier
 from watchpost.notifiers.discord import DiscordNotifier
@@ -35,19 +49,34 @@ from watchpost.notifiers.imessage import IMessageNotifier
 from watchpost.notifiers.ntfy import NtfyNotifier
 from watchpost.notifiers.pushover import PushoverNotifier
 from watchpost.notifiers.slack import SlackNotifier
-from watchpost.notifiers.telegram import TelegramNotifier, get_bot_info
+from watchpost.notifiers.telegram import TelegramNotifier, get_bot_info, get_webhook_info
 from watchpost.notifiers.wecom import WeComNotifier
 from watchpost.ports import AgentBackend, MediaProcessor
+from watchpost.security import redact_secrets
 from watchpost.store import WatchpostStore
 
 logger = logging.getLogger("watchpost.daemon")
+
+
+def _antigravity_home() -> Path:
+    override = os.environ.get("ANTIGRAVITY_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".gemini" / "antigravity"
+
+
+def _antigravity_hooks_file() -> Path:
+    override = os.environ.get("WATCHPOST_ANTIGRAVITY_HOOKS", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".gemini" / "config" / "hooks.json"
 
 
 def _find_antigravity_bin(bin_name: str) -> str | None:
     found = shutil.which(bin_name)
     if found:
         return found
-    candidate = Path.home() / ".gemini" / "antigravity" / "bin" / bin_name
+    candidate = _antigravity_home() / "bin" / bin_name
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
     return None
@@ -398,8 +427,7 @@ class WatchpostDaemon:
             for name in list(self.engine.adapters):
                 if name == "simulator":
                     continue
-                if name in _NATIVE_ADAPTER_NAMES or name not in {"simulator"}:
-                    old_to_close.append(self.engine.adapters.pop(name))
+                old_to_close.append(self.engine.adapters.pop(name))
 
             kept_notifiers = []
             has_live_imessage = False
@@ -429,13 +457,21 @@ class WatchpostDaemon:
                     try:
                         await seed_fn()
                     except Exception as exc:
-                        logger.warning("Notifier %s seed_offset failed on reload: %s", getattr(ntf, "name", "?"), exc)
+                        logger.warning(
+                            "Notifier %s seed_offset failed on reload: %s",
+                            getattr(ntf, "name", "?"),
+                            redact_secrets(str(exc)),
+                        )
                 reg_fn = getattr(ntf, "register_commands", None)
                 if callable(reg_fn):
                     try:
                         await reg_fn()
                     except Exception as exc:
-                        logger.warning("Notifier %s register_commands failed on reload: %s", getattr(ntf, "name", "?"), exc)
+                        logger.warning(
+                            "Notifier %s register_commands failed on reload: %s",
+                            getattr(ntf, "name", "?"),
+                            redact_secrets(str(exc)),
+                        )
 
             for obj in old_to_close:
                 if reused_hub is not None:
@@ -471,7 +507,7 @@ class WatchpostDaemon:
                             debounced=True,
                         )
                     except Exception as exc:
-                        logger.warning("Reload seed failed (%s / %s): %s", ch.adapter, ch.id, exc)
+                        logger.warning("Reload seed failed (%s / %s): %s", ch.adapter, ch.id, redact_secrets(str(exc)))
 
             active_count = sum(
                 1 for c in self.engine.store.list_channels() if c.enabled and c.adapter != "owner_direct"
@@ -494,95 +530,182 @@ class WatchpostDaemon:
             "owner_actions": actions,
         }
 
+    @contextlib.contextmanager
+    def _instance_lock(self):
+        lock_path = self.engine.store.db_path.parent / "watchpost.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = lock_path.open("a+", encoding="utf-8")
+        acquired = False
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    fh.seek(0)
+                    other_pid = fh.read().strip() or "unknown"
+                    raise RuntimeError(
+                        f"Another Watchpost daemon is already running (PID {other_pid}, lock {lock_path})"
+                    ) from exc
+            acquired = True
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{os.getpid()}\n")
+            fh.flush()
+            yield lock_path
+        finally:
+            if acquired:
+                try:
+                    fh.seek(0)
+                    fh.truncate()
+                    fh.flush()
+                except OSError:
+                    pass
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+            fh.close()
+
     async def run_forever(
         self,
         *,
         stop_event: asyncio.Event | None = None,
         seed_on_start: bool = True,
     ) -> None:
-        stopper = stop_event or asyncio.Event()
-        recovered = self.engine.store.recover_stale_active_threads()
-        if recovered:
-            logger.warning("Recovered %d orphaned active thread(s) on startup", recovered)
-        if seed_on_start:
-            await self.engine.poll_all_channels(seed_if_empty=True, debounced=False)
-            for ntf in self.engine.notifiers:
-                seed_fn = getattr(ntf, "seed_offset", None)
-                if callable(seed_fn):
-                    try:
-                        await seed_fn()
-                    except Exception as exc:
-                        logger.warning("Notifier %s seed_offset failed: %s", getattr(ntf, "name", "?"), exc)
-                reg_fn = getattr(ntf, "register_commands", None)
-                if callable(reg_fn):
-                    try:
-                        await reg_fn()
-                    except Exception as exc:
-                        logger.warning("Notifier %s register_commands failed: %s", getattr(ntf, "name", "?"), exc)
-        logger.info(
-            "Watchpost daemon started (backend=%s, channels=%d, api_port=%d)",
-            self.engine.backend.name,
-            self.engine.store.get_metrics()["channels"],
-            int(getattr(self.config, "api_port", 0) or 0),
-        )
+        with self._instance_lock():
+            stopper = stop_event or asyncio.Event()
+            recovered = self.engine.store.recover_stale_active_threads()
+            if recovered:
+                logger.warning("Recovered %d orphaned active thread(s) on startup", recovered)
 
-        api_server: Any = None
-        api_task: asyncio.Task[None] | None = None
-        if int(getattr(self.config, "api_port", 0) or 0) > 0:
-            import uvicorn
-
-            from watchpost.server import create_app
-
-            app = create_app(
-                self.engine.store.db_path,
-                backend=self.engine.backend,
-                config=self.engine.config,
-                engine=self.engine,
-                reload_fn=self.reload_from_disk,
-                config_path=self.config_path,
+            pruned_init = prune_old_media(
+                self.engine.media_dir,
+                max_age_days=int(getattr(self.engine.config, "media_retention_days", 14) or 14),
             )
-            uv_cfg = uvicorn.Config(
-                app,
-                host="127.0.0.1",
-                port=int(self.config.api_port),
-                log_level="warning",
-                access_log=False,
+            if pruned_init:
+                logger.info("Pruned %d expired media artifact(s) on startup", pruned_init)
+
+            if seed_on_start:
+                await self.engine.poll_all_channels(seed_if_empty=True, debounced=False)
+                for ntf in self.engine.notifiers:
+                    seed_fn = getattr(ntf, "seed_offset", None)
+                    if callable(seed_fn):
+                        try:
+                            await seed_fn()
+                        except Exception as exc:
+                            logger.warning(
+                                "Notifier %s seed_offset failed: %s",
+                                getattr(ntf, "name", "?"),
+                                redact_secrets(str(exc)),
+                            )
+                    reg_fn = getattr(ntf, "register_commands", None)
+                    if callable(reg_fn):
+                        try:
+                            await reg_fn()
+                        except Exception as exc:
+                            logger.warning(
+                                "Notifier %s register_commands failed: %s",
+                                getattr(ntf, "name", "?"),
+                                redact_secrets(str(exc)),
+                            )
+
+            logger.info(
+                "Watchpost daemon started (backend=%s, channels=%d, api_port=%d, webhook_port=%d)",
+                self.engine.backend.name,
+                self.engine.store.get_metrics()["channels"],
+                int(getattr(self.config, "api_port", 0) or 0),
+                int(getattr(self.config, "webhook_port", 0) or 0),
             )
-            api_server = uvicorn.Server(uv_cfg)
-            api_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
-            api_task = asyncio.create_task(api_server.serve())
 
-        next_chan_at = 0.0
-        next_owner_at = 0.0
+            api_server: Any = None
+            api_task: asyncio.Task[None] | None = None
+            webhook_server: Any = None
+            webhook_task: asyncio.Task[None] | None = None
+            if int(getattr(self.config, "api_port", 0) or 0) > 0:
+                import uvicorn
 
-        try:
-            while not stopper.is_set():
-                now = time.monotonic()
-                chan_interval = max(1.0, float(self.config.poll_interval_s))
-                owner_interval = max(0.5, float(self.config.owner_poll_interval_s))
-                if now >= next_chan_at:
-                    await self.engine.poll_all_channels(seed_if_empty=False, debounced=True)
-                    await self.engine.flush_quiet_digest_if_due()
-                    next_chan_at = now + chan_interval
-                if now >= next_owner_at:
-                    await self.engine.poll_owner_actions_once()
-                    next_owner_at = now + owner_interval
+                from watchpost.server import create_app
 
-                wake_in = max(0.1, min(next_chan_at - time.monotonic(), next_owner_at - time.monotonic(), 1.0))
-                try:
-                    await asyncio.wait_for(stopper.wait(), timeout=wake_in)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            if api_server is not None:
-                api_server.should_exit = True
-            if api_task is not None:
-                try:
-                    await asyncio.wait_for(api_task, timeout=3.0)
-                except Exception:
-                    api_task.cancel()
-            await self.engine.flush_all()
-            await self.close_resources()
+                app = create_app(
+                    self.engine.store.db_path,
+                    backend=self.engine.backend,
+                    config=self.engine.config,
+                    engine=self.engine,
+                    reload_fn=self.reload_from_disk,
+                    config_path=self.config_path,
+                )
+                uv_cfg = uvicorn.Config(
+                    app,
+                    host="127.0.0.1",
+                    port=int(self.config.api_port),
+                    log_level="warning",
+                    access_log=False,
+                )
+                api_server = uvicorn.Server(uv_cfg)
+                api_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+                api_task = asyncio.create_task(api_server.serve())
+
+            if int(getattr(self.config, "webhook_port", 0) or 0) > 0:
+                import uvicorn
+
+                from watchpost.server import create_webhook_app
+
+                wh_app = create_webhook_app(self.engine)
+                wh_cfg = uvicorn.Config(
+                    wh_app,
+                    host="127.0.0.1",
+                    port=int(self.config.webhook_port),
+                    log_level="warning",
+                    access_log=False,
+                )
+                webhook_server = uvicorn.Server(wh_cfg)
+                webhook_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+                webhook_task = asyncio.create_task(webhook_server.serve())
+
+            prev_bg = self.engine.background_owner_actions
+            self.engine.background_owner_actions = True
+            next_chan_at = 0.0
+            next_owner_at = 0.0
+            next_prune_at = time.monotonic() + 21600.0
+
+            try:
+                while not stopper.is_set():
+                    now = time.monotonic()
+                    chan_interval = max(1.0, float(self.config.poll_interval_s))
+                    owner_interval = max(0.5, float(self.config.owner_poll_interval_s))
+                    if now >= next_chan_at:
+                        await self.engine.poll_all_channels(seed_if_empty=False, debounced=True)
+                        await self.engine.flush_quiet_digest_if_due()
+                        next_chan_at = now + chan_interval
+                    if now >= next_owner_at:
+                        await self.engine.poll_owner_actions_once()
+                        next_owner_at = now + owner_interval
+                    if now >= next_prune_at:
+                        prune_old_media(
+                            self.engine.media_dir,
+                            max_age_days=int(getattr(self.engine.config, "media_retention_days", 14) or 14),
+                        )
+                        next_prune_at = now + 21600.0
+
+                    wake_in = max(0.1, min(next_chan_at - time.monotonic(), next_owner_at - time.monotonic(), 1.0))
+                    try:
+                        await asyncio.wait_for(stopper.wait(), timeout=wake_in)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                self.engine.background_owner_actions = prev_bg
+                for srv, tsk in ((api_server, api_task), (webhook_server, webhook_task)):
+                    if srv is not None:
+                        srv.should_exit = True
+                    if tsk is not None:
+                        try:
+                            await asyncio.wait_for(tsk, timeout=3.0)
+                        except Exception:
+                            tsk.cancel()
+                await self.engine.wait_background_tasks(timeout_s=5.0)
+                await self.engine.flush_all()
+                await self.close_resources()
 
     async def close_resources(self) -> None:
         for obj in [*self.engine.adapters.values(), *self.engine.notifiers]:
@@ -604,7 +727,7 @@ def _check_backend_binary(
         return {"ok": True, "detail": "mock (offline testing)"}
     if preset == "antigravity":
         found = _find_antigravity_bin(cfg.backend.antigravity_bin)
-        hooks_file = Path.home() / ".gemini" / "config" / "hooks.json"
+        hooks_file = _antigravity_hooks_file()
         hook_wired = False
         if hooks_file.is_file():
             try:
@@ -640,8 +763,42 @@ def _run_async_in_sync(coro: Any, *, timeout_s: float = 15.0) -> Any:
         return pool.submit(asyncio.run, coro).result(timeout=timeout_s)
 
 
+def _nearest_existing_parent(path: Path) -> Path:
+    cur = path
+    while not cur.exists() and cur != cur.parent:
+        cur = cur.parent
+    return cur
+
+
+def _is_port_free(port: int) -> bool:
+    if port <= 0:
+        return True
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.3)
+            return sock.connect_ex(("127.0.0.1", port)) != 0
+    except OSError:
+        return True
+
+
+def _inspect_lockfile(lock_path: Path) -> tuple[bool, str]:
+    if not lock_path.is_file() or fcntl is None:
+        return False, ""
+    try:
+        with lock_path.open("r", encoding="utf-8", errors="replace") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                return False, ""
+            except BlockingIOError:
+                pid = fh.read().strip()
+                return True, pid or "unknown"
+    except OSError:
+        return False, ""
+
+
 def run_doctor(cfg_path: Path | str | None = None, *, live: bool = False) -> dict[str, Any]:
-    """Inspect config, dependencies, harnesses, and adapters without leaking secrets."""
+    """Inspect config, dependencies, harnesses, and adapters without leaking secrets or mutating disk."""
     resolved_path = Path(cfg_path).expanduser() if cfg_path else default_config_path()
     checks: dict[str, dict[str, Any]] = {}
     if not resolved_path.is_file():
@@ -649,33 +806,80 @@ def run_doctor(cfg_path: Path | str | None = None, *, live: bool = False) -> dic
             "ok": False,
             "config_path": str(resolved_path),
             "checks": {
-                "config": {"ok": False, "detail": f"Missing config file: {resolved_path} (run watchpost init-config)"}
+                "config": {"ok": False, "detail": f"Missing config file: {resolved_path} (run watchpost setup)"}
             },
             "channels": [],
         }
 
     try:
+        raw_cfg = load_raw_config(resolved_path)
         cfg = load_config(resolved_path)
     except Exception as exc:
         return {
             "ok": False,
             "config_path": str(resolved_path),
-            "checks": {"config": {"ok": False, "detail": f"Invalid config: {exc}"}},
+            "checks": {"config": {"ok": False, "detail": f"Invalid config: {redact_secrets(str(exc))}"}},
             "channels": [],
         }
     checks["config"] = {"ok": True, "detail": str(resolved_path)}
 
-    # Storage & workspace
-    db_parent = Path(cfg.db_path).expanduser().parent
-    try:
-        db_parent.mkdir(parents=True, exist_ok=True)
-        db_writable = os.access(db_parent, os.W_OK)
-    except OSError:
-        db_writable = False
-    checks["storage"] = {"ok": db_writable, "detail": str(Path(cfg.db_path).expanduser())}
+    # Env placeholders & storage (read-only: never mkdir inside doctor)
+    unresolved = find_unresolved_placeholders(raw_cfg, config_path=resolved_path)
+    if unresolved:
+        missing_str = ", ".join(f"{field}->${{{env}}}" for field, env in unresolved[:6])
+        checks["env_placeholders"] = {"ok": False, "detail": f"Unresolved env vars: {missing_str}"}
+    else:
+        checks["env_placeholders"] = {"ok": True, "detail": "all active placeholders resolved"}
+
+    db_file = Path(cfg.db_path).expanduser()
+    probe_dir = db_file.parent if db_file.parent.exists() else _nearest_existing_parent(db_file.parent)
+    db_writable = probe_dir.is_dir() and os.access(probe_dir, os.W_OK)
+    checks["storage"] = {"ok": db_writable, "detail": str(db_file)}
+
+    if os.name == "posix" and db_file.is_file():
+        mode = stat.S_IMODE(db_file.stat().st_mode)
+        perm_ok = (mode & 0o077) == 0
+        checks["db_permissions"] = {
+            "ok": perm_ok,
+            "detail": (
+                f"mode={oct(mode)}"
+                if perm_ok
+                else f"insecure mode={oct(mode)} on {db_file} (expected 0600)"
+            ),
+        }
 
     ws = Path(cfg.workspace_dir).expanduser()
     checks["workspace"] = {"ok": ws.is_dir(), "detail": str(ws)}
+
+    # Daemon lock & loopback port conflicts
+    lock_path = db_file.parent / "watchpost.lock"
+    running, running_pid = _inspect_lockfile(lock_path)
+    api_port = int(getattr(cfg, "api_port", 0) or 0)
+    if running:
+        checks["daemon_instance"] = {"ok": True, "detail": f"running (PID {running_pid})"}
+    elif api_port > 0 and not _is_port_free(api_port):
+        checks["daemon_instance"] = {
+            "ok": False,
+            "detail": f"stopped, but api_port {api_port} is already in use on 127.0.0.1",
+        }
+    else:
+        checks["daemon_instance"] = {"ok": True, "detail": "stopped (lock free)"}
+
+    # Per-channel workspace and adapter checks
+    ext_adapter_names = {e.name for e in cfg.external_adapters}
+    ch_issues: list[str] = []
+    for ch in cfg.channels:
+        if not ch.enabled or ch.adapter == "owner_direct":
+            continue
+        ch_ws = Path(ch.workspace_dir).expanduser() if ch.workspace_dir else ws
+        if not ch_ws.is_dir():
+            ch_issues.append(f"{ch.id}: missing workspace {ch_ws}")
+        if ch.adapter not in _NATIVE_ADAPTER_NAMES and ch.adapter != "simulator" and ch.adapter not in ext_adapter_names:
+            ch_issues.append(f"{ch.id}: unknown adapter {ch.adapter!r}")
+    checks["channel_workspaces"] = {
+        "ok": not ch_issues,
+        "detail": "; ".join(ch_issues) if ch_issues else f"{len(cfg.channels)} channel(s) valid",
+    }
 
     # Agent CLI backend (+ optional backup backend)
     checks["backend"] = _check_backend_binary(cfg.backend.preset, cfg, is_primary=True)
@@ -744,10 +948,24 @@ def run_doctor(cfg_path: Path | str | None = None, *, live: bool = False) -> dic
                 )
                 uname = str(bot_info.get("username") or "").strip()
                 tg_detail = f"configured (@{uname}, API reachable)" if uname else "configured (API reachable)"
+                try:
+                    wh_info = _run_async_in_sync(
+                        get_webhook_info(
+                            cfg.telegram.bot_token,
+                            base_url=cfg.telegram.base_url,
+                            proxy_url=cfg.telegram.proxy_url,
+                        )
+                    )
+                    wh_url = str(wh_info.get("url") or "").strip()
+                    if wh_url:
+                        tg_ok = False
+                        tg_detail = f"active Telegram webhook conflicts with getUpdates ({wh_url}); call deleteWebhook first"
+                except Exception:
+                    pass
             except Exception as exc:
                 tg_ok = False
                 tg_detail = (
-                    f"configured locally, but Telegram API unreachable ({exc}); "
+                    f"configured locally, but Telegram API unreachable ({redact_secrets(str(exc))}); "
                     "check network/Clash TUN or telegram.proxy_url"
                 )
         checks["telegram"] = {

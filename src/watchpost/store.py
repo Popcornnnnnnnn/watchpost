@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -226,14 +227,43 @@ def _row_to_thread(row: sqlite3.Row) -> ThreadRecord:
 class WatchpostStore:
     """Thread-safe SQLite WAL persistence backend."""
 
+    CURRENT_SCHEMA_VERSION = 2
+
     def __init__(self, db_path: Path | str) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = Path(db_path).expanduser()
+        parent = self.db_path.parent
+        parent_existed = parent.exists()
+        parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix" and not parent_existed:
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
-            cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
-            if "workspace_dir" not in cols:
-                conn.execute("ALTER TABLE channels ADD COLUMN workspace_dir TEXT NOT NULL DEFAULT ''")
+            ver = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+            if ver < 1:
+                cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
+                if "workspace_dir" not in cols:
+                    conn.execute("ALTER TABLE channels ADD COLUMN workspace_dir TEXT NOT NULL DEFAULT ''")
+                conn.execute("PRAGMA user_version = 1")
+            if ver < 2:
+                conn.execute("PRAGMA user_version = 2")
+        self._tighten_db_permissions()
+
+    def _tighten_db_permissions(self) -> None:
+        if os.name != "posix":
+            return
+        for candidate in (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        ):
+            if candidate.exists():
+                try:
+                    os.chmod(candidate, 0o600)
+                except OSError:
+                    pass
 
     @contextlib.contextmanager
     def _connect(self):

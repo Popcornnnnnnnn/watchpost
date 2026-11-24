@@ -80,7 +80,16 @@ def test_codex_jsonl_parsing_and_readonly_sandbox_flag() -> None:
             assert res.needs_attention == ""
 
             steer_res = await cli.steer_thread(ref, "Test", "go", cwd=Path("."), channel=ch)
-            assert captured_cmds[1][:6] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check", ref]
+            assert captured_cmds[1][:8] == [
+                "codex",
+                "exec",
+                "resume",
+                "-c",
+                'sandbox_mode="read-only"',
+                "--json",
+                "--skip-git-repo-check",
+                ref,
+            ]
             assert "已按批准方案完成调整" in steer_res.summary_bubbles[0]
 
     asyncio.run(_run())
