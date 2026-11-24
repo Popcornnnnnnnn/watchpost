@@ -60,6 +60,7 @@ class TelegramConfig(BaseModel):
     owner_user_id: str = ""
     base_url: str = "https://api.telegram.org"
     poll_timeout_s: int = 0
+    proxy_url: str = ""
 
 
 class SlackConfig(BaseModel):
@@ -171,6 +172,9 @@ class WatchpostConfig(BaseModel):
     db_path: str = DEFAULT_DB_PATH
     media_dir: str = DEFAULT_MEDIA_DIR
     workspace_dir: str = "."
+    personal_workspace_dir: str = ""
+    personal_session_ttl_s: int = 0
+    ack_on_receive: bool | None = None
     language: str = "zh"
     poll_interval_s: float = 10.0
     owner_poll_interval_s: float = 3.0
@@ -347,6 +351,9 @@ def resolve_config(cfg: WatchpostConfig, *, env: Mapping[str, str] | None = None
             "db_path": str(Path(resolved.db_path).expanduser()),
             "media_dir": str(Path(resolved.media_dir).expanduser()),
             "workspace_dir": str(Path(resolved.workspace_dir).expanduser()),
+            "personal_workspace_dir": str(Path(resolved.personal_workspace_dir).expanduser())
+            if resolved.personal_workspace_dir
+            else "",
             "feishu": resolved.feishu.model_copy(update=feishu_updates) if feishu_updates else resolved.feishu,
             "telegram": resolved.telegram.model_copy(update=tg_updates) if tg_updates else resolved.telegram,
             "slack": resolved.slack.model_copy(update=slack_updates) if slack_updates else resolved.slack,

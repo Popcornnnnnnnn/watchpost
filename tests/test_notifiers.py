@@ -198,3 +198,187 @@ def test_imessage_notifier_backlog_echo_and_attributed_body() -> None:
             assert actions[0].reply_token == "g-out-1"
 
         asyncio.run(_run())
+
+
+def test_telegram_notifier_media_buttons_typing_commands_and_persistent_offset() -> None:
+    import json
+    from watchpost.store import WatchpostStore
+
+    seen_endpoints: list[str] = []
+    sent_json: list[dict] = []
+    photo_uploads: list[bytes] = []
+    callbacks_answered: list[dict] = []
+    markups_cleared: list[dict] = []
+    typing_calls: list[dict] = []
+    commands_calls: list[dict] = []
+    poll_offsets: list[str | None] = []
+    updates_queue: list[list[dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        seen_endpoints.append(path)
+        if path.endswith("/sendMessage"):
+            body = json.loads(request.content.decode("utf-8"))
+            sent_json.append(body)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 300 + len(sent_json)}})
+        if path.endswith("/sendPhoto"):
+            photo_uploads.append(request.content)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 400 + len(photo_uploads)}})
+        if path.endswith("/sendChatAction"):
+            typing_calls.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/setMyCommands"):
+            commands_calls.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/answerCallbackQuery"):
+            callbacks_answered.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/editMessageReplyMarkup"):
+            markups_cleared.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/getUpdates"):
+            poll_offsets.append(request.url.params.get("offset"))
+            batch = updates_queue.pop(0) if updates_queue else []
+            return httpx.Response(200, json={"ok": True, "result": batch})
+        if path.endswith("/getFile"):
+            fid = request.url.params.get("file_id", "")
+            mapping = {
+                "f_photo_lg": "photos/snap.jpg",
+                "f_voice_1": "voice/note.ogg",
+                "f_doc_1": "docs/trace.log",
+            }
+            return httpx.Response(200, json={"ok": True, "result": {"file_path": mapping.get(fid, "other/raw.bin")}})
+        if "/file/bot" in path:
+            return httpx.Response(200, content=b"FILEBYTES-" + path.encode("utf-8"))
+        return httpx.Response(404)
+
+    async def _run() -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = root / "bay2.png"
+            img.write_bytes(b"\x89PNG\r\n\x1a\nFAKEPNG")
+            store = WatchpostStore(root / "wp.db")
+            cfg = TelegramConfig(enabled=True, bot_token="tok_full", owner_chat_id="777")
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+            ntf = TelegramNotifier(cfg, store=store, media_dir=root / "media", language="zh", client=client)
+
+            # 1. Seed backlog on cold start without returning owner actions
+            updates_queue.append(
+                [
+                    {
+                        "update_id": 50,
+                        "message": {"message_id": 1, "chat": {"id": 777, "type": "private"}, "from": {"is_bot": False}, "text": "stale"},
+                    }
+                ]
+            )
+            assert await ntf.seed_offset() == 1
+            assert store.get_kv("telegram_owner_update_offset") == 51
+
+            # 2. Commands + typing
+            assert await ntf.register_commands() is True
+            assert len(commands_calls[0]["commands"]) == 8
+            assert commands_calls[0]["commands"][0]["command"] == "status"
+            await ntf.send_typing()
+            assert typing_calls[-1] == {"chat_id": "777", "action": "typing"}
+
+            # 3. Start with image attachment sends text + photo
+            ch = ChannelConfig(id="ch_ops", adapter="feishu", external_chat_id="oc_ops", name="Ops")
+            th_go = ThreadRecord(
+                id="th_go_1",
+                channel_id="ch_ops",
+                backend="mock",
+                backend_thread_ref="r1",
+                title="Bay 2",
+                pending_go=True,
+            )
+            start_ids = await ntf.notify_start(ch, th_go, "Bay 2 screenshot", attachments=[str(img)])
+            assert start_ids == ["301", "401"]
+            assert len(photo_uploads) == 1
+
+            # 4. Completion attaches inline keyboard only to last bubble when pending_go=True
+            done_ids = await ntf.notify_completion(ch, th_go, ["Summary part", "Needs confirmation"])
+            assert done_ids == ["302", "303"]
+            assert "reply_markup" not in sent_json[1]
+            kb = sent_json[2]["reply_markup"]["inline_keyboard"][0]
+            assert kb[0]["callback_data"] == "wp:go:th_go_1"
+            assert kb[1]["callback_data"] == "wp:skip:th_go_1"
+
+            # 5. Restarted TelegramNotifier resumes from persisted offset 51
+            ntf2 = TelegramNotifier(cfg, store=store, media_dir=root / "media", language="zh", client=client)
+            updates_queue.append(
+                [
+                    {
+                        "update_id": 51,
+                        "callback_query": {
+                            "id": "cb_stranger",
+                            "from": {"is_bot": False},
+                            "data": "wp:go:th_go_1",
+                            "message": {"message_id": 303, "chat": {"id": 999}},
+                        },
+                    },
+                    {
+                        "update_id": 52,
+                        "callback_query": {
+                            "id": "cb_owner",
+                            "from": {"is_bot": False},
+                            "data": "wp:go:th_go_1",
+                            "message": {"message_id": 303, "chat": {"id": 777}},
+                        },
+                    },
+                    {
+                        "update_id": 53,
+                        "message": {
+                            "message_id": 801,
+                            "chat": {"id": 777, "type": "private"},
+                            "from": {"is_bot": False},
+                            "caption": "Inspect this log & photo",
+                            "photo": [
+                                {"file_id": "f_photo_sm", "file_size": 100},
+                                {"file_id": "f_photo_lg", "file_size": 2048},
+                            ],
+                        },
+                    },
+                    {
+                        "update_id": 54,
+                        "message": {
+                            "message_id": 802,
+                            "chat": {"id": 777, "type": "private"},
+                            "from": {"is_bot": False},
+                            "voice": {"file_id": "f_voice_1", "file_size": 512},
+                        },
+                    },
+                    {
+                        "update_id": 55,
+                        "message": {
+                            "message_id": 803,
+                            "chat": {"id": 777, "type": "private"},
+                            "from": {"is_bot": False},
+                            "document": {"file_id": "f_doc_1", "file_name": "trace.log", "mime_type": "text/plain"},
+                        },
+                    },
+                ]
+            )
+            actions = await ntf2.poll_owner_actions()
+            assert poll_offsets[-1] == "51"
+            assert store.get_kv("telegram_owner_update_offset") == 56
+            assert len(actions) == 4
+            assert actions[0].kind == "approve_go" and actions[0].thread_id == "th_go_1"
+            assert callbacks_answered == [{"callback_query_id": "cb_owner", "text": "已批准执行"}]
+            assert markups_cleared[0]["reply_markup"] == {"inline_keyboard": []}
+
+            assert actions[1].kind == "steer" and actions[1].text == "Inspect this log & photo"
+            assert actions[1].attachments[0]["is_audio"] == "false"
+            assert Path(actions[1].attachments[0]["path"]).is_file()
+
+            assert actions[2].kind == "steer" and actions[2].text == ""
+            assert actions[2].attachments[0]["is_audio"] == "true"
+            assert Path(actions[2].attachments[0]["path"]).is_file()
+
+            assert actions[3].kind == "steer"
+            assert actions[3].attachments[0]["name"] == "trace.log"
+            assert actions[3].attachments[0]["is_audio"] == "false"
+
+            await client.aclose()
+
+    asyncio.run(_run())

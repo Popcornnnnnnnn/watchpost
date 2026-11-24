@@ -65,6 +65,9 @@ class TelegramUpdateHub:
         *,
         base_url: str = "https://api.telegram.org",
         poll_timeout_s: int = 0,
+        proxy_url: str = "",
+        store: Any = None,
+        offset_kv_key: str = "telegram_update_offset",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._token = bot_token.strip()
@@ -72,11 +75,16 @@ class TelegramUpdateHub:
         self._api_url = f"{self._base_url}/bot{self._token}"
         self._file_base = f"{self._base_url}/file/bot{self._token}"
         self._poll_timeout_s = max(0, int(poll_timeout_s))
+        self._proxy_url = proxy_url.strip()
+        self._store = store
+        self._offset_kv_key = offset_kv_key.strip() or "telegram_update_offset"
         self._external_client = client
         self._owned_client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()
-        self._offset: int | None = None
+        saved_off = self._store.get_kv(self._offset_kv_key) if self._store is not None else None
+        self._offset: int | None = int(saved_off) if isinstance(saved_off, int) and saved_off > 0 else None
         self._owner_queues: dict[str, deque[dict[str, Any]]] = {}
+        self._owner_callbacks: dict[str, deque[dict[str, Any]]] = {}
         self._chat_messages: dict[str, list[dict[str, Any]]] = {}
         self._seen_msg_ids: dict[str, set[str]] = {}
         self._known_chats: dict[str, dict[str, str]] = {}
@@ -93,13 +101,20 @@ class TelegramUpdateHub:
         if self._external_client is not None:
             return self._external_client
         if self._owned_client is None:
-            self._owned_client = httpx.AsyncClient(timeout=max(15.0, float(self._poll_timeout_s) + 10.0))
+            self._owned_client = httpx.AsyncClient(
+                timeout=max(15.0, float(self._poll_timeout_s) + 10.0),
+                proxy=self._proxy_url or None,
+            )
         return self._owned_client
 
     async def aclose(self) -> None:
         if self._owned_client is not None:
             await self._owned_client.aclose()
             self._owned_client = None
+
+    def _persist_offset(self) -> None:
+        if self._store is not None and self._offset is not None:
+            self._store.set_kv(self._offset_kv_key, int(self._offset))
 
     def _record_message(self, msg: dict[str, Any]) -> None:
         chat = msg.get("chat") or {}
@@ -133,13 +148,49 @@ class TelegramUpdateHub:
             self._owner_queues[cid] = queue
         queue.append(msg)
 
+    def _record_callback_query(self, cb: dict[str, Any]) -> None:
+        msg = cb.get("message") or {}
+        cid = str((msg.get("chat") or {}).get("id") or "").strip()
+        if not cid:
+            return
+        queue = self._owner_callbacks.get(cid)
+        if queue is None:
+            queue = deque(maxlen=200)
+            self._owner_callbacks[cid] = queue
+        queue.append(cb)
+
+    async def seed_offset(self) -> int:
+        """Advance past pending backlog updates on first boot without queuing them."""
+        if not self._token or self._offset is not None:
+            return 0
+        async with self._lock:
+            if self._offset is not None:
+                return 0
+            resp = await self._client().get(
+                f"{self._api_url}/getUpdates",
+                params={"timeout": 0, "allowed_updates": '["message","callback_query"]'},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, dict) or not payload.get("ok"):
+                return 0
+            results = payload.get("result") or []
+            max_id = max(
+                (upd["update_id"] for upd in results if isinstance(upd.get("update_id"), int)),
+                default=None,
+            )
+            if max_id is not None:
+                self._offset = max_id + 1
+                self._persist_offset()
+            return len(results)
+
     async def sync(self) -> int:
         if not self._token:
             return 0
         async with self._lock:
             params: dict[str, Any] = {
                 "timeout": self._poll_timeout_s,
-                "allowed_updates": '["message"]',
+                "allowed_updates": '["message","callback_query"]',
             }
             if self._offset is not None:
                 params["offset"] = self._offset
@@ -148,6 +199,7 @@ class TelegramUpdateHub:
             payload = resp.json()
             if not isinstance(payload, dict) or not payload.get("ok"):
                 raise RuntimeError(f"Telegram getUpdates failed: {payload}")
+            prev_offset = self._offset
             count = 0
             for upd in payload.get("result") or []:
                 upd_id = upd.get("update_id")
@@ -157,11 +209,26 @@ class TelegramUpdateHub:
                 if isinstance(msg, dict) and msg:
                     self._record_message(msg)
                     count += 1
+                cb = upd.get("callback_query") or {}
+                if isinstance(cb, dict) and cb:
+                    self._record_callback_query(cb)
+                    count += 1
+            if self._offset != prev_offset:
+                self._persist_offset()
             return count
 
     async def poll_owner_messages(self, owner_chat_id: str) -> list[dict[str, Any]]:
         await self.sync()
         queue = self._owner_queues.get(owner_chat_id.strip())
+        if not queue:
+            return []
+        drained = list(queue)
+        queue.clear()
+        return drained
+
+    async def poll_owner_callbacks(self, owner_chat_id: str) -> list[dict[str, Any]]:
+        await self.sync()
+        queue = self._owner_callbacks.get(owner_chat_id.strip())
         if not queue:
             return []
         drained = list(queue)
@@ -224,6 +291,7 @@ class TelegramInboundAdapter:
             effective_token,
             base_url=config.base_url,
             poll_timeout_s=config.poll_timeout_s,
+            proxy_url=getattr(config, "proxy_url", ""),
             client=client,
         )
 

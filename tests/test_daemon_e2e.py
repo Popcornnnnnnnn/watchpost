@@ -11,7 +11,7 @@ import httpx
 
 from watchpost.config import BackendConfig, FeishuConfig, TelegramConfig, WatchpostConfig
 from watchpost.daemon import WatchpostDaemon, build_engine_from_config
-from watchpost.models import ChannelConfig, ChatType, ThreadStatus, TriageMode, TriggerMode
+from watchpost.models import ChannelConfig, ChatType, ThreadRecord, ThreadStatus, TriageMode, TriggerMode
 
 
 def test_daemon_feishu_to_telegram_to_owner_go_end_to_end() -> None:
@@ -170,6 +170,116 @@ def test_daemon_feishu_to_telegram_to_owner_go_end_to_end() -> None:
             stop_ev.set()
             await daemon.run_forever(stop_event=stop_ev, seed_on_start=False)
             await f_client.aclose()
+            await t_client.aclose()
+
+    asyncio.run(_run())
+
+
+def test_daemon_telegram_top_level_personal_direct_typing_and_button_skip() -> None:
+    tg_sent: list[dict] = []
+    tg_typing: list[dict] = []
+    tg_commands: list[dict] = []
+    tg_updates: list[list[dict]] = []
+
+    def tg_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/sendMessage"):
+            body = json.loads(request.content.decode("utf-8"))
+            tg_sent.append(body)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 500 + len(tg_sent)}})
+        if path.endswith("/sendChatAction"):
+            tg_typing.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/setMyCommands"):
+            tg_commands.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/answerCallbackQuery") or path.endswith("/editMessageReplyMarkup"):
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/getUpdates"):
+            batch = tg_updates.pop(0) if tg_updates else []
+            return httpx.Response(200, json={"ok": True, "result": batch})
+        return httpx.Response(404)
+
+    async def _run() -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = WatchpostConfig(
+                db_path=str(root / "wp.db"),
+                media_dir=str(root / "media"),
+                workspace_dir=str(root),
+                personal_workspace_dir=str(root),
+                personal_session_ttl_s=3600,
+                ack_on_receive=False,
+                language="en",
+                backend=BackendConfig(preset="mock"),
+                telegram=TelegramConfig(enabled=True, bot_token="tg_tok", owner_chat_id="888"),
+            )
+            t_client = httpx.AsyncClient(transport=httpx.MockTransport(tg_handler))
+            engine = build_engine_from_config(cfg, telegram_client=t_client)
+            daemon = WatchpostDaemon(engine, cfg)
+
+            # Seed backlog + register_commands via seed_on_start=True
+            tg_updates.append(
+                [
+                    {
+                        "update_id": 90,
+                        "message": {"message_id": 10, "chat": {"id": 888, "type": "private"}, "from": {"is_bot": False}, "text": "old message"},
+                    }
+                ]
+            )
+            stop_ev = asyncio.Event()
+            stop_ev.set()
+            await daemon.run_forever(stop_event=stop_ev, seed_on_start=True)
+            assert len(tg_commands) == 1
+            assert engine.store.get_kv("telegram_owner_update_offset") == 91
+
+            # Plain Telegram text routes into Personal Direct Chat using top-level personal_workspace_dir
+            tg_updates.append(
+                [
+                    {
+                        "update_id": 91,
+                        "message": {"message_id": 11, "chat": {"id": 888, "type": "private"}, "from": {"is_bot": False}, "text": "check status of tests"},
+                    }
+                ]
+            )
+            assert await engine.poll_owner_actions_once() == 1
+            personal_th = engine.store.list_threads()[0]
+            assert personal_th.channel_id == "personal_direct"
+            assert personal_th.sender_id == "telegram"
+            assert tg_typing  # sendChatAction typing triggered during turn
+            assert any("Summary" in m["text"] or "OK" in m["text"] or len(m["text"]) > 0 for m in tg_sent)
+
+            # Inline skip button callback clears pending_go via Telegram callback_query
+            ch_ops = ChannelConfig(id="ch_ops", adapter="simulator", external_chat_id="x1", name="Ops")
+            engine.store.upsert_channel(ch_ops)
+            th_wait = ThreadRecord(
+                id="th_skip_1",
+                channel_id="ch_ops",
+                backend="mock",
+                backend_thread_ref="r_skip",
+                title="Bay 3",
+                status=ThreadStatus.awaiting_go,
+                pending_go=True,
+            )
+            engine.store.create_or_update_thread(th_wait)
+            tg_updates.append(
+                [
+                    {
+                        "update_id": 92,
+                        "callback_query": {
+                            "id": "cb_skip_1",
+                            "from": {"is_bot": False},
+                            "data": "wp:skip:th_skip_1",
+                            "message": {"message_id": 505, "chat": {"id": 888}},
+                        },
+                    }
+                ]
+            )
+            assert await engine.poll_owner_actions_once() == 1
+            skipped = engine.store.get_thread("th_skip_1")
+            assert skipped is not None and skipped.pending_go is False
+            assert skipped.status == ThreadStatus.completed
+
             await t_client.aclose()
 
     asyncio.run(_run())

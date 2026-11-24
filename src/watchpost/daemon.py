@@ -175,6 +175,8 @@ def _register_configured_platforms(
                 inbound_tok,
                 base_url=tg_base,
                 poll_timeout_s=cfg.telegram.poll_timeout_s,
+                proxy_url=cfg.telegram.proxy_url,
+                store=engine.store,
                 client=telegram_client,
             )
 
@@ -193,6 +195,9 @@ def _register_configured_platforms(
             TelegramNotifier(
                 cfg.telegram,
                 hub=reused_hub if same_tg_token else None,
+                store=engine.store,
+                media_dir=Path(cfg.media_dir).expanduser(),
+                language=cfg.language,
                 client=telegram_client,
             )
         )
@@ -233,6 +238,19 @@ def _register_configured_platforms(
             engine.register_notifier(ExternalCommandNotifier(ext_ntf))
 
     return reused_hub
+
+
+def _resolve_personal_settings(cfg: WatchpostConfig) -> tuple[Path | None, int, bool]:
+    """Resolve personal direct chat settings from top-level config with imessage fallback."""
+    raw_ws = (cfg.personal_workspace_dir or cfg.imessage.personal_workspace_dir or "").strip()
+    personal_ws = Path(raw_ws).expanduser() if raw_ws else None
+    ttl_s = (
+        int(cfg.personal_session_ttl_s)
+        if int(cfg.personal_session_ttl_s or 0) > 0
+        else int(cfg.imessage.personal_session_ttl_s)
+    )
+    ack = cfg.ack_on_receive if cfg.ack_on_receive is not None else bool(cfg.imessage.ack_on_receive)
+    return personal_ws, ttl_s, ack
 
 
 def build_engine_from_config(
@@ -279,11 +297,7 @@ def build_engine_from_config(
     else:
         backend = primary
 
-    personal_ws = (
-        Path(cfg.imessage.personal_workspace_dir).expanduser()
-        if cfg.imessage.personal_workspace_dir
-        else None
-    )
+    personal_ws, personal_ttl_s, ack_on_receive = _resolve_personal_settings(cfg)
     engine = WatchpostEngine(
         store,
         backend,
@@ -293,8 +307,8 @@ def build_engine_from_config(
             debounce_s=cfg.debounce_s,
             max_debounce_s=cfg.max_debounce_s,
             personal_workspace_dir=personal_ws,
-            personal_session_ttl_s=cfg.imessage.personal_session_ttl_s,
-            ack_on_receive=cfg.imessage.ack_on_receive,
+            personal_session_ttl_s=personal_ttl_s,
+            ack_on_receive=ack_on_receive,
             quiet_hours=cfg.quiet_hours,
             cross_channel_window_s=cfg.cross_channel_window_s,
             cross_channel_max_items=cfg.cross_channel_max_items,
@@ -347,11 +361,7 @@ class WatchpostDaemon:
                     f"Watchpost config path unavailable for reload: {self.config_path}"
                 )
             new_cfg = load_config(self.config_path)
-            personal_ws = (
-                Path(new_cfg.imessage.personal_workspace_dir).expanduser()
-                if new_cfg.imessage.personal_workspace_dir
-                else None
-            )
+            personal_ws, personal_ttl_s, ack_on_receive = _resolve_personal_settings(new_cfg)
             self.engine.config = EngineConfig(
                 workspace_dir=Path(new_cfg.workspace_dir).expanduser(),
                 language=new_cfg.language,
@@ -359,8 +369,8 @@ class WatchpostDaemon:
                 max_debounce_s=new_cfg.max_debounce_s,
                 media_retention_days=self.engine.config.media_retention_days,
                 personal_workspace_dir=personal_ws,
-                personal_session_ttl_s=new_cfg.imessage.personal_session_ttl_s,
-                ack_on_receive=new_cfg.imessage.ack_on_receive,
+                personal_session_ttl_s=personal_ttl_s,
+                ack_on_receive=ack_on_receive,
                 quiet_hours=new_cfg.quiet_hours,
                 cross_channel_window_s=new_cfg.cross_channel_window_s,
                 cross_channel_max_items=new_cfg.cross_channel_max_items,
@@ -479,6 +489,19 @@ class WatchpostDaemon:
             logger.warning("Recovered %d orphaned active thread(s) on startup", recovered)
         if seed_on_start:
             await self.engine.poll_all_channels(seed_if_empty=True, debounced=False)
+            for ntf in self.engine.notifiers:
+                seed_fn = getattr(ntf, "seed_offset", None)
+                if callable(seed_fn):
+                    try:
+                        await seed_fn()
+                    except Exception as exc:
+                        logger.warning("Notifier %s seed_offset failed: %s", getattr(ntf, "name", "?"), exc)
+                reg_fn = getattr(ntf, "register_commands", None)
+                if callable(reg_fn):
+                    try:
+                        await reg_fn()
+                    except Exception as exc:
+                        logger.warning("Notifier %s register_commands failed: %s", getattr(ntf, "name", "?"), exc)
         logger.info(
             "Watchpost daemon started (backend=%s, channels=%d, api_port=%d)",
             self.engine.backend.name,

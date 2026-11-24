@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from watchpost.adapters.simulator import SimulatorAdapter, default_demo_channels
 from watchpost.bubbles import format_completion_bubbles, strip_markdown
@@ -111,6 +113,44 @@ class WatchpostEngine:
             except Exception as exc:
                 logger.warning("Notifier %s notify_start failed: %s", ntf.name, exc)
         return pairs
+
+    @asynccontextmanager
+    async def _typing_indicator(self, *, enabled: bool = True) -> AsyncIterator[None]:
+        if not enabled:
+            yield
+            return
+        targets = [ntf for ntf in self.notifiers if callable(getattr(ntf, "send_typing", None))]
+        if not targets:
+            yield
+            return
+
+        async def _ping_once() -> None:
+            for ntf in targets:
+                try:
+                    await ntf.send_typing()
+                except Exception:
+                    pass
+
+        await _ping_once()
+        stop_ev = asyncio.Event()
+
+        async def _loop() -> None:
+            while not stop_ev.is_set():
+                try:
+                    await asyncio.wait_for(stop_ev.wait(), timeout=4.5)
+                    break
+                except asyncio.TimeoutError:
+                    await _ping_once()
+
+        task = asyncio.create_task(_loop())
+        try:
+            yield
+        finally:
+            stop_ev.set()
+            try:
+                await task
+            except Exception:
+                pass
 
     _MEDIA_ONLY_TEXT_RE = re.compile(
         r"^(?:\[(?:Image|Voice|Audio|File|Media|Video|Sticker|图片|语音|文件|Recalled)(?:\s*:[^\]]*)?\])$",
@@ -677,49 +717,50 @@ class WatchpostEngine:
 
         target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
         try:
-            if matched_thread is not None:
-                steer_msg = build_steer_prompt(
-                    channel,
-                    recent_messages,
-                    batch,
-                    group_context=group_ctx,
-                    language=self.config.language,
-                )
-                result = await self.backend.steer_thread(
-                    matched_thread.backend_thread_ref,
-                    title,
-                    steer_msg,
-                    cwd=target_cwd,
-                    channel=channel,
-                )
-                backend_ref = matched_thread.backend_thread_ref
-            else:
-                cross_memory = (
-                    self.store.get_recent_cross_channel_context(
-                        exclude_channel_id=channel.id,
-                        workspace_dir=str(target_cwd),
-                        window_s=self.config.cross_channel_window_s,
-                        limit=self.config.cross_channel_max_items,
-                        now_ts=now_ts,
+            async with self._typing_indicator(enabled=not suppress_notify):
+                if matched_thread is not None:
+                    steer_msg = build_steer_prompt(
+                        channel,
+                        recent_messages,
+                        batch,
+                        group_context=group_ctx,
+                        language=self.config.language,
                     )
-                    if self.config.cross_channel_window_s > 0 and self.config.cross_channel_max_items > 0
-                    else []
-                )
-                prompt = build_new_thread_prompt(
-                    channel,
-                    channel.persona_text,
-                    recent_messages,
-                    batch,
-                    group_context=group_ctx,
-                    cross_channel_memory=cross_memory,
-                    language=self.config.language,
-                )
-                backend_ref, result = await self.backend.start_thread(
-                    title,
-                    prompt,
-                    cwd=target_cwd,
-                    channel=channel,
-                )
+                    result = await self.backend.steer_thread(
+                        matched_thread.backend_thread_ref,
+                        title,
+                        steer_msg,
+                        cwd=target_cwd,
+                        channel=channel,
+                    )
+                    backend_ref = matched_thread.backend_thread_ref
+                else:
+                    cross_memory = (
+                        self.store.get_recent_cross_channel_context(
+                            exclude_channel_id=channel.id,
+                            workspace_dir=str(target_cwd),
+                            window_s=self.config.cross_channel_window_s,
+                            limit=self.config.cross_channel_max_items,
+                            now_ts=now_ts,
+                        )
+                        if self.config.cross_channel_window_s > 0 and self.config.cross_channel_max_items > 0
+                        else []
+                    )
+                    prompt = build_new_thread_prompt(
+                        channel,
+                        channel.persona_text,
+                        recent_messages,
+                        batch,
+                        group_context=group_ctx,
+                        cross_channel_memory=cross_memory,
+                        language=self.config.language,
+                    )
+                    backend_ref, result = await self.backend.start_thread(
+                        title,
+                        prompt,
+                        cwd=target_cwd,
+                        channel=channel,
+                    )
         except Exception:
             self.store.create_or_update_thread(
                 active_record.model_copy(
@@ -823,9 +864,10 @@ class WatchpostEngine:
         is_personal = channel.adapter == "owner_direct" or channel.id == "personal_direct"
         target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
         if is_personal:
+            default_notifier = self.notifiers[0].name if self.notifiers else "imessage"
             steer_prompt = build_personal_direct_prompt(
                 owner_message,
-                notifier=thread.sender_id or "imessage",
+                notifier=thread.sender_id or default_notifier,
                 workspace_dir=target_cwd,
                 is_steer=True,
                 language=self.config.language,
@@ -842,13 +884,14 @@ class WatchpostEngine:
             thread.model_copy(update={"status": ThreadStatus.active, "updated_at": time.time()})
         )
         try:
-            result = await self.backend.steer_thread(
-                active_thread.backend_thread_ref,
-                steer_title,
-                steer_prompt,
-                cwd=target_cwd,
-                channel=channel,
-            )
+            async with self._typing_indicator():
+                result = await self.backend.steer_thread(
+                    active_thread.backend_thread_ref,
+                    steer_title,
+                    steer_prompt,
+                    cwd=target_cwd,
+                    channel=channel,
+                )
         except Exception:
             self.store.create_or_update_thread(
                 active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
@@ -995,13 +1038,14 @@ class WatchpostEngine:
                 )
             )
             try:
-                result = await self.backend.steer_thread(
-                    active_thread.backend_thread_ref,
-                    f"[direct] {ch.name}: {active_thread.title}",
-                    prompt,
-                    cwd=target_cwd,
-                    channel=ch,
-                )
+                async with self._typing_indicator():
+                    result = await self.backend.steer_thread(
+                        active_thread.backend_thread_ref,
+                        f"[direct] {ch.name}: {active_thread.title}",
+                        prompt,
+                        cwd=target_cwd,
+                        channel=ch,
+                    )
             except Exception:
                 self.store.create_or_update_thread(
                     active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
@@ -1066,12 +1110,13 @@ class WatchpostEngine:
             language=self.config.language,
         )
         try:
-            backend_ref, result = await self.backend.start_thread(
-                title,
-                prompt,
-                cwd=target_cwd,
-                channel=ch,
-            )
+            async with self._typing_indicator():
+                backend_ref, result = await self.backend.start_thread(
+                    title,
+                    prompt,
+                    cwd=target_cwd,
+                    channel=ch,
+                )
         except Exception:
             self.store.create_or_update_thread(
                 active_record.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
