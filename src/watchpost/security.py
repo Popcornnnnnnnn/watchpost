@@ -121,22 +121,22 @@ def is_allowed_local_host(host_header: str) -> bool:
 
 async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
     """Terminate a timed-out or cancelled subprocess and its process group cleanly without leaving orphans."""
-    if proc.returncode is not None:
-        return
     if os.name == "posix" and getattr(proc, "pid", None):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-    else:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+    elif proc.returncode is None:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
-    try:
-        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=1.0)
-    except BaseException:
-        pass
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=1.0)
+        except BaseException:
+            pass

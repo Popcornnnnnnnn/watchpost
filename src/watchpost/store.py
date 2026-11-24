@@ -549,6 +549,37 @@ class WatchpostStore:
             )
             return int(cur.rowcount or 0) > 0
 
+    def set_thread_status(
+        self,
+        thread_id: str,
+        *,
+        status: ThreadStatus,
+        clear_pending_go: bool = False,
+    ) -> ThreadRecord | None:
+        """Atomically update thread status (and optionally clear pending_go) without overwriting concurrent pending_go writes."""
+        now = time.time()
+        with self._connect() as conn:
+            if clear_pending_go:
+                conn.execute(
+                    """
+                    UPDATE threads
+                    SET status = ?, pending_go = 0, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status.value, now, thread_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE threads
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status.value, now, thread_id),
+                )
+            row = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
+        return _row_to_thread(row) if row else None
+
     def dismiss_all_pending_go(self) -> int:
         now = time.time()
         with self._connect() as conn:

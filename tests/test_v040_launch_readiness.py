@@ -52,7 +52,7 @@ from watchpost.models import (
 from watchpost.notifiers import classify_owner_command
 from watchpost.notifiers.telegram import TelegramNotifier, wait_for_owner_chat_id
 from watchpost.prompts import build_new_thread_prompt
-from watchpost.security import RedactingLogFilter, atomic_write_text, redact_secrets
+from watchpost.security import RedactingLogFilter, atomic_write_text, kill_process_tree, redact_secrets
 from watchpost.server import create_app, create_webhook_app
 from watchpost.setup_wizard import run_setup_wizard
 from watchpost.store import WatchpostStore
@@ -976,3 +976,94 @@ def test_pr1_telegram_hub_single_poll_for_messages_and_callbacks(tmp_path: Path)
             assert store.get_kv(hub._offset_kv_key) == 12  # noqa: SLF001
 
     asyncio.run(_run_hub_poll())
+
+
+def test_pr2_interleaved_steer_cannot_restore_go_and_orphan_descendant_killed(tmp_path: Path) -> None:
+    # 1. Ordinary steer overlapping with approved go must not resurrect pending_go=True
+    class InterleaveBackend:
+        name = "interleave"
+
+        def __init__(self) -> None:
+            self.steer_entered = asyncio.Event()
+            self.release_steer = asyncio.Event()
+            self.go_count = 0
+
+        async def start_thread(self, title: str, prompt: str, *, cwd: Path, model: str = "", channel=None):
+            del title, prompt, cwd, model, channel
+            return "r0", AgentResult(raw_text="OK")
+
+        async def steer_thread(
+            self,
+            backend_thread_ref: str,
+            title: str,
+            message: str,
+            *,
+            cwd: Path,
+            channel=None,
+            approved_go: bool = False,
+        ):
+            del backend_thread_ref, title, message, cwd, channel
+            if not approved_go:
+                self.steer_entered.set()
+                await self.release_steer.wait()
+            else:
+                self.go_count += 1
+            return AgentResult(raw_text="Summary:\nDone.\n\nSuggested Reply:\nOK.\n\nNeeds Attention:\nNone")
+
+    store = WatchpostStore(tmp_path / "interleave.db")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    be = InterleaveBackend()
+    eng = WatchpostEngine(store, be, config=EngineConfig(workspace_dir=ws, language="en"))
+    th = _seed_thread(store, ws, thread_id="th-interleave", pending_go=True)
+
+    async def _run_interleave() -> None:
+        t_steer = asyncio.create_task(eng.steer_from_owner(th.id, "check extra info", approved_go=False))
+        await be.steer_entered.wait()
+
+        # Approve while ordinary steer is waiting in backend
+        await eng.steer_from_owner(th.id, "go", approved_go=True)
+        assert store.get_thread(th.id).pending_go is False
+
+        # Finish ordinary steer — must NOT write pending_go=True back
+        be.release_steer.set()
+        await t_steer
+        assert store.get_thread(th.id).pending_go is False
+
+        with pytest.raises(ValueError, match="no pending go"):
+            await eng.steer_from_owner(th.id, "go", approved_go=True)
+        assert be.go_count == 1
+
+    asyncio.run(_run_interleave())
+
+    # 2. Exited direct parent with sleeping grandchild holding stdout pipe still gets killed cleanly
+    if os.name == "posix":
+        async def _run_orphan_kill() -> None:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import subprocess, sys; p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); print(p.pid, flush=True)",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            assert proc.stdout is not None
+            child_pid = int((await proc.stdout.readline()).decode().strip())
+            deadline = time.monotonic() + 2.0
+            while proc.returncode is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert proc.returncode == 0
+            await kill_process_tree(proc)
+
+            wait_dead = time.monotonic() + 2.0
+            alive = True
+            while time.monotonic() < wait_dead:
+                try:
+                    os.kill(child_pid, 0)
+                    await asyncio.sleep(0.05)
+                except ProcessLookupError:
+                    alive = False
+                    break
+            assert not alive
+
+        asyncio.run(_run_orphan_kill())

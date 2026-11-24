@@ -1001,8 +1001,13 @@ class WatchpostEngine:
                 language=self.config.language,
             )
             steer_title = f"[{channel.adapter}] {channel.name}: {thread.title}"
-        active_thread = self.store.create_or_update_thread(
-            thread.model_copy(update={"status": ThreadStatus.active, "updated_at": time.time()})
+        active_thread = (
+            self.store.set_thread_status(
+                thread.id,
+                status=ThreadStatus.active,
+                clear_pending_go=approved_go,
+            )
+            or thread
         )
         write_lock = bool(is_personal or approved_go or channel.autonomy_mode == AutonomyMode.auto_fix)
         try:
@@ -1017,8 +1022,10 @@ class WatchpostEngine:
                         approved_go=approved_go,
                     )
         except BaseException:
-            self.store.create_or_update_thread(
-                active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
+            self.store.set_thread_status(
+                thread.id,
+                status=ThreadStatus.error,
+                clear_pending_go=approved_go,
             )
             raise
         all_bubbles, draft_reply = format_completion_bubbles(
@@ -1029,8 +1036,13 @@ class WatchpostEngine:
             include_header=not is_personal,
         )
         next_status = ThreadStatus.error if result.error else ThreadStatus.completed
-        updated = self.store.create_or_update_thread(
-            thread.model_copy(
+        updated = (
+            self.store.set_thread_status(
+                thread.id,
+                status=next_status,
+                clear_pending_go=approved_go,
+            )
+            or thread.model_copy(
                 update={
                     "status": next_status,
                     "pending_go": False if approved_go else thread.pending_go,
