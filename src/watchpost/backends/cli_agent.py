@@ -83,6 +83,8 @@ class CLIAgentBackend:
                 AutonomyMode.diagnose_only,
             }:
                 cmd.extend(["--sandbox", "read-only"])
+            elif channel is not None and channel.autonomy_mode == AutonomyMode.auto_fix:
+                cmd.extend(["--sandbox", "workspace-write"])
         cmd.append(prompt)
         stdout, stderr, rc = await self._run(cmd, cwd=cwd)
         if rc != 0:

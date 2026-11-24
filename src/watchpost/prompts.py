@@ -89,8 +89,9 @@ Read the incoming message(s), voice transcripts, and attached images first, then
 
 ## Channel Autonomy Gate (`auto_fix`)
 1. Enter engineering mode ONLY if Mode 4 applies. Inspect attached media first.{group_note}
-2. Diagnose and fix end-to-end when safe (never restart live field workloads while an operation is active). Skip coding/restarts for Modes 1–3.
-3. **STRICTLY FORBIDDEN (Draft-Only):** Never send, reply to, or react to any external chat message yourself."""
+2. **Local code & verification allowed:** Diagnose the bug, edit code locally, and run builds/tests end-to-end. Skip coding/builds for Modes 1–3.
+3. **WAIT FOR `"go"` BEFORE DEPLOY:** Do **NOT** deploy to production/field hosts, restart live services, or alter live runtime configs without explicit owner approval (`"go"`). When a local fix is ready to deploy, state the exact deploy action needed in `Needs Attention` / `需要注意`.
+4. **STRICTLY FORBIDDEN (Draft-Only):** Never send, reply to, or react to any external chat message yourself."""
 
 
 def _output_format_block(language: str, addressee: str, *, is_group: bool) -> str:

@@ -13,7 +13,17 @@ from watchpost.backends.mock import MockAgentBackend
 from watchpost.debouncer import BurstDebouncer
 from watchpost.engine import WatchpostEngine
 from watchpost.media import LocalWhisperProcessor, clean_whisper_output
-from watchpost.models import EngineConfig, NormalizedMessage, ThreadStatus, TriageMode
+from watchpost.models import (
+    AgentResult,
+    AutonomyMode,
+    ChannelConfig,
+    ChatType,
+    EngineConfig,
+    NormalizedMessage,
+    ThreadStatus,
+    TriageMode,
+    TriggerMode,
+)
 from watchpost.store import WatchpostStore
 
 
@@ -118,3 +128,123 @@ def test_cli_agent_backend_and_whisper_cleanup() -> None:
     proc = LocalWhisperProcessor(model_path=None)
     txt, err = proc.transcribe_audio(Path("/nonexistent/audio.opus"))
     assert txt == "" and "missing" in err.lower()
+
+
+def test_auto_fix_deploy_requires_go_and_codex_sandbox_selection() -> None:
+    class _DeployGateBackend:
+        name = "stub"
+
+        async def start_thread(
+            self,
+            title: str,
+            prompt: str,
+            *,
+            cwd: Path,
+            model: str = "",
+            channel: ChannelConfig | None = None,
+        ) -> tuple[str, AgentResult]:
+            del title, prompt, cwd, model, channel
+            raw = (
+                "Summary:\nFixed parser locally and ran unit tests.\n\n"
+                "Suggested Reply:\nFixed locally; awaiting go to deploy.\n\n"
+                "Needs Attention:\nReply go to deploy to field IPC"
+            )
+            return "ref-autofix-1", AgentResult(
+                raw_text=raw,
+                suggested_reply="Fixed locally; awaiting go to deploy.",
+                needs_attention="Reply go to deploy to field IPC",
+                triage_mode=TriageMode.mode_4_bug,
+            )
+
+        async def steer_thread(
+            self,
+            backend_thread_ref: str,
+            title: str,
+            message: str,
+            *,
+            cwd: Path,
+            channel: ChannelConfig | None = None,
+        ) -> AgentResult:
+            del backend_thread_ref, title, message, cwd, channel
+            raw = "Summary:\nDeployed fix.\n\nSuggested Reply:\nDeployed.\n\nNeeds Attention:\nNone"
+            return AgentResult(raw_text=raw, suggested_reply="Deployed.", triage_mode=TriageMode.mode_4_bug)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        store = WatchpostStore(root / "wp.db")
+        ch = ChannelConfig(
+            id="feishu_autofix",
+            adapter="simulator",
+            external_chat_id="chat_1",
+            name="Field Ops",
+            chat_type=ChatType.p2p,
+            trigger_mode=TriggerMode.all,
+            autonomy_mode=AutonomyMode.auto_fix,
+        )
+        store.upsert_channel(ch)
+        engine = WatchpostEngine(
+            store,
+            _DeployGateBackend(),
+            config=EngineConfig(workspace_dir=root, language="en"),
+            adapters={"simulator": SimulatorAdapter()},
+            media_dir=root / "media",
+        )
+        msg = NormalizedMessage(
+            message_id="m_bug_1",
+            position=1,
+            sender_id="u_1",
+            sender_name="Operator",
+            create_time="10:00:00",
+            clean_text="Bay 2 fault after reboot",
+        )
+        created = asyncio.run(engine.ingest_messages(ch.id, [msg]))
+        assert len(created) == 1
+        assert created[0].pending_go is True
+        assert created[0].status == ThreadStatus.awaiting_go
+        assert store.get_metrics()["awaiting_go"] == 1
+
+        approved = asyncio.run(engine.steer_from_owner(created[0].id, "go", approved_go=True))
+        assert approved.pending_go is False
+        assert approved.status == ThreadStatus.completed
+        assert store.get_metrics()["awaiting_go"] == 0
+
+    async def _run_codex_sandbox_checks() -> None:
+        recorded_cmds: list[list[str]] = []
+
+        def _make_proc(*args: object, **_kwargs: object) -> mock.AsyncMock:
+            recorded_cmds.append([str(a) for a in args])
+            proc = mock.AsyncMock()
+            proc.returncode = 0
+            proc.communicate = mock.AsyncMock(
+                return_value=(b'{"thread_id":"th-1"}\nSummary:\nOK.\n\nSuggested Reply:\nOK.\n\nNeeds Attention:\nNone', b"")
+            )
+            return proc
+
+        auto_ch = ChannelConfig(
+            id="c_auto",
+            adapter="feishu",
+            external_chat_id="x1",
+            name="Auto",
+            autonomy_mode=AutonomyMode.auto_fix,
+        )
+        diag_ch = ChannelConfig(
+            id="c_diag",
+            adapter="feishu",
+            external_chat_id="x2",
+            name="Diag",
+            autonomy_mode=AutonomyMode.diagnose_only,
+        )
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=_make_proc):
+            codex_auto = CLIAgentBackend("codex", sandbox_mode="")
+            await codex_auto.start_thread("T1", "P1", cwd=Path("."), channel=auto_ch)
+            await codex_auto.start_thread("T2", "P2", cwd=Path("."), channel=diag_ch)
+
+            codex_pinned = CLIAgentBackend("codex", sandbox_mode="read-only")
+            await codex_pinned.start_thread("T3", "P3", cwd=Path("."), channel=auto_ch)
+
+        assert ["--sandbox", "workspace-write"] == [recorded_cmds[0][-3], recorded_cmds[0][-2]]
+        assert ["--sandbox", "read-only"] == [recorded_cmds[1][-3], recorded_cmds[1][-2]]
+        assert ["--sandbox", "read-only"] == [recorded_cmds[2][-3], recorded_cmds[2][-2]]
+
+    asyncio.run(_run_codex_sandbox_checks())

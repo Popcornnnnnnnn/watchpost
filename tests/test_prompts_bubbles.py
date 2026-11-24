@@ -91,6 +91,9 @@ def test_prompts_enforce_autonomy_gates_and_untrusted_boundary() -> None:
         assert "EXPLICIT LANGUAGE REQUEST" in prompt and "简体中文" in prompt
         assert "总结：" in prompt and "建议回复：" in prompt
         assert expected in prompt
+        if mode == AutonomyMode.auto_fix:
+            assert "Local code & verification allowed" in prompt
+            assert 'WAIT FOR `"go"` BEFORE DEPLOY' in prompt
 
     go_prompt = build_owner_steer_prompt("go ahead", approved_go=True, language="en")
     assert "APPROVED execution" in go_prompt

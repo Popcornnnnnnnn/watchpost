@@ -739,7 +739,7 @@ class WatchpostEngine:
             language=self.config.language,
         )
         pending_go = (
-            channel.autonomy_mode == AutonomyMode.diagnose_only
+            channel.autonomy_mode in {AutonomyMode.diagnose_only, AutonomyMode.auto_fix}
             and result.triage_mode == TriageMode.mode_4_bug
             and bool(result.needs_attention)
             and not result.error
