@@ -1313,3 +1313,148 @@ def test_pr4_shared_telegram_hub_defers_and_rolls_back_offset(tmp_path: Path) ->
             assert store2.get_kv(hub._offset_kv_key) == 302  # noqa: SLF001
 
     asyncio.run(_run_case_2())
+
+
+def test_pr5_shared_hub_abort_replay_parse_error_and_owner_reload(tmp_path: Path) -> None:
+    # 1. Aborting after poll_owner_events allows clean in-process replay without duplicate drop
+    seen_offsets: list[Any] = []
+
+    def replay_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getUpdates"):
+            seen_offsets.append(request.url.params.get("offset"))
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 200,
+                            "message": {"message_id": 1, "chat": {"id": 42, "type": "private"}, "from": {"is_bot": False}, "text": "/status"},
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async def _run_abort_replay() -> None:
+        store = WatchpostStore(tmp_path / "replay.db")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(replay_handler)) as client:
+            hub = TelegramUpdateHub("111:replayTok", store=store, client=client)
+            hub.register_owner_chat_id("42")
+            first = await hub.poll_owner_events("42", defer_commit=True)
+            assert len(first[0]) == 1
+            hub.abort_deferred_offset()
+            second = await hub.poll_owner_events("42", defer_commit=True)
+            assert len(second[0]) == 1
+            assert seen_offsets == [None, None]
+            hub.commit_offset()
+            assert store.get_kv(hub._offset_kv_key) == 201  # noqa: SLF001
+
+    asyncio.run(_run_abort_replay())
+
+    # 2. Failure inside _parse_owner_events rolls back hub offset so next poll replays cleanly
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    async def _run_parse_fail_rollback() -> None:
+        store = WatchpostStore(tmp_path / "parse_err.db")
+        seen: list[Any] = []
+
+        def h(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/getUpdates"):
+                seen.append(request.url.params.get("offset"))
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": [
+                            {
+                                "update_id": 400,
+                                "message": {"message_id": 9, "chat": {"id": 42, "type": "private"}, "from": {"is_bot": False}, "text": "/status"},
+                            }
+                        ],
+                    },
+                )
+            return httpx.Response(200, json={"ok": True, "result": True})
+
+        ntf_replies: list[str] = []
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as client:
+            hub = TelegramUpdateHub("222:parseTok", store=store, client=client)
+            ntf = TelegramNotifier(
+                TelegramConfig(enabled=True, bot_token="222:parseTok", owner_chat_id="42"),
+                hub=hub,
+                store=store,
+                client=client,
+            )
+            orig_parse = ntf._parse_owner_events  # noqa: SLF001
+            fail_once = True
+
+            async def _flaky_parse(msgs, cbs=None):
+                nonlocal fail_once
+                if fail_once:
+                    fail_once = False
+                    raise OSError("media dir write failed")
+                return await orig_parse(msgs, cbs)
+
+            ntf._parse_owner_events = _flaky_parse  # type: ignore[method-assign]  # noqa: SLF001
+            ntf.send_message = lambda txt: _append_async(ntf_replies, txt)  # type: ignore[method-assign]
+            eng = WatchpostEngine(store, MockAgentBackend(language="en"), config=EngineConfig(workspace_dir=ws, language="en"))
+            eng.register_notifier(ntf)
+
+            assert await eng.poll_owner_actions_once() == 0
+            assert hub._offset is None  # noqa: SLF001
+            assert hub._deferred_owner_active is False  # noqa: SLF001
+            assert store.get_kv(hub._offset_kv_key) is None  # noqa: SLF001
+
+            assert await eng.poll_owner_actions_once() == 1
+            assert seen == [None, None]
+            assert store.get_kv(hub._offset_kv_key) == 401  # noqa: SLF001
+
+    async def _append_async(dst: list[str], txt: str) -> str:
+        dst.append(txt)
+        return "1"
+
+    asyncio.run(_run_parse_fail_rollback())
+
+    # 3. Switching owner via set_owner_chat_ids clears retired owner queue so channel polls aren't stalled
+    async def _run_owner_switch() -> None:
+        store = WatchpostStore(tmp_path / "switch.db")
+        calls = 0
+
+        def sw_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            if request.url.path.endswith("/getUpdates"):
+                calls += 1
+                if calls == 1:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "ok": True,
+                            "result": [
+                                {"update_id": 500, "message": {"message_id": 1, "chat": {"id": 42, "type": "private"}, "text": "old owner msg"}},
+                            ],
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": [
+                            {"update_id": 501, "message": {"message_id": 2, "chat": {"id": -1001, "type": "group"}, "text": "group ping"}},
+                        ],
+                    },
+                )
+            return httpx.Response(200, json={"ok": True, "result": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(sw_handler)) as client:
+            hub = TelegramUpdateHub("333:switchTok", store=store, client=client)
+            hub.register_owner_chat_id("42")
+            await hub.sync(defer_commit=False)
+            assert hub._has_pending_owner_events() is True  # noqa: SLF001
+            hub.set_owner_chat_ids({"99"})
+            assert hub._has_pending_owner_events() is False  # noqa: SLF001
+            assert store.get_kv(hub._offset_kv_key) == 501  # noqa: SLF001
+            msgs = await hub.get_chat_messages("-1001")
+            assert len(msgs) == 1 and msgs[0]["text"] == "group ping"
+
+    asyncio.run(_run_owner_switch())

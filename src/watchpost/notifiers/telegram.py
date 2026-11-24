@@ -776,18 +776,23 @@ class TelegramNotifier:
             return []
 
         if self._hub is not None:
-            poll_events = getattr(self._hub, "poll_owner_events", None)
-            if callable(poll_events):
-                raw_msgs, raw_cbs = await poll_events(self._owner_chat_id, defer_commit=defer_commit)
-            else:
-                raw_msgs = await self._hub.poll_owner_messages(self._owner_chat_id, defer_commit=defer_commit)
-                poll_cbs = getattr(self._hub, "poll_owner_callbacks", None)
-                raw_cbs = (
-                    await poll_cbs(self._owner_chat_id, defer_commit=defer_commit)
-                    if callable(poll_cbs)
-                    else []
-                )
-            return await self._parse_owner_events(raw_msgs, raw_cbs)
+            try:
+                poll_events = getattr(self._hub, "poll_owner_events", None)
+                if callable(poll_events):
+                    raw_msgs, raw_cbs = await poll_events(self._owner_chat_id, defer_commit=defer_commit)
+                else:
+                    raw_msgs = await self._hub.poll_owner_messages(self._owner_chat_id, defer_commit=defer_commit)
+                    poll_cbs = getattr(self._hub, "poll_owner_callbacks", None)
+                    raw_cbs = (
+                        await poll_cbs(self._owner_chat_id, defer_commit=defer_commit)
+                        if callable(poll_cbs)
+                        else []
+                    )
+                return await self._parse_owner_events(raw_msgs, raw_cbs)
+            except BaseException:
+                if defer_commit:
+                    self.abort_deferred_offset()
+                raise
 
         now_mono = time.monotonic()
         if now_mono < self._backoff_until:
@@ -870,7 +875,12 @@ class TelegramNotifier:
                 self._pending_offset = self._offset
             else:
                 self._persist_offset()
-        return await self._parse_owner_events(raw_msgs, raw_cbs)
+        try:
+            return await self._parse_owner_events(raw_msgs, raw_cbs)
+        except BaseException:
+            if defer_commit:
+                self.abort_deferred_offset()
+            raise
 
     async def _parse_owner_events(
         self,

@@ -1649,8 +1649,22 @@ class WatchpostEngine:
                 else:
                     actions = await ntf.poll_owner_actions()
             except Exception as exc:
+                abort_fn = getattr(ntf, "abort_deferred_offset", None)
+                if callable(abort_fn):
+                    try:
+                        abort_fn()
+                    except Exception:
+                        pass
                 logger.warning("Notifier %s poll_owner_actions failed: %s", ntf.name, redact_secrets(str(exc)))
                 continue
+            except BaseException:
+                abort_fn = getattr(ntf, "abort_deferred_offset", None)
+                if callable(abort_fn):
+                    try:
+                        abort_fn()
+                    except Exception:
+                        pass
+                raise
             before_tasks = set(self._bg_tasks)
             try:
                 for action in actions:

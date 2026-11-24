@@ -448,6 +448,15 @@ class WatchpostDaemon:
                 existing_tg_hub=existing_tg_hub,
                 register_imessage=not has_live_imessage,
             )
+            if reused_hub is not None:
+                set_owners = getattr(reused_hub, "set_owner_chat_ids", None)
+                if callable(set_owners):
+                    owner_ids = (
+                        {new_cfg.telegram.owner_chat_id.strip()}
+                        if (new_cfg.telegram.enabled and new_cfg.telegram.owner_chat_id.strip())
+                        else set()
+                    )
+                    set_owners(owner_ids)
 
             for ntf in self.engine.notifiers:
                 if ntf in kept_set:

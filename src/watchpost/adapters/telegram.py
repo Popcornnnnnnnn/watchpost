@@ -103,6 +103,7 @@ class TelegramUpdateHub:
         self._pending_offset: int | None = None
         self._owner_chat_ids: set[str] = set()
         self._deferred_owner_active: bool = False
+        self._uncommitted_mids: list[tuple[str, str]] = []
         self._backoff_s = 0.0
         self._backoff_until = 0.0
         self._owner_queues: dict[str, deque[dict[str, Any]]] = {}
@@ -141,6 +142,18 @@ class TelegramUpdateHub:
         if cid:
             self._owner_chat_ids.add(cid)
 
+    def set_owner_chat_ids(self, owner_chat_ids: set[str]) -> None:
+        """Replace tracked owner chat IDs (used on hot reload so retired owners cannot stall channel polling)."""
+        cleaned = {cid.strip() for cid in owner_chat_ids if cid and cid.strip()}
+        for removed in self._owner_chat_ids - cleaned:
+            self._owner_queues.pop(removed, None)
+            self._owner_callbacks.pop(removed, None)
+        self._owner_chat_ids = cleaned
+        if not cleaned:
+            self._deferred_owner_active = False
+        if self._pending_offset is not None and not self._has_pending_owner_events():
+            self.commit_offset()
+
     def _has_pending_owner_events(self) -> bool:
         if self._deferred_owner_active:
             return True
@@ -154,6 +167,7 @@ class TelegramUpdateHub:
             self._store.set_kv(self._offset_kv_key, int(self._offset))
         self._committed_offset = self._offset
         self._pending_offset = None
+        self._uncommitted_mids.clear()
 
     def commit_offset(self) -> None:
         """Persist any deferred update cursor after downstream dispatch completes."""
@@ -163,10 +177,31 @@ class TelegramUpdateHub:
             self._persist_offset()
 
     def abort_deferred_offset(self) -> None:
-        """Revert any un-committed in-memory cursor if owner dispatch is cancelled."""
+        """Revert any un-committed cursor and unmark un-committed owner messages so retries replay them cleanly."""
         self._deferred_owner_active = False
         self._offset = self._committed_offset
         self._pending_offset = None
+        if self._uncommitted_mids:
+            aborted_by_chat: dict[str, set[str]] = {}
+            for cid, mid in self._uncommitted_mids:
+                aborted_by_chat.setdefault(cid, set()).add(mid)
+            for cid, mids in aborted_by_chat.items():
+                seen_set = self._seen_msg_ids.get(cid)
+                if seen_set is not None:
+                    seen_set.difference_update(mids)
+                bucket = self._chat_messages.get(cid)
+                if bucket:
+                    self._chat_messages[cid] = [
+                        m for m in bucket if str(m.get("message_id") or "").strip() not in mids
+                    ]
+            self._uncommitted_mids.clear()
+        for cid in self._owner_chat_ids:
+            q = self._owner_queues.get(cid)
+            if q:
+                q.clear()
+            cq = self._owner_callbacks.get(cid)
+            if cq:
+                cq.clear()
 
     def _record_message(self, msg: dict[str, Any]) -> None:
         chat = msg.get("chat") or {}
@@ -186,6 +221,7 @@ class TelegramUpdateHub:
         if mid in seen_set:
             return
         seen_set.add(mid)
+        self._uncommitted_mids.append((cid, mid))
 
         bucket = self._chat_messages.setdefault(cid, [])
         bucket.append(msg)
