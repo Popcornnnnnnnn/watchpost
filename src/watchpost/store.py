@@ -534,6 +534,21 @@ class WatchpostStore:
             updated = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
         return _row_to_thread(updated) if updated else None
 
+    def claim_pending_go(self, thread_id: str) -> bool:
+        """Atomically consume pending_go=1 so concurrent/duplicate 'go' taps execute once."""
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE threads
+                SET pending_go = 0,
+                    updated_at = ?
+                WHERE id = ? AND pending_go = 1
+                """,
+                (now, thread_id),
+            )
+            return int(cur.rowcount or 0) > 0
+
     def dismiss_all_pending_go(self) -> int:
         now = time.time()
         with self._connect() as conn:

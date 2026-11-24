@@ -291,6 +291,25 @@ class TelegramUpdateHub:
                     self._persist_offset()
             return count
 
+    async def poll_owner_events(
+        self,
+        owner_chat_id: str,
+        *,
+        defer_commit: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Synchronize once and atomically drain both owner messages and callback queries."""
+        await self.sync(defer_commit=defer_commit)
+        cid = owner_chat_id.strip()
+        m_queue = self._owner_queues.get(cid)
+        c_queue = self._owner_callbacks.get(cid)
+        msgs = list(m_queue) if m_queue else []
+        cbs = list(c_queue) if c_queue else []
+        if m_queue:
+            m_queue.clear()
+        if c_queue:
+            c_queue.clear()
+        return msgs, cbs
+
     async def poll_owner_messages(self, owner_chat_id: str, *, defer_commit: bool = False) -> list[dict[str, Any]]:
         await self.sync(defer_commit=defer_commit)
         queue = self._owner_queues.get(owner_chat_id.strip())

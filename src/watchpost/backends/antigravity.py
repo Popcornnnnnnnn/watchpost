@@ -136,7 +136,7 @@ class AntigravityBackend:
         )
         try:
             out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=self.spawn_timeout_s)
-        except asyncio.TimeoutError:
+        except BaseException:
             await kill_process_tree(proc)
             raise
         return (

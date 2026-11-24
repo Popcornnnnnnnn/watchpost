@@ -760,13 +760,17 @@ class TelegramNotifier:
             return []
 
         if self._hub is not None:
-            raw_msgs = await self._hub.poll_owner_messages(self._owner_chat_id, defer_commit=defer_commit)
-            poll_cbs = getattr(self._hub, "poll_owner_callbacks", None)
-            raw_cbs = (
-                await poll_cbs(self._owner_chat_id, defer_commit=defer_commit)
-                if callable(poll_cbs)
-                else []
-            )
+            poll_events = getattr(self._hub, "poll_owner_events", None)
+            if callable(poll_events):
+                raw_msgs, raw_cbs = await poll_events(self._owner_chat_id, defer_commit=defer_commit)
+            else:
+                raw_msgs = await self._hub.poll_owner_messages(self._owner_chat_id, defer_commit=defer_commit)
+                poll_cbs = getattr(self._hub, "poll_owner_callbacks", None)
+                raw_cbs = (
+                    await poll_cbs(self._owner_chat_id, defer_commit=defer_commit)
+                    if callable(poll_cbs)
+                    else []
+                )
             return await self._parse_owner_events(raw_msgs, raw_cbs)
 
         now_mono = time.monotonic()

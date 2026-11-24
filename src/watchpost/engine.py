@@ -71,6 +71,7 @@ class WatchpostEngine:
         self.background_owner_actions = bool(background_owner_actions)
         self._turn_semaphore = asyncio.Semaphore(max(1, int(getattr(self.config, "max_concurrent_turns", 3) or 3)))
         self._workspace_locks: dict[str, asyncio.Lock] = {}
+        self._personal_direct_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self.debouncer: BurstDebouncer[NormalizedMessage] = BurstDebouncer(
             self._on_debounced_batch,
@@ -961,12 +962,15 @@ class WatchpostEngine:
         owner_message: str,
         *,
         approved_go: bool = False,
+        _go_already_claimed: bool = False,
     ) -> ThreadRecord:
         thread = self.store.get_thread(thread_id)
         if thread is None:
             raise KeyError(f"Unknown thread: {thread_id}")
-        if approved_go and not thread.pending_go:
-            raise ValueError("Thread has no pending go approval")
+        if approved_go:
+            if not _go_already_claimed and not self.store.claim_pending_go(thread_id):
+                raise ValueError("Thread has no pending go approval")
+            thread = thread.model_copy(update={"pending_go": False})
         channel = self.store.get_channel(thread.channel_id)
         if channel is None:
             raise KeyError(f"Unknown channel: {thread.channel_id}")
@@ -1012,7 +1016,7 @@ class WatchpostEngine:
                         channel=channel,
                         approved_go=approved_go,
                     )
-        except Exception:
+        except BaseException:
             self.store.create_or_update_thread(
                 active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
             )
@@ -1113,6 +1117,20 @@ class WatchpostEngine:
         return self.store.upsert_channel(ch)
 
     async def _handle_personal_direct(
+        self,
+        action: OwnerAction,
+        owner_message: str,
+        *,
+        force_new: bool = False,
+    ) -> ThreadRecord | None:
+        async with self._personal_direct_lock:
+            return await self._handle_personal_direct_locked(
+                action,
+                owner_message,
+                force_new=force_new,
+            )
+
+    async def _handle_personal_direct_locked(
         self,
         action: OwnerAction,
         owner_message: str,
@@ -1551,7 +1569,11 @@ class WatchpostEngine:
 
         target_thread = self.store.get_thread(target_id)
         approved_go = action.kind == "approve_go"
-        if approved_go and (target_thread is None or not target_thread.pending_go):
+        if approved_go and (
+            target_thread is None
+            or not target_thread.pending_go
+            or not self.store.claim_pending_go(target_id)
+        ):
             await self._send_owner_reply(
                 action.notifier,
                 "该会话当前没有待确认执行（go）的变更。" if is_zh else "That thread has no pending go approval.",
@@ -1562,12 +1584,22 @@ class WatchpostEngine:
         steer_text = (await self._format_owner_action_message(action, channel=target_ch)) or ("go" if approved_go else "")
         if self.background_owner_actions:
             self._spawn_background(
-                self.steer_from_owner(target_id, steer_text, approved_go=approved_go),
+                self.steer_from_owner(
+                    target_id,
+                    steer_text,
+                    approved_go=approved_go,
+                    _go_already_claimed=approved_go,
+                ),
                 notifier_name=action.notifier,
                 label=target_thread.title if target_thread else target_id,
             )
             return target_thread
-        return await self.steer_from_owner(target_id, steer_text, approved_go=approved_go)
+        return await self.steer_from_owner(
+            target_id,
+            steer_text,
+            approved_go=approved_go,
+            _go_already_claimed=approved_go,
+        )
 
     async def poll_all_channels(self, *, seed_if_empty: bool = False, debounced: bool = True) -> int:
         """Poll every enabled channel whose adapter is registered; return channels polled cleanly."""

@@ -86,7 +86,16 @@ class CLIAgentBackend:
         write_allowed = self._resolve_write_allowed(channel, approved_go=approved_go)
 
         if self.name == "codex":
-            mode = self._sandbox_mode or ("workspace-write" if write_allowed else "read-only")
+            if not write_allowed:
+                mode = "read-only"
+            elif approved_go:
+                mode = (
+                    self._sandbox_mode
+                    if self._sandbox_mode in {"workspace-write", "danger-full-access"}
+                    else "workspace-write"
+                )
+            else:
+                mode = self._sandbox_mode or "workspace-write"
             if not is_steer:
                 if "--sandbox" not in out and "-s" not in out:
                     out.extend(["--sandbox", mode])
@@ -192,7 +201,7 @@ class CLIAgentBackend:
         )
         try:
             out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=self._timeout_s)
-        except asyncio.TimeoutError:
+        except BaseException:
             await kill_process_tree(proc)
             raise
         return (

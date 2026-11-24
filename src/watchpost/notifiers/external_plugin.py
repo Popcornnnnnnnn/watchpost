@@ -50,7 +50,7 @@ class ExternalCommandNotifier:
         stdin_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
             out_b, err_b = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=self._config.timeout_s)
-        except asyncio.TimeoutError:
+        except BaseException:
             await kill_process_tree(proc)
             raise
         stdout = out_b.decode("utf-8", errors="replace").strip()

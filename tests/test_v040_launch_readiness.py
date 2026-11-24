@@ -20,6 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from watchpost.adapters.dingtalk import DingTalkAdapter
+from watchpost.adapters.telegram import TelegramUpdateHub
 from watchpost.backends.cli_agent import CLIAgentBackend
 from watchpost.backends.fallback import FallbackBackend
 from watchpost.backends.mock import MockAgentBackend
@@ -759,3 +760,219 @@ def test_daemon_lock_doctor_service_wizard_and_dotenv(tmp_path: Path, monkeypatc
     # Quick sanity check for atomic_write_text helper
     test_secret = atomic_write_text(tmp_path / "sec.txt", "abc", mode=0o600)
     assert test_secret.read_text(encoding="utf-8") == "abc"
+
+
+# ---------------------------------------------------------------------------
+# 4. PR #1 Review Regression Guards (Double Go, Codex Override, Cancel Kill, Hub Poll, Direct Race)
+# ---------------------------------------------------------------------------
+
+
+def test_pr1_double_go_race_and_personal_direct_serialization(tmp_path: Path) -> None:
+    class SlowSpyBackend:
+        name = "slowspy"
+
+        def __init__(self) -> None:
+            self.starts = 0
+            self.steers = 0
+
+        async def start_thread(self, title: str, prompt: str, *, cwd: Path, model: str = "", channel=None):
+            del title, prompt, cwd, model, channel
+            self.starts += 1
+            await asyncio.sleep(0.05)
+            return f"ref-{self.starts}", AgentResult(raw_text="Started OK")
+
+        async def steer_thread(
+            self,
+            backend_thread_ref: str,
+            title: str,
+            message: str,
+            *,
+            cwd: Path,
+            channel=None,
+            approved_go: bool = False,
+        ):
+            del backend_thread_ref, title, message, cwd, channel, approved_go
+            self.steers += 1
+            await asyncio.sleep(0.05)
+            return AgentResult(raw_text="Summary:\nApplied.\n\nSuggested Reply:\nOK.\n\nNeeds Attention:\nNone")
+
+    store = WatchpostStore(tmp_path / "race.db")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    be = SlowSpyBackend()
+    ntf = _CapturingNotifier()
+    eng = WatchpostEngine(
+        store,
+        be,
+        config=EngineConfig(workspace_dir=ws, personal_workspace_dir=ws, language="en"),
+        background_owner_actions=True,
+    )
+    eng.register_notifier(ntf)
+
+    # 1. Concurrent steer_from_owner(..., approved_go=True) must run backend at most once
+    th1 = _seed_thread(store, ws, thread_id="th-race-1", pending_go=True)
+
+    async def _double_direct_go() -> None:
+        results = await asyncio.gather(
+            eng.steer_from_owner(th1.id, "go", approved_go=True),
+            eng.steer_from_owner(th1.id, "go", approved_go=True),
+            return_exceptions=True,
+        )
+        ok_count = sum(1 for r in results if isinstance(r, ThreadRecord))
+        err_count = sum(1 for r in results if isinstance(r, ValueError))
+        assert ok_count == 1 and err_count == 1
+        assert be.steers == 1
+
+    asyncio.run(_double_direct_go())
+
+    # 2. Two background approve_go actions in the same wave must run backend at most once
+    th2 = _seed_thread(store, ws, thread_id="th-race-2", pending_go=True)
+
+    async def _double_bg_go() -> None:
+        await asyncio.gather(
+            eng.handle_owner_action(OwnerAction(notifier="telegram", kind="approve_go", thread_id=th2.id, text="go")),
+            eng.handle_owner_action(OwnerAction(notifier="telegram", kind="approve_go", thread_id=th2.id, text="go")),
+        )
+        await eng.wait_background_tasks(timeout_s=2.0)
+        assert be.steers == 2  # +1 total across both double taps
+
+    asyncio.run(_double_bg_go())
+
+    # 3. Two concurrent personal direct messages share ONE active thread (1 start + 1 steer)
+    async def _concurrent_direct() -> None:
+        await asyncio.gather(
+            eng.handle_owner_action(OwnerAction(notifier="telegram", kind="steer", text="first check")),
+            eng.handle_owner_action(OwnerAction(notifier="telegram", kind="steer", text="follow-up detail")),
+        )
+        await eng.wait_background_tasks(timeout_s=2.0)
+        assert be.starts == 1
+        assert be.steers == 3  # +1 steer from second concurrent DM
+
+    asyncio.run(_concurrent_direct())
+
+
+def test_pr1_codex_override_precedence_and_cancel_kills_process_tree(tmp_path: Path) -> None:
+    ch_diag = ChannelConfig(
+        id="c1",
+        adapter="slack",
+        external_chat_id="C1",
+        name="Ops",
+        autonomy_mode=AutonomyMode.diagnose_only,
+    )
+    ch_auto = ChannelConfig(
+        id="c2",
+        adapter="slack",
+        external_chat_id="C2",
+        name="Direct",
+        autonomy_mode=AutonomyMode.auto_fix,
+    )
+
+    # Configured sandbox_mode="workspace-write" MUST NOT escalate diagnose_only turns
+    codex_ws = CLIAgentBackend("codex", sandbox_mode="workspace-write")
+    start_diag = codex_ws._apply_preset_flags(codex_ws._start_cmd, is_steer=False, channel=ch_diag, approved_go=False)  # noqa: SLF001
+    assert start_diag[-2:] == ["--sandbox", "read-only"]
+
+    # Legacy sandbox_mode="read-only" MUST NOT block an explicit approved_go=True execution turn
+    codex_ro = CLIAgentBackend("codex", sandbox_mode="read-only")
+    steer_go = codex_ro._apply_preset_flags(  # noqa: SLF001
+        ["codex", "exec", "resume", "--json", "r1"],
+        is_steer=True,
+        channel=ch_diag,
+        approved_go=True,
+    )
+    assert 'sandbox_mode="workspace-write"' in steer_go
+    # While unapproved auto_fix start pinned to read-only still respects the pin
+    start_pinned = codex_ro._apply_preset_flags(codex_ro._start_cmd, is_steer=False, channel=ch_auto, approved_go=False)  # noqa: SLF001
+    assert start_pinned[-2:] == ["--sandbox", "read-only"]
+
+    if os.name == "posix":
+        pid_file = tmp_path / "cancel_child.pid"
+        script = tmp_path / "hang.py"
+        script.write_text(
+            f"""
+import subprocess, sys, time
+from pathlib import Path
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+Path({str(pid_file)!r}).write_text(str(child.pid))
+time.sleep(30)
+""",
+            encoding="utf-8",
+        )
+        backend = CLIAgentBackend(
+            "claude_code",
+            start_cmd=[sys.executable, str(script)],
+            steer_cmd=[sys.executable, str(script)],
+            timeout_s=30.0,
+        )
+
+        async def _cancel_mid_run() -> None:
+            task = asyncio.create_task(backend.start_thread("cancel", "ignored", cwd=tmp_path))
+            deadline = time.monotonic() + 2.0
+            while not pid_file.is_file() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert pid_file.is_file()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_cancel_mid_run())
+        child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 2.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+                time.sleep(0.05)
+            except ProcessLookupError:
+                alive = False
+                break
+        assert not alive
+
+
+def test_pr1_telegram_hub_single_poll_for_messages_and_callbacks(tmp_path: Path) -> None:
+    store = WatchpostStore(tmp_path / "hub.db")
+    calls = 0
+
+    def hub_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path.endswith("/getUpdates"):
+            calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 10,
+                            "message": {"message_id": 50, "chat": {"id": 42}, "from": {"is_bot": False}, "text": "/status"},
+                        },
+                        {
+                            "update_id": 11,
+                            "callback_query": {
+                                "id": "cb-1",
+                                "data": "wp:go:th-99",
+                                "message": {"message_id": 51, "chat": {"id": 42}},
+                            },
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async def _run_hub_poll() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(hub_handler)) as client:
+            hub = TelegramUpdateHub("555:hubTok", store=store, client=client)
+            ntf = TelegramNotifier(
+                TelegramConfig(enabled=True, bot_token="555:hubTok", owner_chat_id="42"),
+                hub=hub,
+                store=store,
+                client=client,
+            )
+            actions = await ntf.poll_owner_actions(defer_commit=True)
+            assert calls == 1  # single getUpdates fetch drained both message + callback
+            assert [a.kind for a in actions] == ["approve_go", "status"]
+            assert store.get_kv(hub._offset_kv_key) is None  # noqa: SLF001
+            ntf.commit_offset()
+            assert store.get_kv(hub._offset_kv_key) == 12  # noqa: SLF001
+
+    asyncio.run(_run_hub_poll())
