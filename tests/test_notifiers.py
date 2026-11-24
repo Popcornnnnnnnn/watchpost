@@ -12,7 +12,7 @@ import httpx
 from watchpost.config import IMessageConfig, TelegramConfig
 from watchpost.models import ChannelConfig, ThreadRecord
 from watchpost.notifiers.imessage import IMessageNotifier, extract_attributed_body_text
-from watchpost.notifiers.telegram import TelegramNotifier, detect_owner_chat_id
+from watchpost.notifiers.telegram import TelegramNotifier, detect_owner_chat_id, telegram_owner_offset_key
 
 
 def test_telegram_notifier_send_auth_and_actions() -> None:
@@ -273,7 +273,7 @@ def test_telegram_notifier_media_buttons_typing_commands_and_persistent_offset()
                 ]
             )
             assert await ntf.seed_offset() == 1
-            assert store.get_kv("telegram_owner_update_offset") == 51
+            assert store.get_kv(telegram_owner_offset_key("tok_full")) == 51
 
             # 2. Commands + typing
             assert await ntf.register_commands() is True
@@ -361,7 +361,7 @@ def test_telegram_notifier_media_buttons_typing_commands_and_persistent_offset()
             )
             actions = await ntf2.poll_owner_actions()
             assert poll_offsets[-1] == "51"
-            assert store.get_kv("telegram_owner_update_offset") == 56
+            assert store.get_kv(telegram_owner_offset_key("tok_full")) == 56
             assert len(actions) == 4
             assert actions[0].kind == "approve_go" and actions[0].thread_id == "th_go_1"
             assert callbacks_answered == [{"callback_query_id": "cb_owner", "text": "已批准执行"}]
@@ -385,7 +385,6 @@ def test_telegram_notifier_media_buttons_typing_commands_and_persistent_offset()
 
 
 def test_telegram_profile_avatar_commands_and_wait_for_owner() -> None:
-    import json
     from watchpost.notifiers.telegram import (
         _COMMANDS_ZH,
         configure_bot_profile,
@@ -443,7 +442,7 @@ def test_telegram_profile_avatar_commands_and_wait_for_owner() -> None:
             assert await set_bot_profile_photo("tok_profile", default_avatar_path(), client=client) is True
             assert len(photo_bodies) == 1
             assert b"attach://avatar" in photo_bodies[0]
-            assert b"\x89PNG" in photo_bodies[0]
+            assert b"\xff\xd8\xff" in photo_bodies[0]
 
             prof = await configure_bot_profile("tok_profile", language="zh", set_avatar=True, client=client)
             assert prof == {"commands": True, "short_description": True, "description": True, "avatar": True}

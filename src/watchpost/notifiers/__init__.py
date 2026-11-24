@@ -6,7 +6,7 @@ import re
 
 from watchpost.models import OwnerAction
 
-_APPROVE_TOKENS = {"go", "approve", "执行", "改吧", "批准", "同意", "可以改", "继续执行"}
+_APPROVE_TOKENS = {"go", "approve", "执行", "改吧", "批准", "可以改", "继续执行"}
 _DISMISS_TOKENS = {"dismiss", "skip", "cancel", "忽略", "取消", "不用", "算了", "关闭go"}
 _STATUS_TOKENS = {"/status", "status", "状态"}
 _LIST_TOKENS = {"/list", "list", "列表"}
@@ -14,6 +14,8 @@ _HELP_TOKENS = {"/help", "help", "帮助"}
 _RESET_TOKENS = {"/reset"}
 _BRIEF_TOKENS = {"/brief", "brief", "早报", "简报", "汇总"}
 _UNMUTE_TOKENS = {"/unmute", "unmute", "取消静音", "解除静音"}
+_START_CMD_RE = re.compile(r"^/start(?:@[A-Za-z0-9_]+)?(?:\s+.*)?$", re.IGNORECASE)
+_SLASH_CMD_RE = re.compile(r"^/([A-Za-z][A-Za-z0-9_]{0,31})(?:@[A-Za-z0-9_]+)?(?:\s+.*)?$")
 _MUTE_CMD_RE = re.compile(r"^(?:/mute|mute|静音)(?:\s+(.+)|\s*(\d+.*))?$", re.IGNORECASE)
 
 
@@ -82,6 +84,8 @@ def classify_owner_command(
             reply_token=reply_token,
             attachments=att_list,
         )
+    elif _START_CMD_RE.fullmatch(clean):
+        kind = "start"
     elif lower == "/new" or (lower.startswith("/new") and len(clean) > 4 and clean[4].isspace()):
         return OwnerAction(
             notifier=notifier,
@@ -91,6 +95,8 @@ def classify_owner_command(
             reply_token=reply_token,
             attachments=att_list,
         )
+    elif _SLASH_CMD_RE.fullmatch(clean) and "/" not in clean[1:].split(None, 1)[0]:
+        kind = "unknown_cmd"
     else:
         indexed = _parse_indexed_command(clean)
         if indexed is not None:

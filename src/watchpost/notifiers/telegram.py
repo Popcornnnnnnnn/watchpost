@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -20,12 +21,18 @@ from watchpost.adapters.telegram import TelegramUpdateHub
 from watchpost.config import TelegramConfig
 from watchpost.models import ChannelConfig, ChatType, OwnerAction, ThreadRecord
 from watchpost.notifiers import classify_owner_command, format_start_notice
+from watchpost.security import redact_secrets
 
 logger = logging.getLogger("watchpost.notifiers.telegram")
 
 _MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_OFFSET_KV_KEY = "telegram_owner_update_offset"
+
+
+def telegram_owner_offset_key(bot_token: str) -> str:
+    """Return a bot-token-scoped kv_state key so hot-swapping bots never reuses stale offsets."""
+    digest = hashlib.sha256((bot_token or "").strip().encode("utf-8")).hexdigest()[:12]
+    return f"telegram_owner_update_offset:{digest}"
 
 _COMMANDS_ZH = [
     {"command": "status", "description": "查看运行状态与待确认列表"},
@@ -61,14 +68,20 @@ def _sanitize_media_filename(name: str, *, fallback: str, default_ext: str) -> s
 
 
 def default_avatar_path() -> Path:
-    """Return the bundled Watchpost bot avatar image path."""
-    return Path(__file__).resolve().parent.parent / "assets" / "avatar.png"
+    """Return the bundled Watchpost bot avatar image path (JPEG for Bot API profile photos)."""
+    base = Path(__file__).resolve().parent.parent / "assets"
+    jpg = base / "avatar.jpg"
+    return jpg if jpg.is_file() else (base / "avatar.png")
 
 
 def _make_http_client(proxy_url: str = "", *, timeout_s: float = 20.0) -> httpx.AsyncClient:
     """Construct an AsyncClient using direct OS/TUN routing or an explicit proxy."""
     proxy = proxy_url.strip() or None
     return httpx.AsyncClient(timeout=timeout_s, proxy=proxy, trust_env=False)
+
+
+def _raise_redacted(exc: Exception) -> RuntimeError:
+    return RuntimeError(redact_secrets(str(exc)))
 
 
 async def get_bot_info(
@@ -86,11 +99,44 @@ async def get_bot_info(
     owns_client = client is None
     http = client or _make_http_client(proxy_url, timeout_s=15.0)
     try:
-        resp = await http.get(url)
-        resp.raise_for_status()
-        payload = resp.json()
+        try:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise _raise_redacted(exc) from exc
         if not isinstance(payload, dict) or not payload.get("ok"):
-            raise RuntimeError(f"Telegram getMe failed: {payload}")
+            raise RuntimeError(redact_secrets(f"Telegram getMe failed: {payload}"))
+        result = payload.get("result")
+        return dict(result) if isinstance(result, dict) else {}
+    finally:
+        if owns_client:
+            await http.aclose()
+
+
+async def get_webhook_info(
+    bot_token: str,
+    *,
+    base_url: str = "https://api.telegram.org",
+    proxy_url: str = "",
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Inspect active Telegram Bot webhook configuration via `getWebhookInfo`."""
+    token = bot_token.strip()
+    if not token:
+        raise RuntimeError("Telegram bot_token is required")
+    url = f"{base_url.rstrip('/')}/bot{token}/getWebhookInfo"
+    owns_client = client is None
+    http = client or _make_http_client(proxy_url, timeout_s=15.0)
+    try:
+        try:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise _raise_redacted(exc) from exc
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            raise RuntimeError(redact_secrets(f"Telegram getWebhookInfo failed: {payload}"))
         result = payload.get("result")
         return dict(result) if isinstance(result, dict) else {}
     finally:
@@ -112,11 +158,14 @@ async def detect_owner_chat_id(
     owns_client = client is None
     http = client or _make_http_client(proxy_url, timeout_s=15.0)
     try:
-        resp = await http.get(url, params={"limit": 20, "timeout": 0})
-        resp.raise_for_status()
-        payload = resp.json()
+        try:
+            resp = await http.get(url, params={"limit": 20, "timeout": 0})
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise _raise_redacted(exc) from exc
         if not payload.get("ok"):
-            raise RuntimeError(f"Telegram getUpdates failed: {payload}")
+            raise RuntimeError(redact_secrets(f"Telegram getUpdates failed: {payload}"))
         seen: dict[str, dict[str, str]] = {}
         for upd in payload.get("result") or []:
             msg = upd.get("message") or upd.get("edited_message") or {}
@@ -142,6 +191,7 @@ async def detect_owner_chat_id(
 async def wait_for_owner_chat_id(
     bot_token: str,
     *,
+    expected_nonce: str = "",
     timeout_s: float = 120.0,
     poll_interval_s: float = 2.0,
     base_url: str = "https://api.telegram.org",
@@ -149,27 +199,46 @@ async def wait_for_owner_chat_id(
     client: httpx.AsyncClient | None = None,
     on_tick: Callable[[], None] | None = None,
 ) -> dict[str, str] | None:
-    """Poll `getUpdates` until the owner messages or presses Start in private chat."""
+    """Poll `getUpdates` until the owner messages in a private chat (matching optional nonce)."""
     token = bot_token.strip()
     if not token:
         raise RuntimeError("Telegram bot_token is required")
+    nonce = expected_nonce.strip()
+    url = f"{base_url.rstrip('/')}/bot{token}/getUpdates"
     owns_client = client is None
     http = client or _make_http_client(proxy_url, timeout_s=15.0)
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     interval = max(0.01, float(poll_interval_s))
     try:
         while True:
-            chats = await detect_owner_chat_id(
-                token,
-                base_url=base_url,
-                proxy_url=proxy_url,
-                client=http,
-            )
-            private_chat = next((c for c in chats if c.get("type") == "private"), None)
-            if private_chat is not None:
-                return private_chat
-            if chats:
-                return chats[0]
+            try:
+                resp = await http.get(url, params={"limit": 50, "timeout": 0})
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as exc:
+                raise _raise_redacted(exc) from exc
+            if isinstance(payload, dict) and payload.get("ok"):
+                for upd in reversed(payload.get("result") or []):
+                    msg = upd.get("message") or upd.get("edited_message") or {}
+                    chat = msg.get("chat") or {}
+                    if str(chat.get("type") or "").strip() != "private":
+                        continue
+                    cid = str(chat.get("id") or "").strip()
+                    if not cid:
+                        continue
+                    txt = str(msg.get("text") or "").strip()
+                    if nonce and txt not in {f"/start {nonce}", nonce}:
+                        continue
+                    return {
+                        "chat_id": cid,
+                        "type": "private",
+                        "username": str(chat.get("username") or ""),
+                        "name": " ".join(
+                            p
+                            for p in [str(chat.get("first_name") or "").strip(), str(chat.get("last_name") or "").strip()]
+                            if p
+                        ),
+                    }
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
@@ -196,21 +265,24 @@ async def set_bot_profile_photo(
     src = Path(photo_path).expanduser()
     if not src.is_file():
         return False
-    mime_type = mimetypes.guess_type(src.name)[0] or "image/png"
+    mime_type = mimetypes.guess_type(src.name)[0] or "image/jpeg"
     content = src.read_bytes()
     url = f"{base_url.rstrip('/')}/bot{token}/setMyProfilePhoto"
     owns_client = client is None
     http = client or _make_http_client(proxy_url, timeout_s=30.0)
     try:
-        resp = await http.post(
-            url,
-            data={"photo": json.dumps({"type": "static", "photo": "attach://avatar"})},
-            files={"avatar": (src.name, content, mime_type)},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
+        try:
+            resp = await http.post(
+                url,
+                data={"photo": json.dumps({"type": "static", "photo": "attach://avatar"})},
+                files={"avatar": (src.name, content, mime_type)},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise _raise_redacted(exc) from exc
         if not isinstance(payload, dict) or not payload.get("ok"):
-            raise RuntimeError(f"Telegram setMyProfilePhoto failed: {payload}")
+            raise RuntimeError(redact_secrets(f"Telegram setMyProfilePhoto failed: {payload}"))
         return True
     finally:
         if owns_client:
@@ -264,7 +336,7 @@ async def configure_bot_profile(
                 body = resp.json()
                 results[key] = bool(isinstance(body, dict) and body.get("ok"))
             except Exception as exc:
-                logger.warning("Telegram %s failed: %s", endpoint, exc)
+                logger.warning("Telegram %s failed: %s", endpoint, redact_secrets(str(exc)))
 
         if set_avatar:
             resolved_avatar = Path(avatar_path).expanduser() if avatar_path else default_avatar_path()
@@ -278,7 +350,7 @@ async def configure_bot_profile(
                         client=http,
                     )
                 except Exception as exc:
-                    logger.warning("Telegram setMyProfilePhoto failed: %s", exc)
+                    logger.warning("Telegram setMyProfilePhoto failed: %s", redact_secrets(str(exc)))
         return results
     finally:
         if owns_client:
@@ -312,12 +384,25 @@ class TelegramNotifier:
         self._language = (language or "zh").strip()
         self._external_client = client
         self._owned_client: httpx.AsyncClient | None = None
-        saved_off = self._store.get_kv(_OFFSET_KV_KEY) if self._store is not None else None
+        self._offset_kv_key = telegram_owner_offset_key(self._token)
+        saved_off = self._store.get_kv(self._offset_kv_key) if self._store is not None else None
         self._offset: int | None = int(saved_off) if isinstance(saved_off, int) and saved_off > 0 else None
+        self._committed_offset: int | None = self._offset
+        self._pending_offset: int | None = None
+        self._backoff_s = 0.0
+        self._backoff_until = 0.0
+        if self._hub is not None and self._owner_chat_id:
+            register_fn = getattr(self._hub, "register_owner_chat_id", None)
+            if callable(register_fn):
+                register_fn(self._owner_chat_id)
 
     @property
     def hub(self) -> TelegramUpdateHub | None:
         return self._hub
+
+    @property
+    def owner_chat_id(self) -> str:
+        return self._owner_chat_id
 
     def _client(self) -> httpx.AsyncClient:
         if self._external_client is not None:
@@ -339,23 +424,52 @@ class TelegramNotifier:
 
     def _persist_offset(self) -> None:
         if self._store is not None and self._offset is not None:
-            self._store.set_kv(_OFFSET_KV_KEY, int(self._offset))
+            self._store.set_kv(self._offset_kv_key, int(self._offset))
+        self._committed_offset = self._offset
+        self._pending_offset = None
+
+    def commit_offset(self) -> None:
+        """Persist any deferred Telegram update cursor after owner actions have been processed."""
+        if self._hub is not None:
+            commit_fn = getattr(self._hub, "commit_offset", None)
+            if callable(commit_fn):
+                commit_fn()
+            return
+        if self._pending_offset is not None:
+            self._offset = max(self._offset or 0, self._pending_offset)
+            self._persist_offset()
+
+    def abort_deferred_offset(self) -> None:
+        """Roll back uncommitted cursor if owner dispatch is cancelled."""
+        if self._hub is not None:
+            abort_fn = getattr(self._hub, "abort_deferred_offset", None)
+            if callable(abort_fn):
+                abort_fn()
+            return
+        self._offset = self._committed_offset
+        self._pending_offset = None
 
     async def _post_with_retry(self, endpoint: str, **kwargs: Any) -> dict[str, Any]:
         last_exc: Exception | None = None
         for attempt in range(2):
             try:
                 resp = await self._client().post(f"{self._base_url}/{endpoint}", **kwargs)
+                if resp.status_code in {429, 500, 502, 503, 504} and attempt == 0:
+                    retry_after = float(resp.headers.get("Retry-After") or 1.0)
+                    await asyncio.sleep(min(5.0, max(0.2, retry_after)))
+                    continue
                 resp.raise_for_status()
                 payload = resp.json()
                 if not isinstance(payload, dict) or not payload.get("ok"):
-                    raise RuntimeError(f"Telegram {endpoint} failed: {payload}")
+                    raise RuntimeError(redact_secrets(f"Telegram {endpoint} failed: {payload}"))
                 return payload
             except httpx.TransportError as exc:
-                last_exc = exc
+                last_exc = _raise_redacted(exc)
                 if attempt == 0:
                     continue
-                raise
+                raise last_exc from exc
+            except httpx.HTTPStatusError as exc:
+                raise _raise_redacted(exc) from exc
         raise last_exc or RuntimeError(f"Telegram {endpoint} failed")
 
     async def seed_offset(self) -> int:
@@ -364,12 +478,15 @@ class TelegramNotifier:
             return await self._hub.seed_offset()
         if not self._token or not self._owner_chat_id or self._offset is not None:
             return 0
-        resp = await self._client().get(
-            f"{self._base_url}/getUpdates",
-            params={"timeout": 0, "allowed_updates": '["message","callback_query"]'},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
+        try:
+            resp = await self._client().get(
+                f"{self._base_url}/getUpdates",
+                params={"timeout": 0, "allowed_updates": '["message","callback_query"]'},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise _raise_redacted(exc) from exc
         if not isinstance(payload, dict) or not payload.get("ok"):
             return 0
         results = payload.get("result") or []
@@ -515,16 +632,22 @@ class TelegramNotifier:
     async def _download_file(self, file_id: str) -> tuple[bytes, str]:
         if self._hub is not None:
             return await self._hub.download_file(file_id)
-        resp = await self._client().get(f"{self._base_url}/getFile", params={"file_id": file_id})
-        resp.raise_for_status()
-        payload = resp.json()
+        try:
+            resp = await self._client().get(f"{self._base_url}/getFile", params={"file_id": file_id})
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise _raise_redacted(exc) from exc
         if not isinstance(payload, dict) or not payload.get("ok"):
-            raise RuntimeError(f"Telegram getFile failed: {payload}")
+            raise RuntimeError(redact_secrets(f"Telegram getFile failed: {payload}"))
         file_path = str((payload.get("result") or {}).get("file_path") or "").lstrip("/")
         if not file_path:
             raise RuntimeError(f"Telegram getFile returned empty file_path for {file_id}")
-        dl = await self._client().get(f"{self._file_base}/{file_path}", follow_redirects=True)
-        dl.raise_for_status()
+        try:
+            dl = await self._client().get(f"{self._file_base}/{file_path}", follow_redirects=True)
+            dl.raise_for_status()
+        except Exception as exc:
+            raise _raise_redacted(exc) from exc
         return dl.content, Path(file_path).name
 
     async def _extract_message_attachments(self, msg: dict[str, Any]) -> list[dict[str, str]]:
@@ -652,15 +775,32 @@ class TelegramNotifier:
             reply_token=str(msg_id) if isinstance(msg_id, int) else "",
         )
 
-    async def poll_owner_actions(self) -> list[OwnerAction]:
+    async def poll_owner_actions(self, *, defer_commit: bool = False) -> list[OwnerAction]:
         if not self._token or not self._owner_chat_id:
             return []
 
         if self._hub is not None:
-            raw_msgs = await self._hub.poll_owner_messages(self._owner_chat_id)
-            poll_cbs = getattr(self._hub, "poll_owner_callbacks", None)
-            raw_cbs = await poll_cbs(self._owner_chat_id) if callable(poll_cbs) else []
-            return await self._parse_owner_events(raw_msgs, raw_cbs)
+            try:
+                poll_events = getattr(self._hub, "poll_owner_events", None)
+                if callable(poll_events):
+                    raw_msgs, raw_cbs = await poll_events(self._owner_chat_id, defer_commit=defer_commit)
+                else:
+                    raw_msgs = await self._hub.poll_owner_messages(self._owner_chat_id, defer_commit=defer_commit)
+                    poll_cbs = getattr(self._hub, "poll_owner_callbacks", None)
+                    raw_cbs = (
+                        await poll_cbs(self._owner_chat_id, defer_commit=defer_commit)
+                        if callable(poll_cbs)
+                        else []
+                    )
+                return await self._parse_owner_events(raw_msgs, raw_cbs)
+            except BaseException:
+                if defer_commit:
+                    self.abort_deferred_offset()
+                raise
+
+        now_mono = time.monotonic()
+        if now_mono < self._backoff_until:
+            return []
 
         params: dict[str, Any] = {
             "timeout": max(0, int(self._config.poll_timeout_s)),
@@ -669,12 +809,50 @@ class TelegramNotifier:
         if self._offset is not None:
             params["offset"] = self._offset
 
-        resp = await self._client().get(f"{self._base_url}/getUpdates", params=params)
-        resp.raise_for_status()
-        payload = resp.json()
-        if not payload.get("ok"):
-            raise RuntimeError(f"Telegram getUpdates failed: {payload}")
+        try:
+            resp = await self._client().get(f"{self._base_url}/getUpdates", params=params)
+        except httpx.TransportError as exc:
+            self._backoff_s = min(60.0, max(2.0, self._backoff_s * 2.0 if self._backoff_s else 2.0))
+            self._backoff_until = time.monotonic() + self._backoff_s
+            logger.warning(
+                "Telegram getUpdates transport error (backing off %.0fs): %s",
+                self._backoff_s,
+                redact_secrets(str(exc)),
+            )
+            return []
 
+        if resp.status_code in {409, 429, 500, 502, 503, 504}:
+            retry_after = 0.0
+            if resp.status_code == 429:
+                try:
+                    retry_after = float(resp.headers.get("Retry-After") or 0.0)
+                except ValueError:
+                    retry_after = 0.0
+            self._backoff_s = min(60.0, max(2.0, retry_after or (self._backoff_s * 2.0 if self._backoff_s else 2.0)))
+            self._backoff_until = time.monotonic() + self._backoff_s
+            if resp.status_code == 409:
+                logger.warning(
+                    "Telegram getUpdates 409 Conflict (another Watchpost instance or active webhook is using this bot token; backing off %.0fs)",
+                    self._backoff_s,
+                )
+            else:
+                logger.warning(
+                    "Telegram getUpdates HTTP %d (backing off %.0fs)",
+                    resp.status_code,
+                    self._backoff_s,
+                )
+            return []
+
+        try:
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise _raise_redacted(exc) from exc
+        if not payload.get("ok"):
+            raise RuntimeError(redact_secrets(f"Telegram getUpdates failed: {payload}"))
+
+        self._backoff_s = 0.0
+        self._backoff_until = 0.0
         prev_offset = self._offset
         raw_msgs: list[dict[str, Any]] = []
         raw_cbs: list[dict[str, Any]] = []
@@ -697,8 +875,16 @@ class TelegramNotifier:
                     raw_cbs.append(cb)
 
         if self._offset != prev_offset:
-            self._persist_offset()
-        return await self._parse_owner_events(raw_msgs, raw_cbs)
+            if defer_commit:
+                self._pending_offset = self._offset
+            else:
+                self._persist_offset()
+        try:
+            return await self._parse_owner_events(raw_msgs, raw_cbs)
+        except BaseException:
+            if defer_commit:
+                self.abort_deferred_offset()
+            raise
 
     async def _parse_owner_events(
         self,

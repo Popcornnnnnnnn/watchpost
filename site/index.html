@@ -28,7 +28,7 @@
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Watchpost — Headless Local Agent Bridge">
-  <meta name="twitter:description" content="4-mode triage, Quiet Hours, cross-channel incident memory, zero-downtime hot reload, and 15+ native platforms.">
+  <meta name="twitter:description" content="4-mode triage, Quiet Hours, cross-channel incident memory, zero-downtime hot reload, and 10 native platforms.">
   <meta name="twitter:image" content="https://watchpost.popcornnn.xyz/assets/og-watchpost.png">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles/tokens.css">
@@ -51,7 +51,7 @@
           <path d="M44 17a15 15 0 0 1 0 10" stroke="#F59E0B" stroke-width="3.2" stroke-linecap="round"/>
         </svg>
         <span>Watchpost</span>
-        <span class="brand-badge">v0.3</span>
+        <span class="brand-badge">v0.4</span>
       </a>
 
       <nav class="primary-nav" aria-label="Primary">
@@ -103,7 +103,7 @@
               <span data-i18n="trust.t1Sub">Zero auto-replies to outsiders</span>
             </div>
             <div class="trust-item">
-              <strong data-i18n="trust.t2Title">15+ Native Platforms</strong>
+              <strong data-i18n="trust.t2Title">10 Native Platforms</strong>
               <span data-i18n="trust.t2Sub">Chats + phone push built in</span>
             </div>
             <div class="trust-item">
@@ -374,7 +374,7 @@
 
         <div class="table-scroll">
           <table class="platform-table">
-            <caption data-i18n="plat.caption">Supported inbound chat adapters, owner push/steering entrances, and local coding agent backends in Watchpost v0.3</caption>
+            <caption data-i18n="plat.caption">Supported inbound chat adapters, owner push/steering entrances, and local coding agent backends in Watchpost v0.4</caption>
             <thead>
               <tr>
                 <th scope="col" data-i18n="plat.colName">Integration</th>
@@ -417,7 +417,7 @@
               <tr data-cat="inbound notifier">
                 <th scope="row">WeCom (企业微信)</th>
                 <td data-i18n="plat.rBoth">Work Chat + App Push</td>
-                <td data-i18n="plat.dWecom">Signed SHA1 GET/POST /api/webhooks/wecom, XXE-safe XML &amp; JSON ingest, media/get, message/send push</td>
+                <td data-i18n="plat.dWecom">Signed SHA1 GET/POST /api/webhooks/wecom (plaintext mode or upstream AES proxy), XXE-safe XML/JSON, media/get, message/send</td>
                 <td><span class="status-pill" data-i18n="plat.sBuilt">Built-in</span></td>
               </tr>
               <tr data-cat="inbound">
@@ -485,14 +485,15 @@
                 <span>bash · Setup Wizard</span>
                 <button type="button" class="code-copy-btn" data-copy-target="code-setup" aria-label="Copy setup commands" data-i18n="qs.copy">Copy</button>
               </div>
-              <pre><code id="code-setup">git clone https://github.com/Popcornnnnnnnn/watchpost.git &amp;&amp; cd watchpost
-uv sync --all-extras
+              <pre><code id="code-setup"># Install globally via uv or pipx (or clone &amp;&amp; uv sync --all-extras)
+uv tool install watchpost-agent
 
-# Writes 0600 ~/.config/watchpost/config.json with ${ENV_VAR} placeholders
-uv run watchpost setup
+# Writes 0600 ~/.config/watchpost/config.json + optional .env credentials
+watchpost setup
+watchpost telegram-setup --token "$TELEGRAM_BOT_TOKEN" --test-message
 
-uv run watchpost channels list-remote --adapter slack
-uv run watchpost doctor &amp;&amp; uv run watchpost run --api-port 8787</code></pre>
+watchpost channels list-remote --adapter slack
+watchpost doctor --live &amp;&amp; watchpost service install</code></pre>
             </div>
           </div>
 
@@ -503,11 +504,11 @@ uv run watchpost doctor &amp;&amp; uv run watchpost run --api-port 8787</code></
                 <button type="button" class="code-copy-btn" data-copy-target="code-sdk" aria-label="Copy Plugin SDK commands" data-i18n="qs.copy">Copy</button>
               </div>
               <pre><code id="code-sdk"># Scaffold a custom adapter or notifier powered by watchpost.sdk
-uv run watchpost plugins scaffold --kind channel --name my_bridge --dest ./plugins/my_bridge
+watchpost plugins scaffold --kind channel --name my_bridge --dest ./plugins/my_bridge
 
 # Automated schema + contract verification (supports WhatsApp bridge template too)
-uv run watchpost plugins check --kind channel --test-fetch --cmd python3 ./plugins/my_bridge/plugin.py
-uv run watchpost plugins check --kind channel --test-fetch --cmd python3 examples/whatsapp_plugin_template.py</code></pre>
+watchpost plugins check --kind channel --test-fetch --cmd python3 ./plugins/my_bridge/plugin.py
+watchpost plugins check --kind channel --test-fetch --cmd python3 examples/whatsapp_plugin_template.py</code></pre>
             </div>
           </div>
 
@@ -518,12 +519,12 @@ uv run watchpost plugins check --kind channel --test-fetch --cmd python3 example
                 <button type="button" class="code-copy-btn" data-copy-target="code-sandbox" aria-label="Copy sandbox commands" data-i18n="qs.copy">Copy</button>
               </div>
               <pre><code id="code-sandbox"># 2-column browser simulator: act as colleagues on left, steer/approve on right
-uv run watchpost sandbox-ui --backend mock
+watchpost sandbox-ui --backend mock
 
 # Or point a real local CLI agent at a repository safely in read-only mode
-uv run watchpost sandbox-ui --backend codex --cwd /path/to/repo --autonomy diagnose_only
+watchpost sandbox-ui --backend codex --cwd /path/to/repo --autonomy diagnose_only
 
-# Run the offline unit &amp; webhook verification suite (51 tests)
+# Run the offline unit, security &amp; webhook verification suite
 uv run pytest -q tests/</code></pre>
             </div>
           </div>
@@ -534,16 +535,17 @@ uv run pytest -q tests/</code></pre>
                 <span>bash · Signed Webhooks &amp; Hot Reload</span>
                 <button type="button" class="code-copy-btn" data-copy-target="code-webhook" aria-label="Copy webhook API commands" data-i18n="qs.copy">Copy</button>
               </div>
-              <pre><code id="code-webhook"># Zero-downtime hot reload of channels, personas, Quiet Hours &amp; debounce timings
-curl -s -X POST http://127.0.0.1:8787/api/reload
+              <pre><code id="code-webhook"># Control API endpoints require the auto-generated 0600 Bearer token
+TOKEN="$(cat ~/.local/share/watchpost/api.token)"
+curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/api/reload
 
 # Trigger or inspect Quiet Hours &amp; Morning Briefing
-curl -s http://127.0.0.1:8787/api/quiet
-curl -s -X POST http://127.0.0.1:8787/api/brief
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/api/quiet
+curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/api/brief
 
-# Fail-closed signed webhook receivers built into watchpost run --api-port 8787:
+# Expose only dedicated webhook_port (e.g. 8788) through public tunnels:
 #   POST /api/webhooks/dingtalk   (HMAC-SHA256 timestamp + sign headers)
-#   GET|POST /api/webhooks/wecom  (SHA1 msg_signature verification)</code></pre>
+#   GET|POST /api/webhooks/wecom  (SHA1 msg_signature; plaintext mode or upstream AES proxy)</code></pre>
             </div>
           </div>
         </div>
@@ -554,7 +556,7 @@ curl -s -X POST http://127.0.0.1:8787/api/brief
   <footer class="site-footer">
     <div class="container footer-inner">
       <div>
-        <strong data-i18n="footer.brand">Watchpost v0.3 · Apache-2.0</strong>
+        <strong data-i18n="footer.brand">Watchpost v0.4 · Apache-2.0</strong>
         <span data-i18n="footer.note"> — Runs locally on your machine. Copyleft/desktop bridges stay separate out-of-process plugins via watchpost.sdk.</span>
       </div>
       <nav class="footer-links" aria-label="Footer">

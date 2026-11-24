@@ -40,6 +40,7 @@ from watchpost.prompts import (
     build_personal_direct_prompt,
     build_steer_prompt,
 )
+from watchpost.security import redact_secrets
 from watchpost.store import WatchpostStore
 
 logger = logging.getLogger("watchpost.engine")
@@ -58,6 +59,7 @@ class WatchpostEngine:
         notifiers: list[NotifierAdapter] | None = None,
         media_processor: MediaProcessor | None = None,
         media_dir: Path | None = None,
+        background_owner_actions: bool = False,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -66,11 +68,106 @@ class WatchpostEngine:
         self.notifiers: list[NotifierAdapter] = list(notifiers or [])
         self.media_processor = media_processor
         self.media_dir = Path(media_dir) if media_dir else (self.store.db_path.parent / "media")
+        self.background_owner_actions = bool(background_owner_actions)
+        self._turn_semaphore = asyncio.Semaphore(max(1, int(getattr(self.config, "max_concurrent_turns", 3) or 3)))
+        self._workspace_locks: dict[str, asyncio.Lock] = {}
+        self._personal_direct_lock = asyncio.Lock()
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self.debouncer: BurstDebouncer[NormalizedMessage] = BurstDebouncer(
             self._on_debounced_batch,
             debounce_s=self.config.debounce_s,
             max_debounce_s=self.config.max_debounce_s,
+            on_error=self._on_debounced_error,
         )
+
+    @asynccontextmanager
+    async def _acquire_turn(self, cwd: Path, *, write_lock: bool = False) -> AsyncIterator[None]:
+        async with self._turn_semaphore:
+            if not write_lock:
+                yield
+                return
+            key = str(Path(cwd).expanduser().resolve())
+            lock = self._workspace_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._workspace_locks[key] = lock
+            async with lock:
+                yield
+
+    async def _invoke_steer_thread(
+        self,
+        backend_thread_ref: str,
+        title: str,
+        message: str,
+        *,
+        cwd: Path,
+        channel: ChannelConfig | None = None,
+        approved_go: bool = False,
+    ) -> Any:
+        sig = inspect.signature(self.backend.steer_thread)
+        if "approved_go" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        ):
+            return await self.backend.steer_thread(
+                backend_thread_ref,
+                title,
+                message,
+                cwd=cwd,
+                channel=channel,
+                approved_go=approved_go,  # type: ignore[call-arg]
+            )
+        return await self.backend.steer_thread(
+            backend_thread_ref,
+            title,
+            message,
+            cwd=cwd,
+            channel=channel,
+        )
+
+    def _spawn_background(self, coro: Any, *, notifier_name: str, label: str) -> None:
+        async def _runner() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                safe_err = redact_secrets(str(exc))
+                logger.warning("Background action '%s' failed: %s", label, safe_err)
+                is_zh = self.config.language.lower().startswith("zh")
+                err_msg = (
+                    f"处理请求（{label}）失败：{safe_err[:180]}"
+                    if is_zh
+                    else f"Action '{label}' failed: {safe_err[:180]}"
+                )
+                await self._send_owner_reply(notifier_name, err_msg)
+
+        task = asyncio.create_task(_runner())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def wait_background_tasks(self, timeout_s: float = 5.0) -> None:
+        pending = [t for t in self._bg_tasks if not t.done()]
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=max(0.1, float(timeout_s)))
+        for t in still:
+            t.cancel()
+        if still:
+            await asyncio.gather(*still, return_exceptions=True)
+
+    @staticmethod
+    def _format_relative_age(age_s: float, *, is_zh: bool) -> str:
+        secs = max(0, int(age_s))
+        if secs < 60:
+            return "刚刚" if is_zh else f"{secs}s ago"
+        mins = secs // 60
+        if mins < 60:
+            return f"{mins}分钟前" if is_zh else f"{mins}m ago"
+        hrs = mins // 60
+        if hrs < 24:
+            return f"{hrs}小时前" if is_zh else f"{hrs}h ago"
+        days = hrs // 24
+        return f"{days}天前" if is_zh else f"{days}d ago"
 
     def register_adapter(self, adapter: ChannelAdapter) -> None:
         self.adapters[adapter.name] = adapter
@@ -491,7 +588,21 @@ class WatchpostEngine:
                 if callable(sender_fn):
                     await sender_fn(text)
             except Exception as exc:
-                logger.warning("Notifier %s send_message failed: %s", ntf.name, exc)
+                logger.warning("Notifier %s send_message failed: %s", ntf.name, redact_secrets(str(exc)))
+
+    async def _on_debounced_error(self, key: str, items: list[NormalizedMessage], exc: Exception) -> None:
+        safe_err = redact_secrets(str(exc))
+        channel_id = key.split("::", 1)[0]
+        ch = self.store.get_channel(channel_id)
+        label = ch.name if ch else channel_id
+        logger.warning("Channel batch processing failed (%s, %d msgs): %s", label, len(items), safe_err)
+        is_zh = self.config.language.lower().startswith("zh")
+        notice = (
+            f"通道「{label}」消息处理失败：{safe_err[:180]}"
+            if is_zh
+            else f"Channel '{label}' failed processing incoming messages: {safe_err[:180]}"
+        )
+        await self._send_owner_reply("", notice)
 
     async def poll_channel(self, channel_id: str, *, debounced: bool = False) -> list[ThreadRecord]:
         channel = self.store.get_channel(channel_id)
@@ -597,7 +708,8 @@ class WatchpostEngine:
                 if self.media_processor is not None:
                     for art in artifacts:
                         if art.kind == "audio" and art.path and not art.transcript:
-                            tr, err = self.media_processor.transcribe_audio(
+                            tr, err = await asyncio.to_thread(
+                                self.media_processor.transcribe_audio,
                                 Path(art.path),
                                 prompt=channel.whisper_prompt,
                                 language=self.config.language,
@@ -717,49 +829,54 @@ class WatchpostEngine:
         target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
         try:
             async with self._typing_indicator(enabled=not suppress_notify):
-                if matched_thread is not None:
-                    steer_msg = build_steer_prompt(
-                        channel,
-                        recent_messages,
-                        batch,
-                        group_context=group_ctx,
-                        language=self.config.language,
-                    )
-                    result = await self.backend.steer_thread(
-                        matched_thread.backend_thread_ref,
-                        title,
-                        steer_msg,
-                        cwd=target_cwd,
-                        channel=channel,
-                    )
-                    backend_ref = matched_thread.backend_thread_ref
-                else:
-                    cross_memory = (
-                        self.store.get_recent_cross_channel_context(
-                            exclude_channel_id=channel.id,
-                            workspace_dir=str(target_cwd),
-                            window_s=self.config.cross_channel_window_s,
-                            limit=self.config.cross_channel_max_items,
-                            now_ts=now_ts,
+                async with self._acquire_turn(
+                    target_cwd,
+                    write_lock=(channel.autonomy_mode == AutonomyMode.auto_fix),
+                ):
+                    if matched_thread is not None:
+                        steer_msg = build_steer_prompt(
+                            channel,
+                            recent_messages,
+                            batch,
+                            group_context=group_ctx,
+                            language=self.config.language,
                         )
-                        if self.config.cross_channel_window_s > 0 and self.config.cross_channel_max_items > 0
-                        else []
-                    )
-                    prompt = build_new_thread_prompt(
-                        channel,
-                        channel.persona_text,
-                        recent_messages,
-                        batch,
-                        group_context=group_ctx,
-                        cross_channel_memory=cross_memory,
-                        language=self.config.language,
-                    )
-                    backend_ref, result = await self.backend.start_thread(
-                        title,
-                        prompt,
-                        cwd=target_cwd,
-                        channel=channel,
-                    )
+                        result = await self._invoke_steer_thread(
+                            matched_thread.backend_thread_ref,
+                            title,
+                            steer_msg,
+                            cwd=target_cwd,
+                            channel=channel,
+                            approved_go=False,
+                        )
+                        backend_ref = matched_thread.backend_thread_ref
+                    else:
+                        cross_memory = (
+                            self.store.get_recent_cross_channel_context(
+                                exclude_channel_id=channel.id,
+                                workspace_dir=str(target_cwd),
+                                window_s=self.config.cross_channel_window_s,
+                                limit=self.config.cross_channel_max_items,
+                                now_ts=now_ts,
+                            )
+                            if self.config.cross_channel_window_s > 0 and self.config.cross_channel_max_items > 0
+                            else []
+                        )
+                        prompt = build_new_thread_prompt(
+                            channel,
+                            channel.persona_text,
+                            recent_messages,
+                            batch,
+                            group_context=group_ctx,
+                            cross_channel_memory=cross_memory,
+                            language=self.config.language,
+                        )
+                        backend_ref, result = await self.backend.start_thread(
+                            title,
+                            prompt,
+                            cwd=target_cwd,
+                            channel=channel,
+                        )
         except Exception:
             self.store.create_or_update_thread(
                 active_record.model_copy(
@@ -845,10 +962,15 @@ class WatchpostEngine:
         owner_message: str,
         *,
         approved_go: bool = False,
+        _go_already_claimed: bool = False,
     ) -> ThreadRecord:
         thread = self.store.get_thread(thread_id)
         if thread is None:
             raise KeyError(f"Unknown thread: {thread_id}")
+        if approved_go:
+            if not _go_already_claimed and not self.store.claim_pending_go(thread_id):
+                raise ValueError("Thread has no pending go approval")
+            thread = thread.model_copy(update={"pending_go": False})
         channel = self.store.get_channel(thread.channel_id)
         if channel is None:
             raise KeyError(f"Unknown channel: {thread.channel_id}")
@@ -879,21 +1001,31 @@ class WatchpostEngine:
                 language=self.config.language,
             )
             steer_title = f"[{channel.adapter}] {channel.name}: {thread.title}"
-        active_thread = self.store.create_or_update_thread(
-            thread.model_copy(update={"status": ThreadStatus.active, "updated_at": time.time()})
+        active_thread = (
+            self.store.set_thread_status(
+                thread.id,
+                status=ThreadStatus.active,
+                clear_pending_go=False,
+            )
+            or thread
         )
+        write_lock = bool(is_personal or approved_go or channel.autonomy_mode == AutonomyMode.auto_fix)
         try:
             async with self._typing_indicator():
-                result = await self.backend.steer_thread(
-                    active_thread.backend_thread_ref,
-                    steer_title,
-                    steer_prompt,
-                    cwd=target_cwd,
-                    channel=channel,
-                )
-        except Exception:
-            self.store.create_or_update_thread(
-                active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
+                async with self._acquire_turn(target_cwd, write_lock=write_lock):
+                    result = await self._invoke_steer_thread(
+                        active_thread.backend_thread_ref,
+                        steer_title,
+                        steer_prompt,
+                        cwd=target_cwd,
+                        channel=channel,
+                        approved_go=approved_go,
+                    )
+        except BaseException:
+            self.store.set_thread_status(
+                thread.id,
+                status=ThreadStatus.error,
+                clear_pending_go=False,
             )
             raise
         all_bubbles, draft_reply = format_completion_bubbles(
@@ -904,8 +1036,13 @@ class WatchpostEngine:
             include_header=not is_personal,
         )
         next_status = ThreadStatus.error if result.error else ThreadStatus.completed
-        updated = self.store.create_or_update_thread(
-            thread.model_copy(
+        updated = (
+            self.store.set_thread_status(
+                thread.id,
+                status=next_status,
+                clear_pending_go=False,
+            )
+            or thread.model_copy(
                 update={
                     "status": next_status,
                     "pending_go": False if approved_go else thread.pending_go,
@@ -937,7 +1074,7 @@ class WatchpostEngine:
         )
         return updated
 
-    def _format_owner_action_message(
+    async def _format_owner_action_message(
         self,
         action: OwnerAction,
         *,
@@ -951,7 +1088,8 @@ class WatchpostEngine:
             is_audio = att.get("is_audio") == "true"
             if is_audio and att_path:
                 if self.media_processor is not None and Path(att_path).is_file():
-                    transcript, err = self.media_processor.transcribe_audio(
+                    transcript, err = await asyncio.to_thread(
+                        self.media_processor.transcribe_audio,
                         Path(att_path),
                         prompt=prompt_hint,
                         language=self.config.language,
@@ -997,7 +1135,20 @@ class WatchpostEngine:
         *,
         force_new: bool = False,
     ) -> ThreadRecord | None:
-        is_zh = self.config.language.lower().startswith("zh")
+        async with self._personal_direct_lock:
+            return await self._handle_personal_direct_locked(
+                action,
+                owner_message,
+                force_new=force_new,
+            )
+
+    async def _handle_personal_direct_locked(
+        self,
+        action: OwnerAction,
+        owner_message: str,
+        *,
+        force_new: bool = False,
+    ) -> ThreadRecord | None:
         ch = self._ensure_personal_channel()
         target_cwd = Path(ch.workspace_dir).expanduser() if ch.workspace_dir else self.config.workspace_dir
         ttl_s = max(60, int(self.config.personal_session_ttl_s))
@@ -1038,13 +1189,15 @@ class WatchpostEngine:
             )
             try:
                 async with self._typing_indicator():
-                    result = await self.backend.steer_thread(
-                        active_thread.backend_thread_ref,
-                        f"[direct] {ch.name}: {active_thread.title}",
-                        prompt,
-                        cwd=target_cwd,
-                        channel=ch,
-                    )
+                    async with self._acquire_turn(target_cwd, write_lock=True):
+                        result = await self._invoke_steer_thread(
+                            active_thread.backend_thread_ref,
+                            f"[direct] {ch.name}: {active_thread.title}",
+                            prompt,
+                            cwd=target_cwd,
+                            channel=ch,
+                            approved_go=True,
+                        )
             except Exception:
                 self.store.create_or_update_thread(
                     active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
@@ -1110,12 +1263,13 @@ class WatchpostEngine:
         )
         try:
             async with self._typing_indicator():
-                backend_ref, result = await self.backend.start_thread(
-                    title,
-                    prompt,
-                    cwd=target_cwd,
-                    channel=ch,
-                )
+                async with self._acquire_turn(target_cwd, write_lock=True):
+                    backend_ref, result = await self.backend.start_thread(
+                        title,
+                        prompt,
+                        cwd=target_cwd,
+                        channel=ch,
+                    )
         except Exception:
             self.store.create_or_update_thread(
                 active_record.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
@@ -1185,8 +1339,30 @@ class WatchpostEngine:
             await self._send_owner_reply(action.notifier, msg)
             return None
 
+        if action.kind == "start":
+            msg = (
+                "Watchpost 已连接，直接发消息即可对话；发送 /status 查看状态，/list 查看最近会话，/help 查看指令。"
+                if is_zh
+                else "Watchpost is connected. Send any message to chat, /status for status, /list for recent threads, or /help for commands."
+            )
+            await self._send_owner_reply(action.notifier, msg)
+            return None
+
+        if action.kind == "unknown_cmd":
+            cmd_head = (action.text.strip().split(None, 1)[0] if action.text.strip() else "/")
+            msg = (
+                f"未识别指令 {cmd_head}；请发送 /help 查看可用命令。"
+                if is_zh
+                else f"Unknown command {cmd_head}; send /help to view supported commands."
+            )
+            await self._send_owner_reply(action.notifier, msg)
+            return None
+
         if action.kind == "brief":
-            await self.send_briefing(notifier_name=action.notifier)
+            if self.background_owner_actions:
+                self._spawn_background(self.send_briefing(notifier_name=action.notifier), notifier_name=action.notifier, label="/brief")
+            else:
+                await self.send_briefing(notifier_name=action.notifier)
             return None
 
         if action.kind == "mute":
@@ -1211,7 +1387,10 @@ class WatchpostEngine:
             )
             await self._send_owner_reply(action.notifier, msg)
             if int(st.get("queued_count") or 0) > 0:
-                await self.send_briefing(notifier_name=action.notifier)
+                if self.background_owner_actions:
+                    self._spawn_background(self.send_briefing(notifier_name=action.notifier), notifier_name=action.notifier, label="/unmute brief")
+                else:
+                    await self.send_briefing(notifier_name=action.notifier)
             return None
 
         if action.kind == "status":
@@ -1242,11 +1421,16 @@ class WatchpostEngine:
                     "当前暂无历史会话。" if is_zh else "No threads yet.",
                 )
                 return None
+            now_ts = time.time()
             self.store.set_kv("last_listed_thread_ids", [th.id for th in threads])
+            self.store.set_kv("last_listed_thread_ids_at", now_ts)
             lines = ["最近会话：" if is_zh else "Recent threads:"]
             for idx, th in enumerate(threads, start=1):
-                tag = "待go" if th.pending_go else th.status.value
-                lines.append(f"{idx}. [{tag}] {th.title}")
+                tag = ("待go" if is_zh else "pending go") if th.pending_go else th.status.value
+                ch_obj = self.store.get_channel(th.channel_id)
+                ch_label = ch_obj.name if ch_obj is not None else th.channel_id
+                age = self._format_relative_age(now_ts - float(th.updated_at or now_ts), is_zh=is_zh)
+                lines.append(f"{idx}. [{tag} | {ch_label} | {age}] {th.title}")
             await self._send_owner_reply(action.notifier, "\n".join(lines))
             return None
 
@@ -1264,7 +1448,7 @@ class WatchpostEngine:
         if action.kind == "new_personal":
             self.store.set_kv("personal_direct_active_thread_id", "")
             self.store.set_kv("personal_direct_reset_at", time.time())
-            formatted = self._format_owner_action_message(action)
+            formatted = await self._format_owner_action_message(action)
             if not formatted:
                 await self._send_owner_reply(
                     action.notifier,
@@ -1273,11 +1457,38 @@ class WatchpostEngine:
                     else "Started a new conversation; send your message.",
                 )
                 return None
+            if self.background_owner_actions:
+                self._spawn_background(
+                    self._handle_personal_direct(action, formatted, force_new=True),
+                    notifier_name=action.notifier,
+                    label="/new",
+                )
+                return None
             return await self._handle_personal_direct(action, formatted, force_new=True)
+
+        if action.list_index > 0 and action.kind == "steer" and not action.text.strip() and not action.attachments:
+            msg = (
+                f"请附带具体内容或指令，例如 #{action.list_index} 再查一下 或 #{action.list_index} go。"
+                if is_zh
+                else f"Include a message or command after #{action.list_index}, e.g. #{action.list_index} check again or #{action.list_index} go."
+            )
+            await self._send_owner_reply(action.notifier, msg)
+            return None
 
         target_id = action.thread_id.strip()
         if not target_id and action.list_index > 0:
             listed = self.store.get_kv("last_listed_thread_ids", [])
+            listed_at = float(self.store.get_kv("last_listed_thread_ids_at", 0.0) or 0.0)
+            if listed_at > 0 and (time.time() - listed_at) > 86400.0:
+                await self._send_owner_reply(
+                    action.notifier,
+                    (
+                        "列表编号已过期（超过24小时），请先发送 /list 重新查看。"
+                        if is_zh
+                        else "Thread list index expired (>24h old); send /list to refresh."
+                    ),
+                )
+                return None
             if isinstance(listed, list) and 1 <= action.list_index <= len(listed):
                 target_id = str(listed[action.list_index - 1])
             elif not listed:
@@ -1304,8 +1515,11 @@ class WatchpostEngine:
                     target_id = th.id
                     break
             if not target_id:
-                recent = self.store.list_threads(limit=1)
-                target_id = recent[0].id if recent else ""
+                await self._send_owner_reply(
+                    action.notifier,
+                    "当前没有待确认执行（go）的会话。" if is_zh else "No threads currently awaiting go approval.",
+                )
+                return None
 
         if action.kind == "dismiss_go":
             if not target_id:
@@ -1338,14 +1552,25 @@ class WatchpostEngine:
             return updated
 
         if not target_id and action.kind == "steer":
-            has_personal_ws = self.config.personal_workspace_dir is not None
-            recent = self.store.list_threads(limit=1)
-            if has_personal_ws or not recent:
-                formatted = self._format_owner_action_message(action)
+            if self.config.personal_workspace_dir is not None:
+                formatted = await self._format_owner_action_message(action)
                 if not formatted:
                     return None
+                if self.background_owner_actions:
+                    self._spawn_background(
+                        self._handle_personal_direct(action, formatted, force_new=False),
+                        notifier_name=action.notifier,
+                        label="direct chat",
+                    )
+                    return None
                 return await self._handle_personal_direct(action, formatted, force_new=False)
-            target_id = recent[0].id
+            msg = (
+                "未指定会话，请左滑回复某条通知气泡、使用 /list + #N 内容，或配置 personal_workspace_dir 开启直接对话。"
+                if is_zh
+                else "No target thread selected. Swipe-reply to a bot alert, use /list then #N <message>, or configure personal_workspace_dir for direct chat."
+            )
+            await self._send_owner_reply(action.notifier, msg)
+            return None
 
         if not target_id:
             await self._send_owner_reply(
@@ -1355,10 +1580,38 @@ class WatchpostEngine:
             return None
 
         target_thread = self.store.get_thread(target_id)
-        target_ch = self.store.get_channel(target_thread.channel_id) if target_thread else None
         approved_go = action.kind == "approve_go"
-        steer_text = self._format_owner_action_message(action, channel=target_ch) or ("go" if approved_go else "")
-        return await self.steer_from_owner(target_id, steer_text, approved_go=approved_go)
+        if approved_go and (
+            target_thread is None
+            or not target_thread.pending_go
+            or not self.store.claim_pending_go(target_id)
+        ):
+            await self._send_owner_reply(
+                action.notifier,
+                "该会话当前没有待确认执行（go）的变更。" if is_zh else "That thread has no pending go approval.",
+            )
+            return None
+
+        target_ch = self.store.get_channel(target_thread.channel_id) if target_thread else None
+        steer_text = (await self._format_owner_action_message(action, channel=target_ch)) or ("go" if approved_go else "")
+        if self.background_owner_actions:
+            self._spawn_background(
+                self.steer_from_owner(
+                    target_id,
+                    steer_text,
+                    approved_go=approved_go,
+                    _go_already_claimed=approved_go,
+                ),
+                notifier_name=action.notifier,
+                label=target_thread.title if target_thread else target_id,
+            )
+            return target_thread
+        return await self.steer_from_owner(
+            target_id,
+            steer_text,
+            approved_go=approved_go,
+            _go_already_claimed=approved_go,
+        )
 
     async def poll_all_channels(self, *, seed_if_empty: bool = False, debounced: bool = True) -> int:
         """Poll every enabled channel whose adapter is registered; return channels polled cleanly."""
@@ -1379,24 +1632,71 @@ class WatchpostEngine:
                 )
                 polled += 1
             except Exception as exc:
-                logger.warning("Channel poll failed (%s / %s): %s", ch.adapter, ch.id, exc)
+                logger.warning("Channel poll failed (%s / %s): %s", ch.adapter, ch.id, redact_secrets(str(exc)))
         return polled
 
     async def poll_owner_actions_once(self) -> int:
         """Poll all registered phone/desktop notifiers and dispatch any owner actions."""
         handled = 0
+        is_zh = self.config.language.lower().startswith("zh")
         for ntf in self.notifiers:
             try:
-                actions = await ntf.poll_owner_actions()
+                sig = inspect.signature(ntf.poll_owner_actions)
+                if "defer_commit" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    actions = await ntf.poll_owner_actions(defer_commit=True)  # type: ignore[call-arg]
+                else:
+                    actions = await ntf.poll_owner_actions()
             except Exception as exc:
-                logger.warning("Notifier %s poll_owner_actions failed: %s", ntf.name, exc)
+                abort_fn = getattr(ntf, "abort_deferred_offset", None)
+                if callable(abort_fn):
+                    try:
+                        abort_fn()
+                    except Exception:
+                        pass
+                logger.warning("Notifier %s poll_owner_actions failed: %s", ntf.name, redact_secrets(str(exc)))
                 continue
-            for action in actions:
+            except BaseException:
+                abort_fn = getattr(ntf, "abort_deferred_offset", None)
+                if callable(abort_fn):
+                    try:
+                        abort_fn()
+                    except Exception:
+                        pass
+                raise
+            before_tasks = set(self._bg_tasks)
+            try:
+                for action in actions:
+                    try:
+                        await self.handle_owner_action(action)
+                        handled += 1
+                    except Exception as exc:
+                        safe_err = redact_secrets(str(exc))
+                        logger.warning("Failed handling owner action %s: %s", action.kind, safe_err)
+                        err_notice = (
+                            f"指令处理失败（{action.kind}）：{safe_err[:180]}"
+                            if is_zh
+                            else f"Failed handling command ({action.kind}): {safe_err[:180]}"
+                        )
+                        await self._send_owner_reply(action.notifier, err_notice)
+                spawned = [t for t in self._bg_tasks if t not in before_tasks and not t.done()]
+                if spawned:
+                    await asyncio.gather(*spawned)
+            except BaseException:
+                abort_fn = getattr(ntf, "abort_deferred_offset", None)
+                if callable(abort_fn):
+                    try:
+                        abort_fn()
+                    except Exception:
+                        pass
+                raise
+            commit_fn = getattr(ntf, "commit_offset", None)
+            if callable(commit_fn):
                 try:
-                    await self.handle_owner_action(action)
-                    handled += 1
+                    commit_fn()
                 except Exception as exc:
-                    logger.warning("Failed handling owner action %s: %s", action.kind, exc)
+                    logger.warning("Notifier %s commit_offset failed: %s", ntf.name, redact_secrets(str(exc)))
         return handled
 
     async def run_demo_scenario(self) -> dict[str, Any]:

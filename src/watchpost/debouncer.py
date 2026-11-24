@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+import logging
 from typing import Generic, TypeVar
 
 T = TypeVar("T")
+logger = logging.getLogger("watchpost.debouncer")
 
 
 @dataclass
@@ -26,8 +28,10 @@ class BurstDebouncer(Generic[T]):
         *,
         debounce_s: float = 25.0,
         max_debounce_s: float = 60.0,
+        on_error: Callable[[str, list[T], Exception], Awaitable[None]] | None = None,
     ) -> None:
         self._on_flush = on_flush
+        self._on_error = on_error
         self.debounce_s = max(0.0, float(debounce_s))
         self.max_debounce_s = max(self.debounce_s, float(max_debounce_s))
         self._buckets: dict[str, _PendingBucket[T]] = {}
@@ -65,6 +69,8 @@ class BurstDebouncer(Generic[T]):
                 await self.flush(key)
             except asyncio.CancelledError:
                 return
+            except Exception as exc:
+                logger.exception("Debounced flush failed for key %s: %s", key, exc)
 
         bucket.task = asyncio.create_task(_wait_and_flush())
 
@@ -77,7 +83,16 @@ class BurstDebouncer(Generic[T]):
             bucket.task.cancel()
         items = list(bucket.items)
         if items:
-            await self._on_flush(key, items)
+            try:
+                await self._on_flush(key, items)
+            except Exception as exc:
+                if self._on_error is not None:
+                    try:
+                        await self._on_error(key, items, exc)
+                        return items
+                    except Exception:
+                        pass
+                raise
         return items
 
     async def flush_all(self) -> int:

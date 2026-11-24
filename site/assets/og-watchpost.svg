@@ -27,7 +27,7 @@
     <path d="M35 16a10 10 0 0 1 0 6" stroke="#F59E0B" stroke-width="2.4" stroke-linecap="round"/>
 
     <rect x="70" y="10" width="230" height="32" rx="16" fill="#172554" stroke="#2563EB" stroke-opacity="0.6"/>
-    <text x="185" y="31" text-anchor="middle" fill="#93C5FD" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="600" letter-spacing="1.1">APACHE-2.0 · v0.3.0</text>
+    <text x="185" y="31" text-anchor="middle" fill="#93C5FD" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="600" letter-spacing="1.1">APACHE-2.0 · v0.4.0</text>
 
     <text x="0" y="128" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="60" font-weight="800" letter-spacing="-1.5">Watchpost</text>
     <text x="0" y="182" fill="#93C5FD" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="28" font-weight="600">Stand watch over noisy chats.</text>

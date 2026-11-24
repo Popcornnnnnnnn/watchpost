@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -226,14 +227,43 @@ def _row_to_thread(row: sqlite3.Row) -> ThreadRecord:
 class WatchpostStore:
     """Thread-safe SQLite WAL persistence backend."""
 
+    CURRENT_SCHEMA_VERSION = 2
+
     def __init__(self, db_path: Path | str) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = Path(db_path).expanduser()
+        parent = self.db_path.parent
+        parent_existed = parent.exists()
+        parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix" and not parent_existed:
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
-            cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
-            if "workspace_dir" not in cols:
-                conn.execute("ALTER TABLE channels ADD COLUMN workspace_dir TEXT NOT NULL DEFAULT ''")
+            ver = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+            if ver < 1:
+                cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
+                if "workspace_dir" not in cols:
+                    conn.execute("ALTER TABLE channels ADD COLUMN workspace_dir TEXT NOT NULL DEFAULT ''")
+                conn.execute("PRAGMA user_version = 1")
+            if ver < 2:
+                conn.execute("PRAGMA user_version = 2")
+        self._tighten_db_permissions()
+
+    def _tighten_db_permissions(self) -> None:
+        if os.name != "posix":
+            return
+        for candidate in (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        ):
+            if candidate.exists():
+                try:
+                    os.chmod(candidate, 0o600)
+                except OSError:
+                    pass
 
     @contextlib.contextmanager
     def _connect(self):
@@ -503,6 +533,53 @@ class WatchpostStore:
             )
             updated = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
         return _row_to_thread(updated) if updated else None
+
+    def claim_pending_go(self, thread_id: str) -> bool:
+        """Atomically consume pending_go=1 so concurrent/duplicate 'go' taps execute once."""
+        now = time.time()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE threads
+                SET pending_go = 0,
+                    updated_at = ?
+                WHERE id = ? AND pending_go = 1
+                """,
+                (now, thread_id),
+            )
+            return int(cur.rowcount or 0) > 0
+
+    def set_thread_status(
+        self,
+        thread_id: str,
+        *,
+        status: ThreadStatus,
+        clear_pending_go: bool = False,
+    ) -> ThreadRecord | None:
+        """Atomically update thread status (and optionally clear pending_go) without overwriting concurrent pending_go writes."""
+        now = time.time()
+        with self._connect() as conn:
+            if clear_pending_go:
+                conn.execute(
+                    """
+                    UPDATE threads
+                    SET status = ?, pending_go = 0, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status.value, now, thread_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE threads
+                    SET status = CASE WHEN pending_go = 1 AND ? IN ('completed', 'error') THEN 'awaiting_go' ELSE ? END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status.value, status.value, now, thread_id),
+                )
+            row = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
+        return _row_to_thread(row) if row else None
 
     def dismiss_all_pending_go(self) -> int:
         now = time.time()

@@ -22,7 +22,7 @@ If no config exists yet, create the starter file (`0600` permissions, `${ENV_VAR
 ```bash
 watchpost init-config
 ```
-Default config path: `~/.config/watchpost/config.json`. Keep raw secrets in environment variables (or `0600` config) and never echo them back in summaries.
+Default config path: `~/.config/watchpost/config.json`. Sibling `0600` credentials in `~/.config/watchpost/.env` are loaded automatically (and overridden by exported shell variables). Keep raw secrets out of summaries.
 
 ### Step 2 — Set Up the Familiar Phone Entrance (Pick 1)
 1. **Telegram Bot (Recommended default):**
@@ -30,7 +30,7 @@ Default config path: `~/.config/watchpost/config.json`. Keep raw secrets in envi
      ```bash
      watchpost telegram-setup --token "$TELEGRAM_BOT_TOKEN" --test-message
      ```
-   - This verifies the bot via `getMe`, sets the Watchpost avatar, registers the `/` command menu & description, waits for the user to tap **Start**, saves `0600` config, disables iMessage, and hot-reloads the running daemon. (For manual ID inspection only: `watchpost telegram-whoami`.)
+   - This verifies the bot via `getMe`, sets the Watchpost avatar (`avatar.jpg`), registers the `/` command menu & description, waits in a private chat for the nonce-verified `https://t.me/<bot>?start=<nonce>` tap, saves `0600` config (preserving `${TELEGRAM_BOT_TOKEN}` placeholders if configured), disables iMessage, and calls Bearer-authenticated `POST /api/reload` on any running daemon. (For manual ID inspection only: `watchpost telegram-whoami`.)
 2. **macOS iMessage (Legacy macOS fallback):**
    - Set `imessage.enabled = true` and `imessage.owner_handle` to the user's iMessage phone number (`+...`) or Apple ID email.
    - Note: using `imessage` requires **Full Disk Access** (`~/Library/Messages/chat.db`) and a dedicated Messages account on Mac.
@@ -73,9 +73,11 @@ watchpost channels add \
    ```bash
    watchpost run --once --seed
    ```
-3. Start continuous background watching:
+3. Start continuous background watching (or install a persistent user service):
    ```bash
-   watchpost run
+   watchpost run --api-port 8787
+   # Or auto-start on login via launchd (macOS) / systemd --user (Linux):
+   watchpost service install
    ```
 
 ---
@@ -83,10 +85,10 @@ watchpost channels add \
 ## 2. Day-to-Day Phone & CLI Controls
 
 From the paired phone chat (`Telegram` or `iMessage`), the owner can reply directly:
-- **`go` / `执行` / `approve`** — Approves a pending `diagnose_only` fix proposal.
-- **`status` / `/status` / `状态`** — Checks monitored channels, threads, and pending `"go"` approvals.
-- **`list` / `/list` / `列表`** — Lists recent Watchpost threads.
-- **Any other text** (especially swipe-replying to a specific bubble) — Steers that investigating agent thread with extra context.
+- **`go` / `approve` / `执行` / `批准`** — Approves a pending `diagnose_only` fix proposal (requires an active `pending_go` thread; casual `"同意"` is treated as normal text, not an approval).
+- **`/status` / `status`** — Checks monitored channels, threads, and pending `"go"` approvals.
+- **`/list` / `list`** — Lists recent Watchpost threads with channel and age (valid for `#N` indexing for 24 hours).
+- **Any other text** (especially swipe-replying to a specific bubble, or `#N <message>`) — Steers that investigating agent thread with extra context.
 
 From CLI:
 - `watchpost channels list` / `watchpost channels remove --id <id>`

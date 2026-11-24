@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from pathlib import Path
 
-from watchpost.models import AgentResult, ChannelConfig
+from watchpost.models import AgentResult, AutonomyMode, ChannelConfig
 from watchpost.ports import AgentBackend
 
 logger = logging.getLogger("watchpost.backends.fallback")
@@ -45,6 +46,14 @@ class FallbackBackend:
         except Exception as exc:
             err_msg = str(exc)
 
+        if channel is not None and channel.autonomy_mode == AutonomyMode.auto_fix:
+            logger.warning(
+                "Primary backend %s failed on auto_fix channel (%s); refusing automatic backup failover to avoid duplicate writes",
+                self.primary.name,
+                err_msg,
+            )
+            return "", AgentResult(raw_text=err_msg, error=err_msg)
+
         logger.warning(
             "Primary backend %s failed (%s); failing over to %s",
             self.primary.name,
@@ -54,6 +63,31 @@ class FallbackBackend:
         b_ref, b_res = await self.backup.start_thread(title, prompt, cwd=cwd, model=model, channel=channel)
         return self._encode_ref(self.backup.name, b_ref), b_res
 
+    @staticmethod
+    async def _call_steer(
+        backend: AgentBackend,
+        raw_ref: str,
+        title: str,
+        message: str,
+        *,
+        cwd: Path,
+        channel: ChannelConfig | None,
+        approved_go: bool,
+    ) -> AgentResult:
+        sig = inspect.signature(backend.steer_thread)
+        if "approved_go" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        ):
+            return await backend.steer_thread(
+                raw_ref,
+                title,
+                message,
+                cwd=cwd,
+                channel=channel,
+                approved_go=approved_go,  # type: ignore[call-arg]
+            )
+        return await backend.steer_thread(raw_ref, title, message, cwd=cwd, channel=channel)
+
     async def steer_thread(
         self,
         backend_thread_ref: str,
@@ -62,12 +96,21 @@ class FallbackBackend:
         *,
         cwd: Path,
         channel: ChannelConfig | None = None,
+        approved_go: bool = False,
     ) -> AgentResult:
         provider, raw_ref = self._decode_ref(backend_thread_ref)
         target = self.backup if provider == self.backup.name else self.primary
 
         try:
-            res = await target.steer_thread(raw_ref, title, message, cwd=cwd, channel=channel)
+            res = await self._call_steer(
+                target,
+                raw_ref,
+                title,
+                message,
+                cwd=cwd,
+                channel=channel,
+                approved_go=approved_go,
+            )
             if not res.error:
                 return res
             err_msg = res.error
@@ -75,6 +118,14 @@ class FallbackBackend:
             err_msg = str(exc)
 
         if target is self.backup:
+            return AgentResult(raw_text=err_msg, error=err_msg)
+
+        if approved_go or (channel is not None and channel.autonomy_mode == AutonomyMode.auto_fix):
+            logger.warning(
+                "Primary backend %s steer failed on writable turn (%s); refusing automatic backup failover to avoid duplicate writes",
+                self.primary.name,
+                err_msg,
+            )
             return AgentResult(raw_text=err_msg, error=err_msg)
 
         logger.warning(

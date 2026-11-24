@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import uuid
 from pathlib import Path
 
 from watchpost.bubbles import extract_sections, split_into_bubbles
 from watchpost.models import AgentResult, AutonomyMode, ChannelConfig, TriageMode
+from watchpost.security import kill_process_tree
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 _META_EVENT_TYPES = {
@@ -64,6 +66,81 @@ class CLIAgentBackend:
         self._timeout_s = float(timeout_s)
         self._sandbox_mode = sandbox_mode.strip()
 
+    @staticmethod
+    def _resolve_write_allowed(channel: ChannelConfig | None, *, approved_go: bool = False) -> bool:
+        if approved_go:
+            return True
+        if channel is not None:
+            return channel.autonomy_mode == AutonomyMode.auto_fix
+        return False
+
+    def _apply_preset_flags(
+        self,
+        cmd: list[str],
+        *,
+        is_steer: bool,
+        channel: ChannelConfig | None,
+        approved_go: bool,
+    ) -> list[str]:
+        out = list(cmd)
+        write_allowed = self._resolve_write_allowed(channel, approved_go=approved_go)
+
+        if self.name == "codex":
+            if not write_allowed:
+                mode = "read-only"
+            elif approved_go:
+                mode = (
+                    self._sandbox_mode
+                    if self._sandbox_mode in {"workspace-write", "danger-full-access"}
+                    else "workspace-write"
+                )
+            else:
+                mode = self._sandbox_mode or "workspace-write"
+            if not is_steer:
+                if "--sandbox" not in out and "-s" not in out:
+                    out.extend(["--sandbox", mode])
+            else:
+                has_sandbox_cfg = (
+                    "--sandbox" in out
+                    or "-s" in out
+                    or any("sandbox_mode" in p for p in out)
+                )
+                if not has_sandbox_cfg:
+                    cfg_flags = ["-c", f'sandbox_mode="{mode}"']
+                    if "resume" in out:
+                        idx = out.index("resume") + 1
+                        out = [*out[:idx], *cfg_flags, *out[idx:]]
+                    elif out:
+                        out = [*out[:-1], *cfg_flags, out[-1]]
+                    else:
+                        out.extend(cfg_flags)
+            return out
+
+        if self.name == "claude_code":
+            if "--permission-mode" not in out:
+                perm = "acceptEdits" if write_allowed else "plan"
+                flags = ["--permission-mode", perm]
+                if "-p" in out:
+                    idx = out.index("-p")
+                    out = [*out[:idx], *flags, *out[idx:]]
+                else:
+                    out.extend(flags)
+            return out
+
+        if self.name == "gemini_cli":
+            has_approval = "--approval-mode" in out or any(p.startswith("--approval-mode=") for p in out)
+            if not has_approval:
+                approval = "auto_edit" if write_allowed else "plan"
+                flags = ["--approval-mode", approval]
+                if "-p" in out:
+                    idx = out.index("-p")
+                    out = [*out[:idx], *flags, *out[idx:]]
+                else:
+                    out.extend(flags)
+            return out
+
+        return out
+
     async def start_thread(
         self,
         title: str,
@@ -74,17 +151,12 @@ class CLIAgentBackend:
         channel: ChannelConfig | None = None,
     ) -> tuple[str, AgentResult]:
         del title, model
-        cmd = list(self._start_cmd)
-        if self.name == "codex" and "--sandbox" not in cmd and "-s" not in cmd:
-            if self._sandbox_mode:
-                cmd.extend(["--sandbox", self._sandbox_mode])
-            elif channel is not None and channel.autonomy_mode in {
-                AutonomyMode.assistant_only,
-                AutonomyMode.diagnose_only,
-            }:
-                cmd.extend(["--sandbox", "read-only"])
-            elif channel is not None and channel.autonomy_mode == AutonomyMode.auto_fix:
-                cmd.extend(["--sandbox", "workspace-write"])
+        cmd = self._apply_preset_flags(
+            self._start_cmd,
+            is_steer=False,
+            channel=channel,
+            approved_go=False,
+        )
         cmd.append(prompt)
         stdout, stderr, rc = await self._run(cmd, cwd=cwd)
         if rc != 0:
@@ -101,9 +173,16 @@ class CLIAgentBackend:
         *,
         cwd: Path,
         channel: ChannelConfig | None = None,
+        approved_go: bool = False,
     ) -> AgentResult:
-        del title, channel
-        cmd = [part.format(ref=backend_thread_ref) for part in self._steer_cmd]
+        del title
+        formatted = [part.format(ref=backend_thread_ref) for part in self._steer_cmd]
+        cmd = self._apply_preset_flags(
+            formatted,
+            is_steer=True,
+            channel=channel,
+            approved_go=approved_go,
+        )
         cmd.append(message)
         stdout, stderr, rc = await self._run(cmd, cwd=cwd)
         if rc != 0:
@@ -118,8 +197,13 @@ class CLIAgentBackend:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=(os.name == "posix"),
         )
-        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=self._timeout_s)
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=self._timeout_s)
+        except BaseException:
+            await kill_process_tree(proc)
+            raise
         return (
             out_b.decode("utf-8", errors="replace").strip(),
             err_b.decode("utf-8", errors="replace").strip(),

@@ -8,13 +8,23 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from watchpost.models import ThreadStatus
-from watchpost.server import create_app
+from watchpost.server import create_app, create_webhook_app
+
+
+def _auth_headers(app) -> dict[str, str]:
+    return {"Authorization": f"Bearer {app.state.watchpost_api_token}"}
 
 
 def test_headless_root_and_rest_api_flow() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         app = create_app(Path(tmp) / "daemon.db")
         client = TestClient(app)
+        hdrs = _auth_headers(app)
+
+        # Unauthenticated, cross-origin, and foreign-Host requests are rejected
+        assert client.get("/api/health").status_code == 401
+        assert client.post("/api/threads/dismiss-all", headers={**hdrs, "Origin": "https://evil.example"}).status_code == 403
+        assert client.get("/api/threads", headers={**hdrs, "Host": "evil.example:8787"}).status_code == 403
 
         # Headless JSON descriptor and strict non-UI security headers
         res = client.get("/")
@@ -27,64 +37,80 @@ def test_headless_root_and_rest_api_flow() -> None:
         assert res.headers["X-Frame-Options"] == "DENY"
         assert res.headers["Content-Security-Policy"] == "default-src 'none'; frame-ancestors 'none'"
 
-        h0 = client.get("/api/health").json()
+        h0 = client.get("/api/health", headers=hdrs).json()
         assert h0["status"] == "ok"
         assert h0["metrics"]["threads"] == 0
 
         # Run built-in simulator demo
-        sim = client.post("/api/simulate/run")
+        sim = client.post("/api/simulate/run", headers=hdrs)
         assert sim.status_code == 200
         assert sim.json()["threads_created"] == 2
 
-        channels = client.get("/api/channels").json()
+        channels = client.get("/api/channels", headers=hdrs).json()
         assert len(channels) == 2
 
         # Patch channel autonomy mode
-        patch = client.patch("/api/channels/sim_alex_dm", json={"autonomy_mode": "assistant_only"})
+        patch = client.patch("/api/channels/sim_alex_dm", json={"autonomy_mode": "assistant_only"}, headers=hdrs)
         assert patch.status_code == 200
         assert patch.json()["autonomy_mode"] == "assistant_only"
 
-        threads = client.get("/api/threads").json()
+        threads = client.get("/api/threads", headers=hdrs).json()
         assert len(threads) == 2
         go_thread = next(t for t in threads if t["pending_go"])
+        non_go_thread = next(t for t in threads if not t["pending_go"])
 
         # Copy draft metric tracking
-        copied = client.post(f"/api/threads/{go_thread['id']}/copied")
+        copied = client.post(f"/api/threads/{go_thread['id']}/copied", headers=hdrs)
         assert copied.status_code == 200
         assert copied.json()["marked"] >= 1
 
+        # Approving a thread that is not awaiting go returns 409 Conflict
+        refused = client.post(f"/api/threads/{non_go_thread['id']}/approve", headers=hdrs)
+        assert refused.status_code == 409
+
         # Steer then approve "go"
-        steered = client.post(f"/api/threads/{go_thread['id']}/steer", json={"message": "Check bay 2 pressure too"})
+        steered = client.post(
+            f"/api/threads/{go_thread['id']}/steer",
+            json={"message": "Check bay 2 pressure too"},
+            headers=hdrs,
+        )
         assert steered.status_code == 200
-        approved = client.post(f"/api/threads/{go_thread['id']}/approve")
+        approved = client.post(f"/api/threads/{go_thread['id']}/approve", headers=hdrs)
         assert approved.status_code == 200
         assert approved.json()["pending_go"] is False
         assert approved.json()["status"] == "completed"
 
-        h1 = client.get("/api/health").json()
+        h1 = client.get("/api/health", headers=hdrs).json()
         assert h1["metrics"]["drafts_copied"] >= 1
         assert h1["metrics"]["awaiting_go"] == 0
 
-        assert client.get("/api/threads/nonexistent").status_code == 404
-        assert client.post("/api/threads/nonexistent/dismiss").status_code == 404
+        assert client.get("/api/threads/nonexistent", headers=hdrs).status_code == 404
+        assert client.post("/api/threads/nonexistent/dismiss", headers=hdrs).status_code == 404
+
+        # Dedicated webhook listener isolates signed webhooks from control API routes
+        wh_app = create_webhook_app(app.state.watchpost_engine)
+        wh_client = TestClient(wh_app)
+        assert wh_client.get("/healthz").status_code == 200
+        assert wh_client.get("/api/threads").status_code == 404
 
 
 def test_dismiss_and_dismiss_all_pending_go() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         app = create_app(Path(tmp) / "daemon.db")
         client = TestClient(app)
+        hdrs = _auth_headers(app)
 
-        sim = client.post("/api/simulate/run")
+        sim = client.post("/api/simulate/run", headers=hdrs)
         assert sim.status_code == 200
 
-        threads = client.get("/api/threads").json()
+        threads = client.get("/api/threads", headers=hdrs).json()
         go_thread = next(t for t in threads if t["pending_go"])
 
-        dismissed = client.post(f"/api/threads/{go_thread['id']}/dismiss")
+        dismissed = client.post(f"/api/threads/{go_thread['id']}/dismiss", headers=hdrs)
         assert dismissed.status_code == 200
         assert dismissed.json()["pending_go"] is False
         assert dismissed.json()["status"] == "completed"
-        assert client.get("/api/health").json()["metrics"]["awaiting_go"] == 0
+        assert client.get("/api/health", headers=hdrs).json()["metrics"]["awaiting_go"] == 0
 
         # Re-simulate and test bulk dismiss-all
         store = app.state.watchpost_store
@@ -93,11 +119,11 @@ def test_dismiss_and_dismiss_all_pending_go() -> None:
                 update={"pending_go": True, "status": ThreadStatus.awaiting_go}
             )
         )
-        assert client.get("/api/health").json()["metrics"]["awaiting_go"] == 1
-        bulk = client.post("/api/threads/dismiss-all")
+        assert client.get("/api/health", headers=hdrs).json()["metrics"]["awaiting_go"] == 1
+        bulk = client.post("/api/threads/dismiss-all", headers=hdrs)
         assert bulk.status_code == 200
         assert bulk.json() == {"cleared": 1, "awaiting_go": 0}
-        assert client.get("/api/health").json()["metrics"]["awaiting_go"] == 0
+        assert client.get("/api/health", headers=hdrs).json()["metrics"]["awaiting_go"] == 0
 
 
 def test_hot_reload_quiet_brief_and_persistent_channel_patch(monkeypatch) -> None:
@@ -160,9 +186,10 @@ def test_hot_reload_quiet_brief_and_persistent_channel_patch(monkeypatch) -> Non
             config_path=cfg_path,
         )
         client = TestClient(app)
+        hdrs = _auth_headers(app)
 
         # Persistent mode patch writes both SQLite and config.json while preserving placeholders & 0600 perms
-        patch = client.patch("/api/channels/ch_keep", json={"autonomy_mode": "assistant_only"})
+        patch = client.patch("/api/channels/ch_keep", json={"autonomy_mode": "assistant_only"}, headers=hdrs)
         assert patch.status_code == 200
         assert patch.json()["autonomy_mode"] == "assistant_only"
         raw_after = load_raw_config(cfg_path)
@@ -191,7 +218,7 @@ def test_hot_reload_quiet_brief_and_persistent_channel_patch(monkeypatch) -> Non
         )
         save_config(updated_cfg, cfg_path)
 
-        rel = client.post("/api/reload")
+        rel = client.post("/api/reload", headers=hdrs)
         assert rel.status_code == 200
         rel_body = rel.json()
         assert rel_body["reloaded"] is True
@@ -206,11 +233,11 @@ def test_hot_reload_quiet_brief_and_persistent_channel_patch(monkeypatch) -> Non
         assert ch_new_db is not None and ch_new_db.enabled is True
 
         # Quiet & briefing endpoints work cleanly
-        q0 = client.get("/api/quiet").json()
+        q0 = client.get("/api/quiet", headers=hdrs).json()
         assert q0["active"] is False
-        q1 = client.post("/api/quiet", json={"action": "mute", "minutes": 45}).json()
+        q1 = client.post("/api/quiet", json={"action": "mute", "minutes": 45}, headers=hdrs).json()
         assert q1["active"] is True and q1["reason"] == "muted"
-        q2 = client.post("/api/quiet", json={"action": "unmute"}).json()
+        q2 = client.post("/api/quiet", json={"action": "unmute"}, headers=hdrs).json()
         assert q2["active"] is False
-        b = client.post("/api/brief")
+        b = client.post("/api/brief", headers=hdrs)
         assert b.status_code == 200 and b.json()["sent"] is True

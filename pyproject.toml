@@ -3,12 +3,29 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "watchpost"
-version = "0.3.0"
+name = "watchpost-agent"
+version = "0.4.0"
 description = "Headless local background bridge for your coding agent — zero-copy-paste head-starts delivered to your phone"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
+authors = [
+  { name = "Popcornnnnnnnn" },
+]
+keywords = ["ai-agents", "coding-agent", "chatops", "telegram", "slack", "feishu", "discord", "mcp", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+]
 dependencies = [
   "fastapi>=0.115,<1.0",
   "uvicorn>=0.32,<1.0",
@@ -31,6 +48,9 @@ watchpost = "watchpost.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/watchpost"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["site", "uv.lock"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

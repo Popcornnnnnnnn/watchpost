@@ -387,8 +387,8 @@ wheels = [
 ]
 
 [[package]]
-name = "watchpost"
-version = "0.3.0"
+name = "watchpost-agent"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
