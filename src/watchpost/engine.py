@@ -455,9 +455,8 @@ class WatchpostEngine:
         return original_text, image_paths, topic
 
     def _completion_channel_label(self, channel: ChannelConfig, *, sender_name: str = "") -> str:
-        is_zh = self.config.language.lower().startswith("zh")
         if channel.adapter == "owner_direct":
-            return "个人直聊" if is_zh else "Personal"
+            return ""
         base = (
             f"{channel.name} · {sender_name}"
             if (channel.chat_type == ChatType.group and sender_name and sender_name != "Owner")
@@ -973,15 +972,15 @@ class WatchpostEngine:
             if self.config.personal_workspace_dir is not None
             else str(self.config.workspace_dir)
         )
+        target_name = "Direct"
         existing = self.store.get_channel("personal_direct")
-        if existing is not None and existing.workspace_dir == ws:
+        if existing is not None and existing.workspace_dir == ws and existing.name == target_name:
             return existing
-        is_zh = self.config.language.lower().startswith("zh")
         ch = ChannelConfig(
             id="personal_direct",
             adapter="owner_direct",
             external_chat_id="owner",
-            name="个人直聊" if is_zh else "Personal Assistant",
+            name=target_name,
             chat_type=ChatType.p2p,
             trigger_mode=TriggerMode.all,
             autonomy_mode=AutonomyMode.auto_fix,
@@ -1018,7 +1017,7 @@ class WatchpostEngine:
             ):
                 active_thread = candidate
 
-        topic = (owner_message.splitlines()[0] if owner_message else "Personal chat")[:36]
+        topic = (owner_message.splitlines()[0] if owner_message else "Direct")[:36]
         title = f"[direct] {ch.name}: {topic}"
 
         if active_thread is not None:
@@ -1167,9 +1166,9 @@ class WatchpostEngine:
                 "- #N 内容 或 #N go：追问或批准列表第 N 条会话\n"
                 "- go / 执行：批准最近一条待确认会话执行修复\n"
                 "- skip / 忽略（或 #N skip / 左滑回复 忽略）：清除待确认（go）标记但不执行\n"
-                "- /new [内容]：开启新的个人直聊会话\n"
-                "- /reset：重置个人直聊上下文\n"
-                "- 直接发文字/语音/图片：自动进入个人直聊；左滑回复通知气泡可追问对应工作会话"
+                "- /new [内容]：开启新会话\n"
+                "- /reset：清空当前对话上下文\n"
+                "- 直接发文字/语音/图片即可对话；回复通知气泡可追问对应工作会话"
                 if is_zh
                 else "Watchpost commands:\n"
                 "- status: view running status & pending approvals\n"
@@ -1179,9 +1178,9 @@ class WatchpostEngine:
                 "- #N <text> or #N go: steer or approve listed thread N\n"
                 "- go / approve: approve latest pending thread\n"
                 "- skip / dismiss (or #N skip): clear pending go without executing\n"
-                "- /new [text]: start a fresh personal direct chat\n"
-                "- /reset: clear personal direct chat context\n"
-                "- direct text/voice/image: personal chat; swipe-reply on alert bubble to steer work thread"
+                "- /new [text]: start a fresh conversation\n"
+                "- /reset: clear current conversation context\n"
+                "- direct text/voice/image: chat directly; reply to an alert bubble to steer that work thread"
             )
             await self._send_owner_reply(action.notifier, msg)
             return None
@@ -1218,8 +1217,6 @@ class WatchpostEngine:
         if action.kind == "status":
             metrics = self.store.get_metrics()
             pending = [t for t in self.store.list_threads(limit=20) if t.pending_go]
-            personal_id = str(self.store.get_kv("personal_direct_active_thread_id", "") or "")
-            personal_th = self.store.get_thread(personal_id) if personal_id else None
             if is_zh:
                 msg = (
                     f"Watchpost 运行中（{self.backend.name}）：监控 {metrics['channels']} 个通道，"
@@ -1227,8 +1224,6 @@ class WatchpostEngine:
                 )
                 if pending:
                     msg += "\n待确认：" + "；".join(t.title for t in pending[:3])
-                if personal_th is not None:
-                    msg += f"\n个人直聊：{personal_th.title} [{personal_th.status.value}]"
             else:
                 msg = (
                     f"Watchpost running ({self.backend.name}): {metrics['channels']} channels, "
@@ -1236,8 +1231,6 @@ class WatchpostEngine:
                 )
                 if pending:
                     msg += "\nPending go: " + "; ".join(t.title for t in pending[:3])
-                if personal_th is not None:
-                    msg += f"\nPersonal chat: {personal_th.title} [{personal_th.status.value}]"
             await self._send_owner_reply(action.notifier, msg)
             return None
 
@@ -1262,9 +1255,9 @@ class WatchpostEngine:
             self.store.set_kv("personal_direct_reset_at", time.time())
             await self._send_owner_reply(
                 action.notifier,
-                "已重置个人直聊上下文，下条消息将开启新会话。"
+                "已清空当前对话上下文，下条消息将开启新会话。"
                 if is_zh
-                else "Reset personal direct chat context; next message starts fresh.",
+                else "Conversation context cleared; next message starts fresh.",
             )
             return None
 
@@ -1275,9 +1268,9 @@ class WatchpostEngine:
             if not formatted:
                 await self._send_owner_reply(
                     action.notifier,
-                    "已开启新的个人直聊会话，请发送问题。"
+                    "已开启新会话，请直接发消息。"
                     if is_zh
-                    else "Started a new personal direct chat; send your prompt.",
+                    else "Started a new conversation; send your message.",
                 )
                 return None
             return await self._handle_personal_direct(action, formatted, force_new=True)

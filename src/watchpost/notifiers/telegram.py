@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import mimetypes
 import re
 import tempfile
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +31,8 @@ _COMMANDS_ZH = [
     {"command": "status", "description": "查看运行状态与待确认列表"},
     {"command": "list", "description": "查看最近 5 条会话（支持 #N）"},
     {"command": "brief", "description": "立即生成最近 12 小时简报"},
-    {"command": "new", "description": "开启新的个人直聊会话"},
-    {"command": "reset", "description": "重置个人直聊上下文"},
+    {"command": "new", "description": "开启新会话"},
+    {"command": "reset", "description": "清空当前对话上下文"},
     {"command": "mute", "description": "临时静音通知（如 /mute 2h）"},
     {"command": "unmute", "description": "恢复消息通知"},
     {"command": "help", "description": "查看全部指令说明"},
@@ -37,8 +42,8 @@ _COMMANDS_EN = [
     {"command": "status", "description": "View daemon status and pending approvals"},
     {"command": "list", "description": "List 5 recent threads (#N reference)"},
     {"command": "brief", "description": "Send latest 12h briefing now"},
-    {"command": "new", "description": "Start a new Personal Direct Chat"},
-    {"command": "reset", "description": "Reset Personal Direct Chat context"},
+    {"command": "new", "description": "Start a new conversation"},
+    {"command": "reset", "description": "Clear current conversation context"},
     {"command": "mute", "description": "Temporarily mute notifications (e.g. /mute 2h)"},
     {"command": "unmute", "description": "Unmute notifications"},
     {"command": "help", "description": "Show command help"},
@@ -55,6 +60,44 @@ def _sanitize_media_filename(name: str, *, fallback: str, default_ext: str) -> s
     return base[:120]
 
 
+def default_avatar_path() -> Path:
+    """Return the bundled Watchpost bot avatar image path."""
+    return Path(__file__).resolve().parent.parent / "assets" / "avatar.png"
+
+
+def _make_http_client(proxy_url: str = "", *, timeout_s: float = 20.0) -> httpx.AsyncClient:
+    """Construct an AsyncClient using direct OS/TUN routing or an explicit proxy."""
+    proxy = proxy_url.strip() or None
+    return httpx.AsyncClient(timeout=timeout_s, proxy=proxy, trust_env=False)
+
+
+async def get_bot_info(
+    bot_token: str,
+    *,
+    base_url: str = "https://api.telegram.org",
+    proxy_url: str = "",
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Verify bot credentials via Telegram `getMe` and return the bot profile dict."""
+    token = bot_token.strip()
+    if not token:
+        raise RuntimeError("Telegram bot_token is required")
+    url = f"{base_url.rstrip('/')}/bot{token}/getMe"
+    owns_client = client is None
+    http = client or _make_http_client(proxy_url, timeout_s=15.0)
+    try:
+        resp = await http.get(url)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            raise RuntimeError(f"Telegram getMe failed: {payload}")
+        result = payload.get("result")
+        return dict(result) if isinstance(result, dict) else {}
+    finally:
+        if owns_client:
+            await http.aclose()
+
+
 async def detect_owner_chat_id(
     bot_token: str,
     *,
@@ -67,7 +110,7 @@ async def detect_owner_chat_id(
         raise RuntimeError("Telegram bot_token is required")
     url = f"{base_url.rstrip('/')}/bot{bot_token.strip()}/getUpdates"
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=15.0, proxy=proxy_url.strip() or None)
+    http = client or _make_http_client(proxy_url, timeout_s=15.0)
     try:
         resp = await http.get(url, params={"limit": 20, "timeout": 0})
         resp.raise_for_status()
@@ -91,6 +134,152 @@ async def detect_owner_chat_id(
                 or str(chat.get("title") or ""),
             }
         return list(seen.values())
+    finally:
+        if owns_client:
+            await http.aclose()
+
+
+async def wait_for_owner_chat_id(
+    bot_token: str,
+    *,
+    timeout_s: float = 120.0,
+    poll_interval_s: float = 2.0,
+    base_url: str = "https://api.telegram.org",
+    proxy_url: str = "",
+    client: httpx.AsyncClient | None = None,
+    on_tick: Callable[[], None] | None = None,
+) -> dict[str, str] | None:
+    """Poll `getUpdates` until the owner messages or presses Start in private chat."""
+    token = bot_token.strip()
+    if not token:
+        raise RuntimeError("Telegram bot_token is required")
+    owns_client = client is None
+    http = client or _make_http_client(proxy_url, timeout_s=15.0)
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    interval = max(0.01, float(poll_interval_s))
+    try:
+        while True:
+            chats = await detect_owner_chat_id(
+                token,
+                base_url=base_url,
+                proxy_url=proxy_url,
+                client=http,
+            )
+            private_chat = next((c for c in chats if c.get("type") == "private"), None)
+            if private_chat is not None:
+                return private_chat
+            if chats:
+                return chats[0]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if on_tick is not None:
+                on_tick()
+            await asyncio.sleep(min(interval, remaining))
+    finally:
+        if owns_client:
+            await http.aclose()
+
+
+async def set_bot_profile_photo(
+    bot_token: str,
+    photo_path: str | Path,
+    *,
+    base_url: str = "https://api.telegram.org",
+    proxy_url: str = "",
+    client: httpx.AsyncClient | None = None,
+) -> bool:
+    """Upload a static profile avatar image for the bot via `setMyProfilePhoto`."""
+    token = bot_token.strip()
+    if not token:
+        raise RuntimeError("Telegram bot_token is required")
+    src = Path(photo_path).expanduser()
+    if not src.is_file():
+        return False
+    mime_type = mimetypes.guess_type(src.name)[0] or "image/png"
+    content = src.read_bytes()
+    url = f"{base_url.rstrip('/')}/bot{token}/setMyProfilePhoto"
+    owns_client = client is None
+    http = client or _make_http_client(proxy_url, timeout_s=30.0)
+    try:
+        resp = await http.post(
+            url,
+            data={"photo": json.dumps({"type": "static", "photo": "attach://avatar"})},
+            files={"avatar": (src.name, content, mime_type)},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            raise RuntimeError(f"Telegram setMyProfilePhoto failed: {payload}")
+        return True
+    finally:
+        if owns_client:
+            await http.aclose()
+
+
+async def configure_bot_profile(
+    bot_token: str,
+    *,
+    language: str = "zh",
+    avatar_path: str | Path | None = None,
+    set_avatar: bool = True,
+    base_url: str = "https://api.telegram.org",
+    proxy_url: str = "",
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, bool]:
+    """Configure Telegram slash commands, bot descriptions, and optional avatar image."""
+    token = bot_token.strip()
+    if not token:
+        raise RuntimeError("Telegram bot_token is required")
+    is_zh = (language or "zh").lower().startswith("zh")
+    cmds = _COMMANDS_ZH if is_zh else _COMMANDS_EN
+    short_desc = (
+        "Watchpost 本地 AI 值班哨兵 — 群消息分诊、排查修复与一键批准"
+        if is_zh
+        else "Watchpost local AI sentinel — chat triage, fix drafts & 1-tap approvals"
+    )
+    full_desc = (
+        "Watchpost 运行在你的本机，安静监听工作群，只将排查结论、修复草案与一键确认按钮发给你，绝不自动外发工作群消息。"
+        if is_zh
+        else "Watchpost runs silently on your machine, triages noisy work chats with your coding agent, and sends concise updates plus 1-tap approval buttons here."
+    )
+    base = f"{base_url.rstrip('/')}/bot{token}"
+    owns_client = client is None
+    http = client or _make_http_client(proxy_url, timeout_s=30.0)
+    results = {
+        "commands": False,
+        "short_description": False,
+        "description": False,
+        "avatar": False,
+    }
+    try:
+        for key, endpoint, payload in (
+            ("commands", "setMyCommands", {"commands": cmds}),
+            ("short_description", "setMyShortDescription", {"short_description": short_desc}),
+            ("description", "setMyDescription", {"description": full_desc}),
+        ):
+            try:
+                resp = await http.post(f"{base}/{endpoint}", json=payload)
+                resp.raise_for_status()
+                body = resp.json()
+                results[key] = bool(isinstance(body, dict) and body.get("ok"))
+            except Exception as exc:
+                logger.warning("Telegram %s failed: %s", endpoint, exc)
+
+        if set_avatar:
+            resolved_avatar = Path(avatar_path).expanduser() if avatar_path else default_avatar_path()
+            if resolved_avatar.is_file():
+                try:
+                    results["avatar"] = await set_bot_profile_photo(
+                        token,
+                        resolved_avatar,
+                        base_url=base_url,
+                        proxy_url=proxy_url,
+                        client=http,
+                    )
+                except Exception as exc:
+                    logger.warning("Telegram setMyProfilePhoto failed: %s", exc)
+        return results
     finally:
         if owns_client:
             await http.aclose()
@@ -134,10 +323,10 @@ class TelegramNotifier:
         if self._external_client is not None:
             return self._external_client
         if self._owned_client is None:
-            proxy_url = getattr(self._config, "proxy_url", "").strip() or None
-            self._owned_client = httpx.AsyncClient(
-                timeout=max(15.0, float(self._config.poll_timeout_s) + 10.0),
-                proxy=proxy_url,
+            proxy_url = getattr(self._config, "proxy_url", "")
+            self._owned_client = _make_http_client(
+                proxy_url,
+                timeout_s=max(15.0, float(self._config.poll_timeout_s) + 10.0),
             )
         return self._owned_client
 

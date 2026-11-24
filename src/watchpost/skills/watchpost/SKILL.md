@@ -25,16 +25,15 @@ watchpost init-config
 Default config path: `~/.config/watchpost/config.json`. Keep raw secrets in environment variables (or `0600` config) and never echo them back in summaries.
 
 ### Step 2 — Set Up the Familiar Phone Entrance (Pick 1)
-1. **Telegram Bot (Recommended cross-platform):**
-   - Ask the user to create a bot in Telegram with `@BotFather` (`/newbot`) and send `"hi"` to their new bot once.
-   - Store the bot token (`TELEGRAM_BOT_TOKEN`), then run:
+1. **Telegram Bot (Recommended default):**
+   - Ask the user to create a bot in Telegram with `@BotFather` (`/newbot`), then run the 1-command onboarding flow:
      ```bash
-     watchpost telegram-whoami
+     watchpost telegram-setup --token "$TELEGRAM_BOT_TOKEN" --test-message
      ```
-   - Save `telegram.enabled = true`, `telegram.bot_token`, and discovered `telegram.owner_chat_id` into `~/.config/watchpost/config.json`.
-2. **macOS iMessage (macOS only):**
+   - This verifies the bot via `getMe`, sets the Watchpost avatar, registers the `/` command menu & description, waits for the user to tap **Start**, saves `0600` config, disables iMessage, and hot-reloads the running daemon. (For manual ID inspection only: `watchpost telegram-whoami`.)
+2. **macOS iMessage (Legacy macOS fallback):**
    - Set `imessage.enabled = true` and `imessage.owner_handle` to the user's iMessage phone number (`+...`) or Apple ID email.
-   - Remind the user that polling replies requires **Full Disk Access** (`~/Library/Messages/chat.db`) for the terminal/Python running `watchpost run`.
+   - Note: using `imessage` requires **Full Disk Access** (`~/Library/Messages/chat.db`) and a dedicated Messages account on Mac.
 
 ### Step 3 — Connect Read-Only Work Chat (`Feishu` / Lark)
 - Guide the user to configure a read-only Feishu app with **no send permissions** (zero read-receipt leaks):

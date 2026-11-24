@@ -35,7 +35,7 @@ from watchpost.notifiers.imessage import IMessageNotifier
 from watchpost.notifiers.ntfy import NtfyNotifier
 from watchpost.notifiers.pushover import PushoverNotifier
 from watchpost.notifiers.slack import SlackNotifier
-from watchpost.notifiers.telegram import TelegramNotifier
+from watchpost.notifiers.telegram import TelegramNotifier, get_bot_info
 from watchpost.notifiers.wecom import WeComNotifier
 from watchpost.ports import AgentBackend, MediaProcessor
 from watchpost.store import WatchpostStore
@@ -413,12 +413,29 @@ class WatchpostDaemon:
                 old_to_close.append(ntf)
             self.engine.notifiers = kept_notifiers
 
+            kept_set = set(kept_notifiers)
             reused_hub = _register_configured_platforms(
                 self.engine,
                 new_cfg,
                 existing_tg_hub=existing_tg_hub,
                 register_imessage=not has_live_imessage,
             )
+
+            for ntf in self.engine.notifiers:
+                if ntf in kept_set:
+                    continue
+                seed_fn = getattr(ntf, "seed_offset", None)
+                if callable(seed_fn):
+                    try:
+                        await seed_fn()
+                    except Exception as exc:
+                        logger.warning("Notifier %s seed_offset failed on reload: %s", getattr(ntf, "name", "?"), exc)
+                reg_fn = getattr(ntf, "register_commands", None)
+                if callable(reg_fn):
+                    try:
+                        await reg_fn()
+                    except Exception as exc:
+                        logger.warning("Notifier %s register_commands failed on reload: %s", getattr(ntf, "name", "?"), exc)
 
             for obj in old_to_close:
                 if reused_hub is not None:
@@ -611,7 +628,19 @@ def _check_backend_binary(
     }
 
 
-def run_doctor(cfg_path: Path | str | None = None) -> dict[str, Any]:
+def _run_async_in_sync(coro: Any, *, timeout_s: float = 15.0) -> Any:
+    """Execute an async helper safely whether or not an event loop is already running."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result(timeout=timeout_s)
+
+
+def run_doctor(cfg_path: Path | str | None = None, *, live: bool = False) -> dict[str, Any]:
     """Inspect config, dependencies, harnesses, and adapters without leaking secrets."""
     resolved_path = Path(cfg_path).expanduser() if cfg_path else default_config_path()
     checks: dict[str, dict[str, Any]] = {}
@@ -703,9 +732,27 @@ def run_doctor(cfg_path: Path | str | None = None) -> dict[str, Any]:
     # Phone entrances
     if cfg.telegram.enabled:
         tg_ok = bool(cfg.telegram.bot_token and cfg.telegram.owner_chat_id)
+        tg_detail = "configured" if tg_ok else "enabled but missing bot_token or owner_chat_id"
+        if tg_ok and live:
+            try:
+                bot_info = _run_async_in_sync(
+                    get_bot_info(
+                        cfg.telegram.bot_token,
+                        base_url=cfg.telegram.base_url,
+                        proxy_url=cfg.telegram.proxy_url,
+                    )
+                )
+                uname = str(bot_info.get("username") or "").strip()
+                tg_detail = f"configured (@{uname}, API reachable)" if uname else "configured (API reachable)"
+            except Exception as exc:
+                tg_ok = False
+                tg_detail = (
+                    f"configured locally, but Telegram API unreachable ({exc}); "
+                    "check network/Clash TUN or telegram.proxy_url"
+                )
         checks["telegram"] = {
             "ok": tg_ok,
-            "detail": "configured" if tg_ok else "enabled but missing bot_token or owner_chat_id",
+            "detail": tg_detail,
         }
     else:
         checks["telegram"] = {"ok": True, "detail": "disabled"}

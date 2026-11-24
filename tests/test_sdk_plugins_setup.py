@@ -373,3 +373,171 @@ def test_setup_wizard_interactive_and_non_interactive_and_init_config_flag(
     monkeypatch.setattr("watchpost.setup_wizard.DEFAULT_MEDIA_DIR", str(tmp_path / "init_i_media"))
     assert cli_main(["init-config", "--interactive", "--config", str(cfg_init_i)]) == 0
     assert load_raw_config(cfg_init_i).quiet_hours.enabled is False
+    assert load_raw_config(cfg_init_i).personal_workspace_dir == str(tmp_path)
+
+
+def test_telegram_setup_preserves_channels_uploads_avatar_and_hot_swaps_daemon(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import httpx
+    from watchpost.cli import run_telegram_setup
+    from watchpost.config import BackendConfig, IMessageConfig, TelegramConfig
+    from watchpost.daemon import WatchpostDaemon, build_engine_from_config
+    from watchpost.engine import WatchpostEngine
+    from watchpost.notifiers import classify_owner_command
+    from watchpost.setup_wizard import detect_environment
+
+    assert detect_environment()["recommended_notifier"] == "telegram"
+
+    cfg_path = tmp_path / "watchpost.json"
+    existing_ch = ChannelConfig(
+        id="feishu_ops",
+        adapter="feishu",
+        external_chat_id="oc_ops_99",
+        name="Ops Support",
+        chat_type=ChatType.group,
+        trigger_mode=TriggerMode.mention_owner,
+    )
+    save_config(
+        WatchpostConfig(
+            db_path=str(tmp_path / "wp.db"),
+            media_dir=str(tmp_path / "media"),
+            workspace_dir=str(tmp_path),
+            language="zh",
+            api_port=0,
+            backend=BackendConfig(preset="mock"),
+            imessage=IMessageConfig(
+                enabled=True,
+                owner_handle="+15550100",
+                personal_workspace_dir=str(tmp_path),
+                personal_session_ttl_s=3600,
+                ack_on_receive=False,
+            ),
+            channels=[existing_ch],
+        ),
+        cfg_path,
+    )
+
+    seen_requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        seen_requests.append(path)
+        if path.endswith("/getMe"):
+            return httpx.Response(200, json={"ok": True, "result": {"id": 123, "username": "wp_live_bot", "first_name": "Watchpost"}})
+        if path.endswith("/getUpdates"):
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {"update_id": 77, "message": {"message_id": 1, "chat": {"id": 555123, "type": "private"}, "text": "/start"}}
+                    ],
+                },
+            )
+        if any(
+            path.endswith(ep)
+            for ep in ("/setMyCommands", "/setMyShortDescription", "/setMyDescription", "/setMyProfilePhoto", "/sendMessage")
+        ):
+            if path.endswith("/sendMessage"):
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 900}})
+            return httpx.Response(200, json={"ok": True, "result": True})
+        return httpx.Response(404)
+
+    async def _run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            res = await run_telegram_setup(
+                config_path=cfg_path,
+                token="123456:TESTTOKEN",
+                wait_s=0.1,
+                no_reload=True,
+                send_test=True,
+                print_fn=lambda _m: None,
+                client=client,
+            )
+            assert res["ok"] is True
+            assert res["owner_chat_id"] == "555123"
+            assert res["profile"] == {
+                "commands": True,
+                "short_description": True,
+                "description": True,
+                "avatar": True,
+            }
+            assert res["test_sent"] is True
+            assert stat.S_IMODE(cfg_path.stat().st_mode) == 0o600
+
+            saved = load_config(cfg_path)
+            assert saved.telegram.enabled is True
+            assert saved.telegram.bot_token == "123456:TESTTOKEN"
+            assert saved.telegram.owner_chat_id == "555123"
+            assert saved.imessage.enabled is False
+            assert saved.personal_workspace_dir == str(tmp_path)
+            assert [c.id for c in saved.channels] == ["feishu_ops"]
+
+            # Hot-swap daemon from old config -> Telegram notifier triggers seed_offset + register_commands
+            old_cfg = WatchpostConfig(
+                db_path=str(tmp_path / "wp.db"),
+                media_dir=str(tmp_path / "media"),
+                workspace_dir=str(tmp_path),
+                language="zh",
+                api_port=0,
+                backend=BackendConfig(preset="mock"),
+            )
+            daemon = WatchpostDaemon(build_engine_from_config(old_cfg), old_cfg, config_path=cfg_path)
+            cmds_before = sum(1 for p in seen_requests if p.endswith("/setMyCommands"))
+
+            # Patch httpx.AsyncClient only for the newly constructed notifier during reload
+            real_async_client = httpx.AsyncClient
+            monkeypatch.setattr(
+                "watchpost.notifiers.telegram._make_http_client",
+                lambda proxy_url="", timeout_s=20.0: real_async_client(transport=httpx.MockTransport(handler)),
+            )
+            reload_res = await daemon.reload_from_disk()
+            assert reload_res["reloaded"] is True
+            assert any(n.name == "telegram" for n in daemon.engine.notifiers)
+            assert sum(1 for p in seen_requests if p.endswith("/setMyCommands")) > cmds_before
+            assert daemon.engine.store.get_kv("telegram_owner_update_offset") == 78
+
+            # Verify cleaned /status & /help outputs omit noisy labels
+            sent_texts: list[str] = []
+
+            class _CaptureNotifier:
+                name = "telegram"
+
+                async def send_message(self, text: str) -> str:
+                    sent_texts.append(text)
+                    return "m1"
+
+                async def notify_start(self, *args: Any, **kwargs: Any) -> list[str]:
+                    return []
+
+                async def notify_completion(self, *args: Any, **kwargs: Any) -> list[str]:
+                    return []
+
+                async def poll_owner_actions(self) -> list[Any]:
+                    return []
+
+            daemon.engine.notifiers = [_CaptureNotifier()]
+            await daemon.engine.handle_owner_action(classify_owner_command("/status", notifier="telegram"))  # type: ignore[arg-type]
+            await daemon.engine.handle_owner_action(classify_owner_command("/help", notifier="telegram"))  # type: ignore[arg-type]
+            await daemon.engine.handle_owner_action(classify_owner_command("/new", notifier="telegram"))  # type: ignore[arg-type]
+            await daemon.engine.handle_owner_action(classify_owner_command("/reset", notifier="telegram"))  # type: ignore[arg-type]
+            assert len(sent_texts) == 4
+            assert all("个人直聊" not in txt for txt in sent_texts)
+
+            await daemon.close_resources()
+        finally:
+            await client.aclose()
+
+    asyncio.run(_run())
+
+    # Verify live doctor check with mocked get_bot_info
+    async def _fake_bot_info(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"id": 123, "username": "wp_live_bot", "first_name": "Watchpost"}
+
+    monkeypatch.setattr("watchpost.daemon.get_bot_info", _fake_bot_info)
+    doc = run_doctor(cfg_path, live=True)
+    assert doc["ok"] is True
+    assert "@wp_live_bot, API reachable" in doc["checks"]["telegram"]["detail"]

@@ -45,7 +45,7 @@ def test_markdown_strip_and_bilingual_bubble_splitting() -> None:
     assert draft == "我刚调整了超时参数，等空闲确认。"
 
     personal_inline, inline_draft = format_completion_bubbles(
-        "个人直聊",
+        "Direct",
         "总结：当前目录正常。\n\n需要注意：无",
         language="zh",
         include_header=False,
@@ -54,7 +54,7 @@ def test_markdown_strip_and_bilingual_bubble_splitting() -> None:
     assert inline_draft == ""
 
     personal_plain, plain_draft = format_completion_bubbles(
-        "个人直聊",
+        "Direct",
         "目前正常，可以直接改代码。",
         language="zh",
         include_header=False,
@@ -131,7 +131,8 @@ def test_personal_direct_prompt_enforces_chinese_override_and_english_fallback()
     assert "禁止使用任何 Markdown" in zh_steer
     assert "不要附带对外回复草稿" in zh_steer
     assert "严禁输出" in zh_steer and "总结：" in zh_steer and "需要注意：" in zh_steer
-    assert "手机直聊跟进" in zh_steer
+    assert "对话跟进" in zh_steer
+    assert "个人直聊" not in zh_new and "个人直聊" not in zh_steer
     assert "当前工作区" not in zh_steer
 
     en_new = build_personal_direct_prompt(

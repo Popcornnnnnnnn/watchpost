@@ -286,12 +286,12 @@ def build_personal_direct_prompt(
     is_steer: bool = False,
     language: str = "zh",
 ) -> str:
-    """Build the mobile-concise prompt for a Personal Direct Chat turn or follow-up."""
+    """Build the mobile-concise prompt for a direct owner conversation turn or follow-up."""
     if language.lower().startswith("zh"):
         header = (
-            f"[Watchpost — 手机直聊跟进 ({notifier})]"
+            f"[Watchpost — 对话跟进 ({notifier})]"
             if is_steer
-            else f"[Watchpost — 手机直聊 ({notifier})]"
+            else f"[Watchpost ({notifier})]"
         )
         ws_line = "" if is_steer else f"\n当前工作区：{workspace_dir}"
         return (
@@ -300,16 +300,16 @@ def build_personal_direct_prompt(
             "## Explicit Language & Natural Texting Rules (覆盖默认英文规则 · 自然简体中文手机短气泡)\n"
             "1. EXPLICIT LANGUAGE REQUEST (OVERRIDES DEFAULT ENGLISH): 本会话是手机端一对一聊天，请严格全程使用自然简体中文回复，绝不输出英文段落（仅保留必需的技术缩写或路径）。\n"
             "2. 像熟络靠谱的技术搭档发微信/短信一样直接开口回答：简单问题直接 1 段（1–2 句短话）说清结论即可；确实需要补充时最多拆成 2–3 个极短段落（用空行隔开）。\n"
-            "3. 严禁输出“总结：”、“需要注意：”、“建议回复：”、“【个人直聊】”等机械格式标签，也不要画蛇添足写套话免责声明（比如“默认目录在某处所以……”“高风险操作会先确认……”）。\n"
+            "3. 严禁输出“总结：”、“需要注意：”、“建议回复：”或任何方括号前缀等机械格式标签，也不要画蛇添足写套话免责声明（比如“默认目录在某处所以……”“高风险操作会先确认……”）。\n"
             "4. 禁止使用任何 Markdown 符号（**、*、`、#、链接语法、代码块、表格），不贴无用的 commit SHA 或 PID。\n"
             "5. 若附带图片路径，先用 read_file 查看。\n"
             "6. 严禁自动发送任何外部聊天消息；除非主人明确要写对外消息，否则不要附带对外回复草稿。"
         )
 
     header = (
-        f"[Watchpost — Personal Direct Chat Follow-up ({notifier})]"
+        f"[Watchpost — Follow-up ({notifier})]"
         if is_steer
-        else f"[Watchpost — Personal Direct Chat ({notifier})]"
+        else f"[Watchpost ({notifier})]"
     )
     ws_line = "" if is_steer else f"\nWorkspace: {workspace_dir}"
     return (

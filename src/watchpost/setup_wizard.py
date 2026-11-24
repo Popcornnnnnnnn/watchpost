@@ -51,7 +51,7 @@ def detect_environment() -> dict[str, Any]:
     rec_backup = "codex" if ("codex" in detected_backends and rec_backend != "codex") else ""
     lark_cli = shutil.which("lark-cli")
     rec_platform = "feishu-lark-cli" if lark_cli else "feishu-api"
-    rec_notifier = "imessage" if sys.platform == "darwin" else "telegram"
+    rec_notifier = "telegram"
 
     return {
         "platform": sys.platform,
@@ -315,6 +315,9 @@ def run_setup_wizard(
         db_path=db_path,
         media_dir=media_dir,
         workspace_dir=workspace_dir,
+        personal_workspace_dir=workspace_dir,
+        personal_session_ttl_s=86400,
+        ack_on_receive=False,
         language=language,
         api_port=api_port,
         quiet_hours=QuietHoursConfig(
@@ -370,7 +373,7 @@ def run_setup_wizard(
     if notifier_choice == "imessage":
         say_fn("  export WATCHPOST_IMESSAGE_HANDLE='+15550100'")
     elif notifier_choice == "telegram":
-        say_fn("  export TELEGRAM_BOT_TOKEN=... TELEGRAM_OWNER_CHAT_ID=...")
+        say_fn(f"  watchpost telegram-setup --config {saved_path}")
     elif notifier_choice == "slack-dm":
         say_fn("  export SLACK_BOT_TOKEN=xoxb-... SLACK_OWNER_USER_ID=U...")
     elif notifier_choice == "discord-dm":

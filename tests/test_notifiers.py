@@ -382,3 +382,80 @@ def test_telegram_notifier_media_buttons_typing_commands_and_persistent_offset()
             await client.aclose()
 
     asyncio.run(_run())
+
+
+def test_telegram_profile_avatar_commands_and_wait_for_owner() -> None:
+    import json
+    from watchpost.notifiers.telegram import (
+        _COMMANDS_ZH,
+        configure_bot_profile,
+        default_avatar_path,
+        get_bot_info,
+        set_bot_profile_photo,
+        wait_for_owner_chat_id,
+    )
+
+    assert default_avatar_path().is_file()
+    assert all("个人直聊" not in cmd["description"] for cmd in _COMMANDS_ZH)
+
+    seen_calls: list[str] = []
+    photo_bodies: list[bytes] = []
+    poll_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        seen_calls.append(path)
+        if path.endswith("/getMe"):
+            return httpx.Response(200, json={"ok": True, "result": {"id": 99, "username": "wp_test_bot", "first_name": "Watchpost"}})
+        if path.endswith("/setMyProfilePhoto"):
+            photo_bodies.append(request.content)
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/setMyCommands") or path.endswith("/setMyShortDescription") or path.endswith("/setMyDescription"):
+            return httpx.Response(200, json={"ok": True, "result": True})
+        if path.endswith("/getUpdates"):
+            poll_count["n"] += 1
+            if poll_count["n"] == 1:
+                return httpx.Response(200, json={"ok": True, "result": []})
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 10,
+                            "message": {
+                                "message_id": 1,
+                                "chat": {"id": 424242, "type": "private", "username": "owner", "first_name": "Jack"},
+                                "text": "/start",
+                            },
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    async def _run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            info = await get_bot_info("tok_profile", client=client)
+            assert info["username"] == "wp_test_bot"
+
+            assert await set_bot_profile_photo("tok_profile", default_avatar_path(), client=client) is True
+            assert len(photo_bodies) == 1
+            assert b"attach://avatar" in photo_bodies[0]
+            assert b"\x89PNG" in photo_bodies[0]
+
+            prof = await configure_bot_profile("tok_profile", language="zh", set_avatar=True, client=client)
+            assert prof == {"commands": True, "short_description": True, "description": True, "avatar": True}
+
+            discovered = await wait_for_owner_chat_id(
+                "tok_profile",
+                timeout_s=2.0,
+                poll_interval_s=0.01,
+                client=client,
+            )
+            assert discovered is not None and discovered["chat_id"] == "424242"
+        finally:
+            await client.aclose()
+
+    asyncio.run(_run())

@@ -1,4 +1,4 @@
-"""Watchpost CLI entry point (`init`, `init-config`, `run`, `doctor`, `channels`, `telegram-whoami`, `install-skill`, `demo`, `serve`)."""
+"""Watchpost CLI entry point (`init`, `init-config`, `setup`, `run`, `doctor`, `channels`, `telegram-setup`, `telegram-whoami`, `install-skill`, `demo`, `serve`)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -13,6 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import httpx
 import uvicorn
 
 from watchpost import __version__
@@ -38,7 +40,13 @@ from watchpost.config import (
 from watchpost.daemon import WatchpostDaemon, build_engine_from_config, run_doctor
 from watchpost.engine import WatchpostEngine
 from watchpost.models import AutonomyMode, ChannelConfig, ChatType, EngineConfig, TriggerMode
-from watchpost.notifiers.telegram import detect_owner_chat_id
+from watchpost.notifiers.telegram import (
+    TelegramNotifier,
+    configure_bot_profile,
+    detect_owner_chat_id,
+    get_bot_info,
+    wait_for_owner_chat_id,
+)
 from watchpost.plugins import check_plugin, scaffold_plugin
 from watchpost.sandbox import run_interactive_sandbox
 from watchpost.sandbox_ui import create_sandbox_ui_app
@@ -108,6 +116,8 @@ async def _run_daemon_cli(
             handlers=handlers,
             force=True,
         )
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
     cfg = load_config(config_path)
     if api_port > 0:
         cfg = cfg.model_copy(update={"api_port": api_port})
@@ -172,6 +182,180 @@ def _handle_hook_stop(args: argparse.Namespace) -> int:
     store = WatchpostStore(db_path)
     handle_stop_hook_payload(payload, store=store)
     return 0
+
+
+async def run_telegram_setup(
+    *,
+    config_path: Path,
+    token: str = "",
+    chat_id: str = "",
+    proxy_url: str | None = None,
+    avatar_path: str = "",
+    set_avatar: bool = True,
+    wait_s: float = 120.0,
+    keep_imessage: bool = False,
+    no_reload: bool = False,
+    send_test: bool = False,
+    print_fn: Any = print,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """One-command Telegram onboarding: verify bot, upload avatar, pair owner chat_id, save 0600 config."""
+    target_cfg = Path(config_path).expanduser()
+    raw_cfg = load_raw_config(target_cfg) if target_cfg.is_file() else WatchpostConfig()
+    resolved_cfg = load_config(target_cfg) if target_cfg.is_file() else raw_cfg
+
+    bot_token = token.strip()
+    if not bot_token:
+        cand = resolved_cfg.telegram.bot_token.strip()
+        if cand and not cand.startswith("${"):
+            bot_token = cand
+    if not bot_token:
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token and sys.stdin.isatty():
+        bot_token = input("Paste Telegram bot token from @BotFather (/newbot): ").strip()
+    if not bot_token:
+        raise RuntimeError(
+            "Telegram bot_token is required. Create one via @BotFather (/newbot) in Telegram and pass --token."
+        )
+
+    eff_proxy = resolved_cfg.telegram.proxy_url if proxy_url is None else proxy_url.strip()
+    base_url = raw_cfg.telegram.base_url or "https://api.telegram.org"
+
+    try:
+        bot_info = await get_bot_info(bot_token, base_url=base_url, proxy_url=eff_proxy, client=client)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed reaching Telegram API getMe ({exc}); verify network/Clash TUN or pass --proxy-url"
+        ) from exc
+
+    bot_username = str(bot_info.get("username") or "").strip()
+    bot_name = str(bot_info.get("first_name") or "Watchpost").strip()
+    print_fn(
+        f"Verified bot: {bot_name} (@{bot_username})" if bot_username else f"Verified bot: {bot_name}"
+    )
+
+    profile = await configure_bot_profile(
+        bot_token,
+        language=raw_cfg.language,
+        avatar_path=avatar_path.strip() or None,
+        set_avatar=set_avatar,
+        base_url=base_url,
+        proxy_url=eff_proxy,
+        client=client,
+    )
+
+    owner_chat_id = chat_id.strip()
+    if not owner_chat_id:
+        existing_chats = await detect_owner_chat_id(
+            bot_token,
+            base_url=base_url,
+            proxy_url=eff_proxy,
+            client=client,
+        )
+        picked = next((c for c in existing_chats if c.get("type") == "private"), None) or (
+            existing_chats[0] if existing_chats else None
+        )
+        if picked is not None:
+            owner_chat_id = str(picked.get("chat_id") or "").strip()
+
+    if not owner_chat_id and wait_s > 0:
+        if bot_username:
+            print_fn(f"Open https://t.me/{bot_username}?start=watchpost and tap Start (waiting up to {int(wait_s)}s)...")
+        else:
+            print_fn(f"Send any message to your bot in Telegram (waiting up to {int(wait_s)}s)...")
+        waited = await wait_for_owner_chat_id(
+            bot_token,
+            timeout_s=wait_s,
+            base_url=base_url,
+            proxy_url=eff_proxy,
+            client=client,
+        )
+        if waited is not None:
+            owner_chat_id = str(waited.get("chat_id") or "").strip()
+
+    if not owner_chat_id:
+        existing_cid = resolved_cfg.telegram.owner_chat_id.strip()
+        if existing_cid and not existing_cid.startswith("${"):
+            owner_chat_id = existing_cid
+
+    if not owner_chat_id:
+        hint = f"https://t.me/{bot_username}?start=watchpost" if bot_username else "your bot in Telegram"
+        raise RuntimeError(
+            f"No Telegram owner chat discovered yet. Open {hint}, tap Start, and re-run `watchpost telegram-setup`."
+        )
+
+    personal_ws = raw_cfg.personal_workspace_dir or raw_cfg.imessage.personal_workspace_dir or raw_cfg.workspace_dir
+    personal_ttl = (
+        raw_cfg.personal_session_ttl_s
+        if int(raw_cfg.personal_session_ttl_s or 0) > 0
+        else raw_cfg.imessage.personal_session_ttl_s
+    )
+    ack_on_receive = (
+        raw_cfg.ack_on_receive
+        if raw_cfg.ack_on_receive is not None
+        else bool(raw_cfg.imessage.ack_on_receive)
+    )
+
+    updated_tg = raw_cfg.telegram.model_copy(
+        update={
+            "enabled": True,
+            "bot_token": bot_token,
+            "owner_chat_id": owner_chat_id,
+            "base_url": base_url,
+            "proxy_url": eff_proxy,
+        }
+    )
+    updated_imsg = (
+        raw_cfg.imessage
+        if keep_imessage
+        else raw_cfg.imessage.model_copy(update={"enabled": False})
+    )
+    updated_cfg = raw_cfg.model_copy(
+        update={
+            "personal_workspace_dir": personal_ws,
+            "personal_session_ttl_s": personal_ttl,
+            "ack_on_receive": ack_on_receive,
+            "telegram": updated_tg,
+            "imessage": updated_imsg,
+        }
+    )
+    saved_path = save_config(updated_cfg, target_cfg)
+    WatchpostStore(Path(updated_cfg.db_path).expanduser())
+
+    test_sent = False
+    if send_test:
+        is_zh = updated_cfg.language.lower().startswith("zh")
+        ping_text = (
+            "✅ Watchpost 已接入 Telegram，直接发消息即可对话，发送 /status 可查看运行状态。"
+            if is_zh
+            else "✅ Watchpost is connected on Telegram. Send any message to chat or /status for daemon status."
+        )
+        ntf = TelegramNotifier(updated_tg, language=updated_cfg.language, client=client)
+        try:
+            tok = await ntf.send_message(ping_text)
+            test_sent = bool(tok)
+        finally:
+            await ntf.aclose()
+
+    reloaded = False
+    if not no_reload and int(updated_cfg.api_port or 0) > 0 and client is None:
+        try:
+            async with httpx.AsyncClient(timeout=3.0, trust_env=False) as local_http:
+                resp = await local_http.post(f"http://127.0.0.1:{int(updated_cfg.api_port)}/api/reload")
+                reloaded = resp.status_code == 200
+        except Exception:
+            reloaded = False
+
+    return {
+        "ok": True,
+        "config_path": str(saved_path),
+        "bot_username": bot_username,
+        "owner_chat_id": owner_chat_id,
+        "profile": profile,
+        "imessage_enabled": bool(updated_imsg.enabled),
+        "test_sent": test_sent,
+        "reloaded": reloaded,
+    }
 
 
 def _handle_channels(args: argparse.Namespace) -> int:
@@ -354,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_doc = sub.add_parser("doctor", help="Verify config, storage, agent CLI, and phone/chat setup")
     p_doc.add_argument("--config", default="", help="Path to config.json")
+    p_doc.add_argument("--live", action="store_true", help="Also verify live Telegram Bot API connectivity")
     p_doc.add_argument("--json", action="store_true", help="Print JSON output")
 
     p_ch = sub.add_parser("channels", help="Inspect, discover, enroll, or remove monitored channels")
@@ -410,9 +595,25 @@ def main(argv: list[str] | None = None) -> int:
     p_plg_chk.add_argument("--timeout", type=float, default=15.0)
     p_plg_chk.add_argument("--json", action="store_true")
 
+    p_tg_setup = sub.add_parser(
+        "telegram-setup",
+        help="1-command Telegram onboarding: verify bot, upload Watchpost avatar, set / commands, pair owner chat_id, save 0600 config",
+    )
+    p_tg_setup.add_argument("--config", default="", help="Path to config.json")
+    p_tg_setup.add_argument("--token", default="", help="Telegram bot token from @BotFather (or reads config / TELEGRAM_BOT_TOKEN)")
+    p_tg_setup.add_argument("--chat-id", default="", help="Optional owner chat_id override (skips interactive Start wait)")
+    p_tg_setup.add_argument("--proxy-url", default=None, help="Optional HTTP/SOCKS proxy URL override")
+    p_tg_setup.add_argument("--avatar", default="", help="Optional custom bot avatar image path (defaults to bundled Watchpost avatar)")
+    p_tg_setup.add_argument("--no-avatar", action="store_true", help="Skip uploading the bot profile avatar")
+    p_tg_setup.add_argument("--wait", type=float, default=120.0, help="Seconds to wait for you to tap Start in Telegram (0 to skip)")
+    p_tg_setup.add_argument("--keep-imessage", action="store_true", help="Keep iMessage enabled instead of switching exclusively to Telegram")
+    p_tg_setup.add_argument("--no-reload", action="store_true", help="Do not call POST /api/reload on the running daemon")
+    p_tg_setup.add_argument("--test-message", action="store_true", help="Send a test confirmation message to the paired Telegram chat")
+
     p_tg = sub.add_parser("telegram-whoami", help="Discover recent Telegram chat IDs talking to your bot")
     p_tg.add_argument("--config", default="", help="Path to config.json")
     p_tg.add_argument("--token", default="", help="Override Telegram bot token")
+    p_tg.add_argument("--proxy-url", default=None, help="Optional HTTP/SOCKS proxy URL override")
 
     p_skill = sub.add_parser("install-skill", help="Install or remove the guided Watchpost Agent Skill")
     p_skill.add_argument("--target", default="claude", choices=sorted(SKILL_TARGETS))
@@ -536,7 +737,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
-        report: dict[str, Any] = run_doctor(cfg_path)
+        report: dict[str, Any] = run_doctor(cfg_path, live=args.live)
         if args.json:
             print(json.dumps(report, indent=2, ensure_ascii=False))
         else:
@@ -611,15 +812,49 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if res["ok"] else 1
         return 1
 
+    if args.command == "telegram-setup":
+        cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
+        try:
+            res = asyncio.run(
+                run_telegram_setup(
+                    config_path=cfg_path,
+                    token=args.token,
+                    chat_id=args.chat_id,
+                    proxy_url=args.proxy_url,
+                    avatar_path=args.avatar,
+                    set_avatar=not args.no_avatar,
+                    wait_s=args.wait,
+                    keep_imessage=args.keep_imessage,
+                    no_reload=args.no_reload,
+                    send_test=args.test_message,
+                )
+            )
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        prof = res["profile"]
+        print(
+            f"Saved Telegram setup ({res['config_path']}, 0600): "
+            f"owner_chat_id={res['owner_chat_id']}, "
+            f"avatar={prof['avatar']}, commands={prof['commands']}, "
+            f"imessage_enabled={res['imessage_enabled']}, reloaded={res['reloaded']}"
+        )
+        if not res["reloaded"]:
+            print(f"Next: start Watchpost with `watchpost run --config {res['config_path']}`")
+        return 0
+
     if args.command == "telegram-whoami":
         token = args.token.strip()
         base_url = "https://api.telegram.org"
+        proxy_url = "" if args.proxy_url is None else args.proxy_url.strip()
         if not token:
             cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
             cfg = load_config(cfg_path)
             token = cfg.telegram.bot_token
             base_url = cfg.telegram.base_url
-        chats = asyncio.run(detect_owner_chat_id(token, base_url=base_url))
+            if args.proxy_url is None:
+                proxy_url = cfg.telegram.proxy_url
+        chats = asyncio.run(detect_owner_chat_id(token, base_url=base_url, proxy_url=proxy_url))
         print(json.dumps(chats, indent=2, ensure_ascii=False))
         return 0
 

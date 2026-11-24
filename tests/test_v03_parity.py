@@ -1105,7 +1105,8 @@ def test_personal_direct_swipe_reply_stays_natural_without_bot_headers(tmp_path:
 
         assert len(backend.steers) == 1
         steer_prompt = backend.steers[0][2]
-        assert "手机直聊跟进" in steer_prompt
+        assert "对话跟进" in steer_prompt
+        assert "个人直聊" not in steer_prompt
         assert "使用纯文本标题（总结：、建议回复：、需要注意：）" not in steer_prompt
 
         assert len(notifier.completions) == 2
