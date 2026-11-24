@@ -387,9 +387,14 @@ class TelegramNotifier:
         self._offset_kv_key = telegram_owner_offset_key(self._token)
         saved_off = self._store.get_kv(self._offset_kv_key) if self._store is not None else None
         self._offset: int | None = int(saved_off) if isinstance(saved_off, int) and saved_off > 0 else None
+        self._committed_offset: int | None = self._offset
         self._pending_offset: int | None = None
         self._backoff_s = 0.0
         self._backoff_until = 0.0
+        if self._hub is not None and self._owner_chat_id:
+            register_fn = getattr(self._hub, "register_owner_chat_id", None)
+            if callable(register_fn):
+                register_fn(self._owner_chat_id)
 
     @property
     def hub(self) -> TelegramUpdateHub | None:
@@ -416,7 +421,8 @@ class TelegramNotifier:
     def _persist_offset(self) -> None:
         if self._store is not None and self._offset is not None:
             self._store.set_kv(self._offset_kv_key, int(self._offset))
-            self._pending_offset = None
+        self._committed_offset = self._offset
+        self._pending_offset = None
 
     def commit_offset(self) -> None:
         """Persist any deferred Telegram update cursor after owner actions have been processed."""
@@ -425,9 +431,19 @@ class TelegramNotifier:
             if callable(commit_fn):
                 commit_fn()
             return
-        if self._pending_offset is not None and self._store is not None:
+        if self._pending_offset is not None:
             self._offset = max(self._offset or 0, self._pending_offset)
             self._persist_offset()
+
+    def abort_deferred_offset(self) -> None:
+        """Roll back uncommitted cursor if owner dispatch is cancelled."""
+        if self._hub is not None:
+            abort_fn = getattr(self._hub, "abort_deferred_offset", None)
+            if callable(abort_fn):
+                abort_fn()
+            return
+        self._offset = self._committed_offset
+        self._pending_offset = None
 
     async def _post_with_retry(self, endpoint: str, **kwargs: Any) -> dict[str, Any]:
         last_exc: Exception | None = None

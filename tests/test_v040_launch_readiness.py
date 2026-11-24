@@ -1175,3 +1175,141 @@ def test_pr3_newer_awaiting_go_preserved_and_cancel_defers_offset(tmp_path: Path
             assert store2.get_kv(ntf._offset_kv_key) is None  # noqa: SLF001
 
     asyncio.run(_verify_cancel_no_commit())
+
+
+def test_pr4_shared_telegram_hub_defers_and_rolls_back_offset(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    class _HeldDirectBackend:
+        name = "held"
+
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.starts = 0
+
+        async def start_thread(self, title: str, prompt: str, *, cwd: Path, model: str = "", channel=None):
+            del title, prompt, cwd, model, channel
+            self.starts += 1
+            self.entered.set()
+            await self.release.wait()
+            return f"ref-{self.starts}", AgentResult(raw_text="Done")
+
+        async def steer_thread(self, *a: Any, **kw: Any) -> AgentResult:
+            del a, kw
+            return AgentResult(raw_text="Done")
+
+    # 1. Owner poll starts long action -> concurrent channel poll MUST NOT send offset=201 or persist KV -> cancel rolls back hub._offset
+    store1 = WatchpostStore(tmp_path / "s1.db")
+    offsets_seen_1: list[Any] = []
+
+    def handler_1(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getUpdates"):
+            offsets_seen_1.append(request.url.params.get("offset"))
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 200,
+                            "message": {"message_id": 1, "chat": {"id": 42, "type": "private"}, "from": {"is_bot": False}, "text": "check status"},
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async def _run_case_1() -> None:
+        be1 = _HeldDirectBackend()
+        eng1 = WatchpostEngine(
+            store1,
+            be1,
+            config=EngineConfig(workspace_dir=ws, personal_workspace_dir=ws, language="en"),
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_1)) as client:
+            hub = TelegramUpdateHub("777:sharedHub1", store=store1, client=client)
+            ntf = TelegramNotifier(
+                TelegramConfig(enabled=True, bot_token="777:sharedHub1", owner_chat_id="42"),
+                hub=hub,
+                store=store1,
+                client=client,
+            )
+            eng1.register_notifier(ntf)
+
+            poll_task = asyncio.create_task(eng1.poll_owner_actions_once())
+            await be1.entered.wait()
+
+            # Concurrent channel sync MUST NOT send offset=201 or write SQLite offset while owner turn runs
+            await hub.get_chat_messages("-1001")
+            assert offsets_seen_1 == [None]
+            assert store1.get_kv(hub._offset_kv_key) is None  # noqa: SLF001
+
+            # Cancelling aborts deferred offset back to committed None
+            poll_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await poll_task
+            assert store1.get_kv(hub._offset_kv_key) is None  # noqa: SLF001
+            assert hub._offset is None  # noqa: SLF001
+
+    asyncio.run(_run_case_1())
+
+    # 2. Channel poll fetches owner update 300 + group update 301 first -> offset deferred until poll_owner_actions_once finishes
+    store2 = WatchpostStore(tmp_path / "s2.db")
+    offsets_seen_2: list[Any] = []
+
+    def handler_2(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getUpdates"):
+            offsets_seen_2.append(request.url.params.get("offset"))
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 300,
+                            "message": {"message_id": 10, "chat": {"id": 42, "type": "private"}, "from": {"is_bot": False}, "text": "run check"},
+                        },
+                        {
+                            "update_id": 301,
+                            "message": {"message_id": 11, "chat": {"id": -1001, "type": "group"}, "from": {"is_bot": False}, "text": "hi team"},
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async def _run_case_2() -> None:
+        be2 = _HeldDirectBackend()
+        be2.release.set()
+        eng2 = WatchpostEngine(
+            store2,
+            be2,
+            config=EngineConfig(workspace_dir=ws, personal_workspace_dir=ws, language="en"),
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_2)) as client:
+            hub = TelegramUpdateHub("888:sharedHub2", store=store2, client=client)
+            ntf = TelegramNotifier(
+                TelegramConfig(enabled=True, bot_token="888:sharedHub2", owner_chat_id="42"),
+                hub=hub,
+                store=store2,
+                client=client,
+            )
+            eng2.register_notifier(ntf)
+
+            msgs = await hub.get_chat_messages("-1001")
+            assert len(msgs) == 1
+            assert store2.get_kv(hub._offset_kv_key) is None  # noqa: SLF001  # owner update 300 queued -> NOT persisted yet
+
+            # Second channel poll MUST NOT issue another getUpdates while update 300 is un-drained
+            await hub.get_chat_messages("-1001")
+            assert offsets_seen_2 == [None]
+
+            # Owner poll drains already-queued update 300 without issuing premature getUpdates and commits 302 only on completion
+            handled = await eng2.poll_owner_actions_once()
+            assert handled == 1 and be2.starts == 1
+            assert offsets_seen_2 == [None]
+            assert store2.get_kv(hub._offset_kv_key) == 302  # noqa: SLF001
+
+    asyncio.run(_run_case_2())

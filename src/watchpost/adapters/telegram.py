@@ -99,7 +99,10 @@ class TelegramUpdateHub:
         self._lock = asyncio.Lock()
         saved_off = self._store.get_kv(self._offset_kv_key) if self._store is not None else None
         self._offset: int | None = int(saved_off) if isinstance(saved_off, int) and saved_off > 0 else None
+        self._committed_offset: int | None = self._offset
         self._pending_offset: int | None = None
+        self._owner_chat_ids: set[str] = set()
+        self._deferred_owner_active: bool = False
         self._backoff_s = 0.0
         self._backoff_until = 0.0
         self._owner_queues: dict[str, deque[dict[str, Any]]] = {}
@@ -132,16 +135,38 @@ class TelegramUpdateHub:
             await self._owned_client.aclose()
             self._owned_client = None
 
+    def register_owner_chat_id(self, owner_chat_id: str) -> None:
+        """Track owner chat IDs so shared channel polls pause offset advancement while owner actions wait or execute."""
+        cid = (owner_chat_id or "").strip()
+        if cid:
+            self._owner_chat_ids.add(cid)
+
+    def _has_pending_owner_events(self) -> bool:
+        if self._deferred_owner_active:
+            return True
+        for cid in self._owner_chat_ids:
+            if self._owner_queues.get(cid) or self._owner_callbacks.get(cid):
+                return True
+        return False
+
     def _persist_offset(self) -> None:
         if self._store is not None and self._offset is not None:
             self._store.set_kv(self._offset_kv_key, int(self._offset))
-            self._pending_offset = None
+        self._committed_offset = self._offset
+        self._pending_offset = None
 
     def commit_offset(self) -> None:
         """Persist any deferred update cursor after downstream dispatch completes."""
-        if self._pending_offset is not None and self._store is not None:
+        self._deferred_owner_active = False
+        if self._pending_offset is not None and not self._has_pending_owner_events():
             self._offset = max(self._offset or 0, self._pending_offset)
             self._persist_offset()
+
+    def abort_deferred_offset(self) -> None:
+        """Revert any un-committed in-memory cursor if owner dispatch is cancelled."""
+        self._deferred_owner_active = False
+        self._offset = self._committed_offset
+        self._pending_offset = None
 
     def _record_message(self, msg: dict[str, Any]) -> None:
         chat = msg.get("chat") or {}
@@ -218,6 +243,8 @@ class TelegramUpdateHub:
         if not self._token:
             return 0
         async with self._lock:
+            if not defer_commit and self._has_pending_owner_events():
+                return 0
             if time.monotonic() < self._backoff_until:
                 return 0
             params: dict[str, Any] = {
@@ -285,7 +312,7 @@ class TelegramUpdateHub:
                     self._record_callback_query(cb)
                     count += 1
             if self._offset != prev_offset:
-                if defer_commit:
+                if defer_commit or self._has_pending_owner_events():
                     self._pending_offset = self._offset
                 else:
                     self._persist_offset()
@@ -297,17 +324,23 @@ class TelegramUpdateHub:
         *,
         defer_commit: bool = False,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Synchronize once and atomically drain both owner messages and callback queries."""
-        await self.sync(defer_commit=defer_commit)
+        """Synchronize once when needed and atomically drain both owner messages and callback queries."""
+        self.register_owner_chat_id(owner_chat_id)
         cid = owner_chat_id.strip()
         m_queue = self._owner_queues.get(cid)
         c_queue = self._owner_callbacks.get(cid)
+        if not m_queue and not c_queue:
+            await self.sync(defer_commit=defer_commit)
+            m_queue = self._owner_queues.get(cid)
+            c_queue = self._owner_callbacks.get(cid)
         msgs = list(m_queue) if m_queue else []
         cbs = list(c_queue) if c_queue else []
         if m_queue:
             m_queue.clear()
         if c_queue:
             c_queue.clear()
+        if defer_commit and (msgs or cbs):
+            self._deferred_owner_active = True
         return msgs, cbs
 
     async def poll_owner_messages(self, owner_chat_id: str, *, defer_commit: bool = False) -> list[dict[str, Any]]:

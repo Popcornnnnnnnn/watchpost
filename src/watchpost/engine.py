@@ -1652,22 +1652,31 @@ class WatchpostEngine:
                 logger.warning("Notifier %s poll_owner_actions failed: %s", ntf.name, redact_secrets(str(exc)))
                 continue
             before_tasks = set(self._bg_tasks)
-            for action in actions:
-                try:
-                    await self.handle_owner_action(action)
-                    handled += 1
-                except Exception as exc:
-                    safe_err = redact_secrets(str(exc))
-                    logger.warning("Failed handling owner action %s: %s", action.kind, safe_err)
-                    err_notice = (
-                        f"指令处理失败（{action.kind}）：{safe_err[:180]}"
-                        if is_zh
-                        else f"Failed handling command ({action.kind}): {safe_err[:180]}"
-                    )
-                    await self._send_owner_reply(action.notifier, err_notice)
-            spawned = [t for t in self._bg_tasks if t not in before_tasks and not t.done()]
-            if spawned:
-                await asyncio.gather(*spawned)
+            try:
+                for action in actions:
+                    try:
+                        await self.handle_owner_action(action)
+                        handled += 1
+                    except Exception as exc:
+                        safe_err = redact_secrets(str(exc))
+                        logger.warning("Failed handling owner action %s: %s", action.kind, safe_err)
+                        err_notice = (
+                            f"指令处理失败（{action.kind}）：{safe_err[:180]}"
+                            if is_zh
+                            else f"Failed handling command ({action.kind}): {safe_err[:180]}"
+                        )
+                        await self._send_owner_reply(action.notifier, err_notice)
+                spawned = [t for t in self._bg_tasks if t not in before_tasks and not t.done()]
+                if spawned:
+                    await asyncio.gather(*spawned)
+            except BaseException:
+                abort_fn = getattr(ntf, "abort_deferred_offset", None)
+                if callable(abort_fn):
+                    try:
+                        abort_fn()
+                    except Exception:
+                        pass
+                raise
             commit_fn = getattr(ntf, "commit_offset", None)
             if callable(commit_fn):
                 try:
