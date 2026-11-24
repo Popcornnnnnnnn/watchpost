@@ -451,11 +451,11 @@ class WatchpostDaemon:
             if reused_hub is not None:
                 set_owners = getattr(reused_hub, "set_owner_chat_ids", None)
                 if callable(set_owners):
-                    owner_ids = (
-                        {new_cfg.telegram.owner_chat_id.strip()}
-                        if (new_cfg.telegram.enabled and new_cfg.telegram.owner_chat_id.strip())
-                        else set()
-                    )
+                    owner_ids = {
+                        n.owner_chat_id
+                        for n in self.engine.notifiers
+                        if isinstance(n, TelegramNotifier) and n.hub is reused_hub and n.owner_chat_id
+                    }
                     set_owners(owner_ids)
 
             for ntf in self.engine.notifiers:

@@ -400,6 +400,10 @@ class TelegramNotifier:
     def hub(self) -> TelegramUpdateHub | None:
         return self._hub
 
+    @property
+    def owner_chat_id(self) -> str:
+        return self._owner_chat_id
+
     def _client(self) -> httpx.AsyncClient:
         if self._external_client is not None:
             return self._external_client

@@ -20,7 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from watchpost.adapters.dingtalk import DingTalkAdapter
-from watchpost.adapters.telegram import TelegramUpdateHub
+from watchpost.adapters.telegram import TelegramInboundAdapter, TelegramUpdateHub
 from watchpost.backends.cli_agent import CLIAgentBackend
 from watchpost.backends.fallback import FallbackBackend
 from watchpost.backends.mock import MockAgentBackend
@@ -1458,3 +1458,87 @@ def test_pr5_shared_hub_abort_replay_parse_error_and_owner_reload(tmp_path: Path
             assert len(msgs) == 1 and msgs[0]["text"] == "group ping"
 
     asyncio.run(_run_owner_switch())
+
+
+def test_pr6_reload_separate_inbound_and_owner_tokens_does_not_stall_hub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cfg_path = tmp_path / "config.json"
+    db_path = tmp_path / "reload.db"
+
+    async def _noop(*_a: Any, **_kw: Any) -> int:
+        return 0
+
+    monkeypatch.setattr(TelegramNotifier, "seed_offset", _noop)
+    monkeypatch.setattr(TelegramNotifier, "register_commands", _noop)
+
+    calls = 0
+
+    def inbound_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path.endswith("/getUpdates"):
+            calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": calls,
+                            "message": {
+                                "message_id": calls,
+                                "chat": {"id": 42, "type": "private"},
+                                "text": f"msg-{calls}",
+                            },
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async def _run_reload_separate_tokens() -> None:
+        init_tg = TelegramConfig(enabled=True, bot_token="111:sharedTok", inbound_enabled=True, owner_chat_id="42")
+        init_cfg = WatchpostConfig(
+            db_path=str(db_path),
+            workspace_dir=str(ws),
+            personal_workspace_dir=str(ws),
+            telegram=init_tg,
+        )
+        save_config(init_cfg, cfg_path)
+
+        store = WatchpostStore(db_path)
+        eng = WatchpostEngine(store, MockAgentBackend(language="en"), config=EngineConfig(workspace_dir=ws))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(inbound_handler)) as client:
+            hub = TelegramUpdateHub("222:inboundTok", store=store, client=client)
+            eng.register_adapter(TelegramInboundAdapter(init_tg, hub=hub, client=client))
+            eng.register_notifier(TelegramNotifier(init_tg, hub=hub, store=store, client=client))
+            daemon = WatchpostDaemon(eng, init_cfg, config_path=cfg_path)
+
+            # Hot-reload so notifier uses a DIFFERENT token while inbound keeps 222:inboundTok
+            new_cfg = init_cfg.model_copy(
+                update={
+                    "telegram": TelegramConfig(
+                        enabled=True,
+                        bot_token="333:notifyOnlyTok",
+                        inbound_enabled=True,
+                        inbound_bot_token="222:inboundTok",
+                        owner_chat_id="42",
+                    )
+                }
+            )
+            save_config(new_cfg, cfg_path)
+            await daemon.reload_from_disk()
+
+            assert eng.adapters["telegram"].hub is hub
+            assert eng.notifiers[0].hub is None
+            assert hub._owner_chat_ids == set()  # noqa: SLF001
+
+            await hub.sync()
+            await hub.sync()
+            assert calls == 2
+            assert hub._has_pending_owner_events() is False  # noqa: SLF001
+
+    asyncio.run(_run_reload_separate_tokens())
