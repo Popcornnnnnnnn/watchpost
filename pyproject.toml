@@ -50,7 +50,7 @@ watchpost = "watchpost.cli:main"
 packages = ["src/watchpost"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["site", "uv.lock"]
+exclude = ["site", "uv.lock", "docs/assets"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

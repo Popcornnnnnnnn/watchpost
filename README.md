@@ -1,9 +1,17 @@
 # Watchpost (`watchpost-agent`)
 
+[![CI](https://github.com/Popcornnnnnnnn/watchpost/actions/workflows/ci.yml/badge.svg)](https://github.com/Popcornnnnnnnn/watchpost/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Popcornnnnnnnn/watchpost)](https://github.com/Popcornnnnnnnn/watchpost/releases/latest)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Popcornnnnnnnn/watchpost/blob/main/LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
+[![Website](https://img.shields.io/badge/website-watchpost.popcornnn.xyz-0f172a)](https://watchpost.popcornnn.xyz)
+
 **Website:** [watchpost.popcornnn.xyz](https://watchpost.popcornnn.xyz)
 
 **Headless local background bridge for your coding agent (`Apache-2.0`).**
 Watches selected chat channels, runs local triage + your coding agent (`Antigravity`, `Codex`, `Claude Code`, `Gemini CLI`, with automatic primary→backup failover), and delivers concise diagnoses and **1-tap-copy draft replies** strictly to your phone or DM—never auto-sending to external senders.
+
+![Watchpost overview](site/assets/og-watchpost.png)
 
 ## How It Works
 
@@ -32,6 +40,12 @@ flowchart LR
 - **Hardened Control API & Isolated `webhook_port`:** Local control routes on `--api-port 8787` enforce a `0o600` Bearer token (`~/.local/share/watchpost/api.token`), loopback `Host` allowlist, and browser `Origin` blocking. Expose an optional separate `webhook_port` (e.g., `8788`) for public reverse tunnels so `/api/*` control routes stay local-only.
 - **10 Native Integrations + Out-of-Process Plugin SDK:** Built-in support for **Feishu / Lark**, **Slack**, **Discord**, **Telegram** (outbound + shared-hub inbound), **DingTalk**, **WeCom (企业微信)**, **macOS iMessage**, **ntfy**, **Bark**, and **Pushover**, plus a clean-room WhatsApp stdio SDK template ([`examples/whatsapp_plugin_template.py`](https://github.com/Popcornnnnnnnn/watchpost/blob/main/examples/whatsapp_plugin_template.py)).
 - **Background Service & Reliability Controls:** Single-instance `watchpost.lock`, token-scoped Telegram polling with `409`/`429` backoff, secret redaction across logs/HTTP errors, periodic media pruning, and `watchpost service install|status|uninstall` (`launchd` / `systemd --user`).
+
+## Interactive Sandbox Preview
+
+Run `watchpost sandbox-ui --backend mock` to test colleague chats, read-only diagnosis, 1-tap drafts, and `go` approvals locally.
+
+![Watchpost 2-column sandbox simulator](docs/assets/sandbox-demo.png)
 
 ## Quickstart (5-Minute Onboarding)
 
