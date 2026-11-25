@@ -38,9 +38,9 @@ flowchart LR
 Requires Python `3.11+`:
 
 ```bash
-# Recommended: install CLI globally via uv or pipx
-uv tool install watchpost-agent
-# or: pipx install watchpost-agent
+# Recommended: install CLI globally from GitHub via uv or pipx
+uv tool install git+https://github.com/Popcornnnnnnnn/watchpost.git
+# or: pipx install git+https://github.com/Popcornnnnnnnn/watchpost.git
 
 # Or install from source
 git clone https://github.com/Popcornnnnnnnn/watchpost.git && cd watchpost

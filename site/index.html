@@ -485,8 +485,8 @@
                 <span>bash · Setup Wizard</span>
                 <button type="button" class="code-copy-btn" data-copy-target="code-setup" aria-label="Copy setup commands" data-i18n="qs.copy">Copy</button>
               </div>
-              <pre><code id="code-setup"># Install globally via uv or pipx (or clone &amp;&amp; uv sync --all-extras)
-uv tool install watchpost-agent
+              <pre><code id="code-setup"># Install globally from GitHub via uv or pipx (or clone &amp;&amp; uv sync --all-extras)
+uv tool install git+https://github.com/Popcornnnnnnnn/watchpost.git
 
 # Writes 0600 ~/.config/watchpost/config.json + optional .env credentials
 watchpost setup
