@@ -1,4 +1,4 @@
-"""Offline Field-Ops channel simulator adapter for testing and interactive demos."""
+"""Offline channel simulator adapter for testing and interactive demos."""
 
 from __future__ import annotations
 
@@ -23,37 +23,37 @@ def default_demo_channels() -> list[ChannelConfig]:
             id="sim_alex_dm",
             adapter="simulator",
             external_chat_id="sim_chat_alex",
-            name="Alex (Field Ops DM)",
+            name="Alex (Release DM)",
             chat_type=ChatType.p2p,
             trigger_mode=TriggerMode.all,
             autonomy_mode=AutonomyMode.diagnose_only,
             persona_text=(
-                "Role: Field Commissioning Engineer.\n"
-                "Scope: Telemetry Node 1–3 deployments and rollout status checks.\n"
+                "Role: Backend Release Engineer.\n"
+                "Scope: API & Worker v2.1 deployments and rollout status checks.\n"
                 "Style: Asks brief rollout and schedule questions alongside real fault escalations."
             ),
-            whisper_prompt="Node 1 Node 2 v2.1 rollout telemetry bay",
+            whisper_prompt="Node 1 Node 2 v2.1 rollout worker api",
         ),
         ChannelConfig(
-            id="sim_site_alpha_group",
+            id="sim_ops_alerts_group",
             adapter="simulator",
-            external_chat_id="sim_chat_alpha_group",
-            name="Site Alpha Support (@me Group)",
+            external_chat_id="sim_chat_ops_group",
+            name="Ops Alerts (@me Group)",
             chat_type=ChatType.group,
             trigger_mode=TriggerMode.mention_owner,
             autonomy_mode=AutonomyMode.diagnose_only,
             persona_text=(
-                "Role: Site Alpha Hardware Support Group.\n"
-                "Members: Sam (On-site Tech), Alex (Support Engineer), Lead.\n"
-                "Pattern: Overnight operator screenshots -> morning @Lead escalation."
+                "Role: Backend Services Support Group.\n"
+                "Members: Sam (On-call Eng), Alex (Support Engineer), Lead.\n"
+                "Pattern: Overnight alert screenshots -> morning @Lead escalation."
             ),
-            whisper_prompt="Site Alpha Bay 2 Robot-07 PLC timeout handshake",
+            whisper_prompt="Ops Alerts Worker-02 API 503 timeout pool",
         ),
     ]
 
 
 class SimulatorAdapter:
-    """In-memory mock adapter modeling real B2B field-ops message streams."""
+    """In-memory mock adapter modeling realistic engineering chat streams."""
 
     name = "simulator"
 
@@ -73,7 +73,7 @@ class SimulatorAdapter:
                 create_time="09:40:00",
                 sender_id="user_alex",
                 sender_name="Alex",
-                clean_text="Morning! Starting Bay 1 rollout checks.",
+                clean_text="Morning! Starting Node 1 rollout checks.",
             ),
             NormalizedMessage(
                 message_id="dm_1",
@@ -96,7 +96,7 @@ class SimulatorAdapter:
         ]
 
         t_overnight = t - 9 * 3600 * 1000
-        self._history["sim_chat_alpha_group"] = [
+        self._history["sim_chat_ops_group"] = [
             NormalizedMessage(
                 message_id="grp_0_seed",
                 position=100,
@@ -115,7 +115,7 @@ class SimulatorAdapter:
                 sender_id="user_sam",
                 sender_name="Sam",
                 msg_type="image",
-                media_refs=[MediaRef(kind="image", key="sim_hmi_bay2", ext=".png")],
+                media_refs=[MediaRef(kind="image", key="sim_trace_worker2", ext=".png")],
             ),
             NormalizedMessage(
                 message_id="grp_2_handoff",
@@ -124,7 +124,7 @@ class SimulatorAdapter:
                 create_time="01:02:15",
                 sender_id="user_sam",
                 sender_name="Sam",
-                clean_text="Bay 2 handshake took 690s and timed out @Alex",
+                clean_text="Worker 2 pool returned 503 and timed out @Alex",
                 mentions=[Mention(id="user_alex", name="Alex")],
             ),
             # Unrelated Bucket-2 background with undecoded image (must NOT be downloaded)
@@ -157,7 +157,7 @@ class SimulatorAdapter:
                 create_time="09:44:00",
                 sender_id="user_alex",
                 sender_name="Alex",
-                clean_text="@Lead 帮忙看一下昨晚 Bay 2 反馈的握手超时问题",
+                clean_text="@Lead 帮忙看一下昨晚 Worker 2 反馈的 503 超时问题",
                 mentions=[Mention(id="user_owner", name="Lead")],
                 mentions_owner=True,
             ),

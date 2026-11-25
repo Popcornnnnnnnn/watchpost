@@ -71,7 +71,7 @@ def test_headless_root_and_rest_api_flow() -> None:
         # Steer then approve "go"
         steered = client.post(
             f"/api/threads/{go_thread['id']}/steer",
-            json={"message": "Check bay 2 pressure too"},
+            json={"message": "Check worker 2 pool latency too"},
             headers=hdrs,
         )
         assert steered.status_code == 200

@@ -1700,7 +1700,7 @@ class WatchpostEngine:
         return handled
 
     async def run_demo_scenario(self) -> dict[str, Any]:
-        """Populate SQLite with the built-in Field-Ops simulator channels & sample scenario."""
+        """Populate SQLite with the built-in simulator channels & sample scenario."""
         sim = self.adapters.get("simulator")
         if not isinstance(sim, SimulatorAdapter):
             sim = SimulatorAdapter()

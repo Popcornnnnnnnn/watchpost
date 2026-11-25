@@ -71,7 +71,7 @@ def test_telegram_notifier_send_auth_and_actions() -> None:
                                     "message_id": 503,
                                     "chat": {"id": 12345, "type": "private"},
                                     "from": {"is_bot": False},
-                                    "text": "Also check bay 3",
+                                    "text": "Also check worker 3",
                                 },
                             },
                         ],
@@ -98,7 +98,7 @@ def test_telegram_notifier_send_auth_and_actions() -> None:
         ch = ChannelConfig(id="ch1", adapter="feishu", external_chat_id="oc_1", name="Ops")
         th = ThreadRecord(id="th_1", channel_id="ch1", backend="mock", backend_thread_ref="r1", title="Bug")
 
-        start_ids = await ntf.notify_start(ch, th, "bay 2 stuck")
+        start_ids = await ntf.notify_start(ch, th, "worker 2 stuck")
         done_ids = await ntf.notify_completion(ch, th, ["Summary bubble", "Draft bubble"])
         assert start_ids == ["101"]
         assert done_ids == ["102", "103"]
@@ -108,7 +108,7 @@ def test_telegram_notifier_send_auth_and_actions() -> None:
         assert len(actions) == 3  # stranger chat_id=999999 rejected
         assert actions[0].kind == "approve_go" and actions[0].reply_token == "102"
         assert actions[1].kind == "status"
-        assert actions[2].kind == "steer" and actions[2].text == "Also check bay 3"
+        assert actions[2].kind == "steer" and actions[2].text == "Also check worker 3"
 
         # Offset advanced -> subsequent poll returns empty
         assert await ntf.poll_owner_actions() == []
@@ -120,8 +120,8 @@ def test_telegram_notifier_send_auth_and_actions() -> None:
 
 def test_imessage_notifier_backlog_echo_and_attributed_body() -> None:
     # Verify typedstream attributedBody extraction
-    sample_blob = b"\x04\x0bstreamtyped\x81\xe8\x03NSString\x01\x94\x84\x01+\x0eCheck bay 2 OK\x86\x84\x02"
-    assert extract_attributed_body_text(sample_blob) == "Check bay 2 OK"
+    sample_blob = b"\x04\x0bstreamtyped\x81\xe8\x03NSString\x01\x94\x84\x01+\x0eCheck API 2 OK\x86\x84\x02"
+    assert extract_attributed_body_text(sample_blob) == "Check API 2 OK"
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "chat.db"
@@ -255,7 +255,7 @@ def test_telegram_notifier_media_buttons_typing_commands_and_persistent_offset()
     async def _run() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            img = root / "bay2.png"
+            img = root / "worker2.png"
             img.write_bytes(b"\x89PNG\r\n\x1a\nFAKEPNG")
             store = WatchpostStore(root / "wp.db")
             cfg = TelegramConfig(enabled=True, bot_token="tok_full", owner_chat_id="777")
@@ -289,10 +289,10 @@ def test_telegram_notifier_media_buttons_typing_commands_and_persistent_offset()
                 channel_id="ch_ops",
                 backend="mock",
                 backend_thread_ref="r1",
-                title="Bay 2",
+                title="Worker 2",
                 pending_go=True,
             )
-            start_ids = await ntf.notify_start(ch, th_go, "Bay 2 screenshot", attachments=[str(img)])
+            start_ids = await ntf.notify_start(ch, th_go, "Worker 2 screenshot", attachments=[str(img)])
             assert start_ids == ["301", "401"]
             assert len(photo_uploads) == 1
 

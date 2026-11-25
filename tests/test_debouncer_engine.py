@@ -67,7 +67,7 @@ def test_engine_simulator_handoff_filters_and_owner_go() -> None:
 
         threads = {t.channel_id: t for t in store.list_threads()}
         dm_thread = threads["sim_alex_dm"]
-        grp_thread = threads["sim_site_alpha_group"]
+        grp_thread = threads["sim_ops_alerts_group"]
         assert dm_thread.triage_mode == TriageMode.mode_1_qa
         assert dm_thread.status == ThreadStatus.completed
         assert dm_thread.pending_go is False
@@ -79,7 +79,7 @@ def test_engine_simulator_handoff_filters_and_owner_go() -> None:
         # Follow-up pure small talk / recalled message in same group produces 0 triggers
         ignored = asyncio.run(
             engine.ingest_messages(
-                "sim_site_alpha_group",
+                "sim_ops_alerts_group",
                 [
                     NormalizedMessage(
                         message_id="grp_del_2",
@@ -147,12 +147,12 @@ def test_auto_fix_deploy_requires_go_and_codex_sandbox_selection() -> None:
             raw = (
                 "Summary:\nFixed parser locally and ran unit tests.\n\n"
                 "Suggested Reply:\nFixed locally; awaiting go to deploy.\n\n"
-                "Needs Attention:\nReply go to deploy to field IPC"
+                "Needs Attention:\nReply go to deploy to prod host"
             )
             return "ref-autofix-1", AgentResult(
                 raw_text=raw,
                 suggested_reply="Fixed locally; awaiting go to deploy.",
-                needs_attention="Reply go to deploy to field IPC",
+                needs_attention="Reply go to deploy to prod host",
                 triage_mode=TriageMode.mode_4_bug,
             )
 
@@ -176,7 +176,7 @@ def test_auto_fix_deploy_requires_go_and_codex_sandbox_selection() -> None:
             id="feishu_autofix",
             adapter="simulator",
             external_chat_id="chat_1",
-            name="Field Ops",
+            name="Ops Release",
             chat_type=ChatType.p2p,
             trigger_mode=TriggerMode.all,
             autonomy_mode=AutonomyMode.auto_fix,
@@ -195,7 +195,7 @@ def test_auto_fix_deploy_requires_go_and_codex_sandbox_selection() -> None:
             sender_id="u_1",
             sender_name="Operator",
             create_time="10:00:00",
-            clean_text="Bay 2 fault after reboot",
+            clean_text="Worker 2 fault after reboot",
         )
         created = asyncio.run(engine.ingest_messages(ch.id, [msg]))
         assert len(created) == 1

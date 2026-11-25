@@ -41,7 +41,7 @@ def test_codex_jsonl_parsing_and_readonly_sandbox_flag() -> None:
                                 "item": {
                                     "id": "item_1",
                                     "type": "agent_message",
-                                    "text": "总结：\n日志定位到握手超时。\n\n建议回复：\n我刚核查过日志，先按新参数测一下。\n\n需要注意：\n无",
+                                    "text": "总结：\n日志定位到连接池超时。\n\n建议回复：\n我刚核查过日志，先按新参数测一下。\n\n需要注意：\n无",
                                 },
                             }
                         ),
@@ -75,7 +75,7 @@ def test_codex_jsonl_parsing_and_readonly_sandbox_flag() -> None:
             assert "--sandbox" in captured_cmds[0]
             idx = captured_cmds[0].index("--sandbox")
             assert captured_cmds[0][idx + 1] == "read-only"
-            assert "日志定位到握手超时" in res.summary_bubbles[0]
+            assert "日志定位到连接池超时" in res.summary_bubbles[0]
             assert "我刚核查过日志" in res.suggested_reply
             assert res.needs_attention == ""
 
@@ -98,7 +98,7 @@ def test_codex_jsonl_parsing_and_readonly_sandbox_flag() -> None:
 def test_local_sandbox_adapter_and_console_notifier() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        img_src = root / "bay2_photo.png"
+        img_src = root / "worker2_photo.png"
         img_src.write_bytes(b"FAKEPNGDATA")
 
         adapter = LocalSandboxAdapter(root / "sb")
@@ -142,7 +142,7 @@ def test_local_sandbox_adapter_and_console_notifier() -> None:
 def test_interactive_sandbox_session_end_to_end() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        img_path = root / "hmi_timeout.png"
+        img_path = root / "trace_timeout.png"
         img_path.write_bytes(b"IMG_BYTES")
         out = io.StringIO()
 
@@ -156,12 +156,12 @@ def test_interactive_sandbox_session_end_to_end() -> None:
             # 2. Switch to @me group, drop Sam's screenshot without @owner -> stored, not triggered
             assert await session.handle_line("/mode group") is True
             assert await session.handle_line("/as Sam") is True
-            assert await session.handle_line(f"/img {img_path} Bay 2 handshake timed out after 690s @Alex") is True
+            assert await session.handle_line(f"/img {img_path} Worker 2 pool timed out with 503 @Alex") is True
             assert "not triggered" in out.getvalue()
 
             # 3. Alex escalates with /at -> downloads Sam's image, diagnoses bug, prints awaiting_go bubbles
             assert await session.handle_line("/as Alex") is True
-            assert await session.handle_line("/at 昨晚 Bay 2 报错超时麻烦看一下") is True
+            assert await session.handle_line("/at 昨晚 Worker 2 报错超时麻烦看一下") is True
             threads = session.store.list_threads()
             assert len(threads) == 1
             th = threads[0]
@@ -230,11 +230,11 @@ def test_sandbox_ui_routes_ime_guidance_filter_and_phone_loop() -> None:
             json={
                 "mode": "group",
                 "sender_name": "Sam",
-                "text": "昨晚 Bay 2 报错超时麻烦看一下",
+                "text": "昨晚 Worker 2 报错超时麻烦看一下",
                 "mentions_owner": True,
                 "immediate": True,
                 "image_data_url": f"data:image/png;base64,{tiny_png}",
-                "image_name": "bay2.png",
+                "image_name": "worker2.png",
             },
         )
         assert real.status_code == 200

@@ -127,7 +127,7 @@ Read the incoming message(s), voice transcripts, and attached images first, then
 ## Channel Autonomy Gate (`auto_fix`)
 1. Enter engineering mode ONLY if Mode 4 applies. Inspect attached media first.{group_note}
 2. **Local code & verification allowed:** Diagnose the bug, edit code locally, and run builds/tests end-to-end. Skip coding/builds for Modes 1–3.
-3. **WAIT FOR `"go"` BEFORE DEPLOY:** Do **NOT** deploy to production/field hosts, restart live services, or alter live runtime configs without explicit owner approval (`"go"`). When a local fix is ready to deploy, state the exact deploy action needed in `Needs Attention` / `需要注意`.
+3. **WAIT FOR `"go"` BEFORE DEPLOY:** Do **NOT** deploy to production hosts, restart live services, or alter live runtime configs without explicit owner approval (`"go"`). When a local fix is ready to deploy, state the exact deploy action needed in `Needs Attention` / `需要注意`.
 4. **STRICTLY FORBIDDEN (Draft-Only):** Never send, reply to, or react to any external chat message yourself."""
 
 
@@ -135,7 +135,7 @@ def _output_format_block(language: str, addressee: str, *, is_group: bool) -> st
     target = f"{addressee} in this group" if is_group else addressee
     if language.lower().startswith("zh"):
         return f"""## Required Final Response Format (全中文 · 手机短气泡风格)
-EXPLICIT LANGUAGE REQUEST (OVERRIDES DEFAULT ENGLISH): 本会话是手机端中文聊天，请严格全程使用自然简体中文回复，绝不输出英文段落（仅保留必需的专业缩写或编号，如 PLC、CAN、设备/车号）。
+EXPLICIT LANGUAGE REQUEST (OVERRIDES DEFAULT ENGLISH): 本会话是手机端中文聊天，请严格全程使用自然简体中文回复，绝不输出英文段落（仅保留必需的专业缩写或编号，如 API、SQL、服务/模块名）。
 End with these exact plain-text headings (NO Markdown, no `**`/`*`/`` ` ``/`#`, no raw commit SHAs or PIDs):
 - `总结：` 拆成 1–3 个极短段落（用空行隔开），每段 1–2 句短话（约 30–65 字）。
 

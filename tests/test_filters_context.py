@@ -22,7 +22,7 @@ def test_trigger_and_small_talk_filters() -> None:
         id="g1",
         adapter="slack",
         external_chat_id="C1",
-        name="Site Alpha Group",
+        name="Backend Ops Group",
         chat_type=ChatType.group,
         trigger_mode=TriggerMode.mention_owner,
     )
@@ -71,7 +71,7 @@ def test_overnight_handoff_two_bucket_and_depth_chain() -> None:
         create_ms=now_ms - 20 * 3600 * 1000,
         sender_id="u_lead",
         sender_name="Lead",
-        clean_text="Watch Bay 2 pressure overnight",
+        clean_text="Watch Worker 2 pool latency overnight",
     )
     recent = [
         NormalizedMessage(
@@ -81,7 +81,7 @@ def test_overnight_handoff_two_bucket_and_depth_chain() -> None:
             sender_id="u_sam",
             sender_name="Sam",
             msg_type="image",
-            media_refs=[MediaRef(kind="image", key="bay2_img")],
+            media_refs=[MediaRef(kind="image", key="worker2_img")],
         ),
         NormalizedMessage(
             message_id="h_txt",
@@ -89,7 +89,7 @@ def test_overnight_handoff_two_bucket_and_depth_chain() -> None:
             create_ms=now_ms - 9 * 3600 * 1000 + 20_000,
             sender_id="u_sam",
             sender_name="Sam",
-            clean_text="Bay 2 stalled @Alex",
+            clean_text="Worker 2 stalled @Alex",
             reply_to_id="r0",
             mentions=[Mention(id="u_alex", name="Alex")],
         ),

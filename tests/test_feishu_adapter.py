@@ -107,7 +107,7 @@ def test_feishu_adapter_auth_pagination_normalization_and_media() -> None:
                                 "msg_type": "text",
                                 "sender": {"id": "ou_alex", "sender_type": "user"},
                                 "mentions": [{"id": "ou_owner", "name": "Lead", "key": "@_user_1"}],
-                                "body": {"content": json.dumps({"text": "@_user_1 check bay 2"})},
+                                "body": {"content": json.dumps({"text": "@_user_1 check worker 2"})},
                             },
                         ]
                     },
@@ -166,7 +166,7 @@ def test_feishu_adapter_auth_pagination_normalization_and_media() -> None:
         msgs = await adapter.fetch_recent(ch, limit=20)
         assert [m.message_id for m in msgs] == ["om_1_text", "om_2_post", "om_3_recalled", "om_4_file"]
         assert msgs[0].mentions_owner is True
-        assert "@Lead check bay 2" in msgs[0].clean_text
+        assert "@Lead check worker 2" in msgs[0].clean_text
         assert msgs[1].reply_to_id == "om_1_text"
         assert "Fault Report" in msgs[1].clean_text
         assert msgs[1].media_refs[0].key == "img_post_1"

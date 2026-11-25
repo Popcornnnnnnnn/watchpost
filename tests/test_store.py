@@ -43,7 +43,7 @@ def test_schema_wal_and_channel_thread_lifecycle() -> None:
             chat_type=ChatType.p2p,
             trigger_mode=TriggerMode.all,
             autonomy_mode=AutonomyMode.diagnose_only,
-            persona_text="Site Alpha ops engineer",
+            persona_text="Backend ops engineer",
         )
         saved = store.upsert_channel(ch)
         assert saved.name == "Alex"

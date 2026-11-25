@@ -224,7 +224,7 @@ def test_api_auth_csrf_host_approve_409_and_webhook_isolation(tmp_path: Path) ->
             "senderStaffId": "u1",
             "senderNick": "Alice",
             "msgId": "m-dt-1",
-            "text": {"content": "Station pressure low"},
+            "text": {"content": "Queue backlog high"},
         },
     )
     assert wh_res.status_code == 200

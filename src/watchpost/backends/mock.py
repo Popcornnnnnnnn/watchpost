@@ -9,7 +9,7 @@ from watchpost.bubbles import extract_sections, split_into_bubbles
 from watchpost.models import AgentResult, AutonomyMode, ChannelConfig, TriageMode
 
 _QA_KEYWORDS = ("?", "？", "吗", "更新", "几个", "几号", "多久", "eta", "status", "ready", "rollout", "version")
-_BUG_KEYWORDS = ("bug", "error", "stuck", "timeout", "fail", "crash", "690s", "异常", "报错", "卡住", "超时", "故障")
+_BUG_KEYWORDS = ("bug", "error", "stuck", "timeout", "fail", "crash", "503", "异常", "报错", "卡住", "超时", "故障")
 
 
 def _extract_focus_text(prompt: str) -> str:
@@ -71,20 +71,20 @@ class MockAgentBackend:
             if is_zh:
                 raw = (
                     "总结：\n"
-                    "已按确认方案完成节点状态核查与参数调整。\n\n"
-                    "当前站点运行平稳，没有新的阻塞告警。\n\n"
+                    "已按确认方案完成服务配置核查与参数调整。\n\n"
+                    "当前服务运行平稳，没有新的阻塞告警。\n\n"
                     "建议回复：\n"
-                    "这边已经处理并验证好了，现场现在可以恢复正常作业，有任何异常随时叫我。\n\n"
+                    "这边已经修复并验证好了，服务现在已恢复正常，有任何异常随时叫我。\n\n"
                     "需要注意：\n"
                     "无"
                 )
             else:
                 raw = (
                     "Summary:\n"
-                    "Applied the approved fix and verified telemetry looks healthy.\n\n"
+                    "Applied the approved fix and verified service metrics look healthy.\n\n"
                     "No active blockers remain.\n\n"
                     "Suggested Reply:\n"
-                    "Fix is live and verified now. You can resume normal operations on site.\n\n"
+                    "Fix is live and verified now. The API is back to normal.\n\n"
                     "Needs Attention:\n"
                     "None"
                 )
@@ -130,21 +130,21 @@ class MockAgentBackend:
         if is_zh:
             raw = (
                 "总结：\n"
-                f"{img_note_zh}本次超时主要卡在握手信号等待阈值偏短。\n\n"
-                "建议先把现场日志确认清楚，再将等待超时从 10s 调整为 30s。\n\n"
+                f"{img_note_zh}本次超时主要卡在连接池闲置回收阈值偏短。\n\n"
+                "建议先把服务日志确认清楚，再将 idle_timeout 从 10s 调整为 30s。\n\n"
                 "建议回复：\n"
-                "收到，昨晚截图和报错我都看了，主要是设备握手等待时间太短触发了保护。\n"
-                "我先准备了调整方案，等现场空闲窗口确认后就能更新。\n\n"
+                "收到，昨晚截图和报错我都看了，主要是连接池闲置超时太短触发了 503。\n"
+                "我先准备了调整方案，确认发布窗口后就能更新。\n\n"
                 "需要注意：\n"
                 f"{attention_zh}"
             )
         else:
             raw = (
                 "Summary:\n"
-                f"{img_note_en}the cycle stall comes from a 10s handshake timeout firing early.\n\n"
-                "Raising the timeout to 30s resolves it without masking hardware faults.\n\n"
+                f"{img_note_en}the 503 timeout comes from a 10s connection-pool idle timeout firing early.\n\n"
+                "Raising idle_timeout to 30s resolves it without masking real upstream failures.\n\n"
                 "Suggested Reply:\n"
-                "Got it — checked the overnight screenshot and logs. A 10s handshake timeout tripped early; I have a 30s fix ready once the bay is idle.\n\n"
+                "Got it — checked the overnight screenshot and logs. A 10s pool timeout tripped early; I have a 30s fix ready once you confirm deploy.\n\n"
                 "Needs Attention:\n"
                 f"{attention_en}"
             )

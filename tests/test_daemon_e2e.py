@@ -33,7 +33,7 @@ def test_daemon_feishu_to_telegram_to_owner_go_end_to_end() -> None:
                     "msg_type": "text",
                     "sender": {"id": "ou_sam", "sender_type": "user"},
                     "mentions": [{"id": "ou_alex", "name": "Alex", "key": "@_user_1"}],
-                    "body": {"content": json.dumps({"text": "@_user_1 bay 2 stuck overnight"})},
+                    "body": {"content": json.dumps({"text": "@_user_1 worker 2 stuck overnight"})},
                 },
                 {
                     "message_id": "fm_seed_img",
@@ -52,7 +52,7 @@ def test_daemon_feishu_to_telegram_to_owner_go_end_to_end() -> None:
                         "msg_type": "text",
                         "sender": {"id": "ou_alex", "sender_type": "user"},
                         "mentions": [{"id": "ou_lead", "name": "Lead", "key": "@_user_1"}],
-                        "body": {"content": json.dumps({"text": "@_user_1 昨晚 bay 2 报错超时麻烦看一下"})},
+                        "body": {"content": json.dumps({"text": "@_user_1 昨晚 worker 2 报错超时麻烦看一下"})},
                     },
                     *items,
                 ]
@@ -258,7 +258,7 @@ def test_daemon_telegram_top_level_personal_direct_typing_and_button_skip() -> N
                 channel_id="ch_ops",
                 backend="mock",
                 backend_thread_ref="r_skip",
-                title="Bay 3",
+                title="Worker 3",
                 status=ThreadStatus.awaiting_go,
                 pending_go=True,
             )

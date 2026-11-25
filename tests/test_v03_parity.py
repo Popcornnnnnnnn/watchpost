@@ -723,10 +723,10 @@ def test_imessage_photo_forwarding_quotes_and_echo_suppression(tmp_path: Path, m
     # 2. Completion bubble header avoids `Name:` confusion & strips redundant colon tag only
     b1, _ = format_completion_bubbles(
         "飞书 · Peer X",
-        "总结：\nPeer X: 现场换电正常进行中。\n\n需要注意：\n无",
+        "总结：\nPeer X: 接口服务正常进行中。\n\n需要注意：\n无",
         language="zh",
     )
-    assert b1[0] == "【飞书 · Peer X】\n现场换电正常进行中。"
+    assert b1[0] == "【飞书 · Peer X】\n接口服务正常进行中。"
     b2, _ = format_completion_bubbles(
         "飞书 · Peer X",
         "总结：\nPeer X说先观察一下。\n\n需要注意：\n无",
@@ -846,14 +846,14 @@ def test_imessage_photo_forwarding_quotes_and_echo_suppression(tmp_path: Path, m
                     sender_id="ou_peer",
                     sender_name="Peer X",
                     msg_type="text",
-                    clean_text="这个告警影响吗，现场正常在换电",
+                    clean_text="这个告警影响吗，线上服务正常在跑",
                 ),
             ],
         )
         assert len(created) == 1
-        assert created[0].title == "这个告警影响吗，现场正常在换电"
+        assert created[0].title == "这个告警影响吗，线上服务正常在跑"
         assert any(t == "【飞书 · Peer X】发来新消息，正在查看" for t in sent_texts)
-        assert any(t == '"这个告警影响吗，现场正常在换电"' for t in sent_texts)
+        assert any(t == '"这个告警影响吗，线上服务正常在跑"' for t in sent_texts)
         assert any(t.startswith("【飞书 · Peer X】\n") for t in sent_texts)
         assert len(sent_files) == 1 and "watchpost_outbox/wp_out_" in sent_files[0]
 
@@ -1253,7 +1253,7 @@ def test_quiet_hours_briefing_urgent_and_mute_commands(tmp_path: Path, monkeypat
             id="ch_ops",
             adapter="feishu",
             external_chat_id="oc_ops",
-            name="Field Support",
+            name="Backend Support",
             chat_type=ChatType.p2p,
             trigger_mode=TriggerMode.all,
             autonomy_mode=AutonomyMode.diagnose_only,
@@ -1312,7 +1312,7 @@ def test_quiet_hours_briefing_urgent_and_mute_commands(tmp_path: Path, monkeypat
                     create_ms=int(ts_0200 * 1000),
                     sender_id="ou_1",
                     sender_name="Engineer",
-                    clean_text="URGENT 现场服务异常退出",
+                    clean_text="URGENT 线上服务异常退出",
                 )
             ],
         )
@@ -1329,7 +1329,7 @@ def test_quiet_hours_briefing_urgent_and_mute_commands(tmp_path: Path, monkeypat
         flushed = await engine.flush_quiet_digest_if_due(now_ts=ts_0805)
         assert flushed == 1
         assert engine.get_quiet_status(now_ts=ts_0805)["queued_count"] == 0
-        assert any("早安简报" in txt and "Field Support" in txt for txt in notifier.direct_replies)
+        assert any("早安简报" in txt and "Backend Support" in txt for txt in notifier.direct_replies)
         assert await engine.flush_quiet_digest_if_due(now_ts=ts_0805) == 0
 
         # 5. Daytime /mute 60m -> quiet active -> silent -> /brief flushes -> /unmute resumes

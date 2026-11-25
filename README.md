@@ -41,12 +41,6 @@ flowchart LR
 - **10 Native Integrations + Out-of-Process Plugin SDK:** Built-in support for **Feishu / Lark**, **Slack**, **Discord**, **Telegram** (outbound + shared-hub inbound), **DingTalk**, **WeCom (企业微信)**, **macOS iMessage**, **ntfy**, **Bark**, and **Pushover**, plus a clean-room WhatsApp stdio SDK template ([`examples/whatsapp_plugin_template.py`](https://github.com/Popcornnnnnnnn/watchpost/blob/main/examples/whatsapp_plugin_template.py)).
 - **Background Service & Reliability Controls:** Single-instance `watchpost.lock`, token-scoped Telegram polling with `409`/`429` backoff, secret redaction across logs/HTTP errors, periodic media pruning, and `watchpost service install|status|uninstall` (`launchd` / `systemd --user`).
 
-## Interactive Sandbox Preview
-
-Run `watchpost sandbox-ui --backend mock` to test colleague chats, read-only diagnosis, 1-tap drafts, and `go` approvals locally.
-
-![Watchpost 2-column sandbox simulator](docs/assets/sandbox-demo.png)
-
 ## Quickstart (5-Minute Onboarding)
 
 Requires Python `3.11+`:

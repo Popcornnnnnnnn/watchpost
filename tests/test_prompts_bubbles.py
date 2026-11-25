@@ -14,9 +14,9 @@ def test_markdown_strip_and_bilingual_bubble_splitting() -> None:
     assert "- See PR (https://example.com/1)" in clean
 
     long_cn = (
-        "刚才查了2号工位日志，现在卡在机械臂握手等待这一步。"
-        "视觉传感器三个轴都显示到位了，但控制器里的就绪标志一直没置位。"
-        "刚才触发过一次重试，紧接着又超出了十秒阈值导致流程暂停。"
+        "刚才查了2号工作节点日志，现在卡在下游接口回调等待这一步。"
+        "请求参数三个字段都显示校验通过了，但回调里的就绪标志一直没置位。"
+        "刚才触发过一次重试，紧接着又超出了十秒阈值导致队列暂停。"
     )
     cn_bubbles = split_into_bubbles(long_cn, max_bubbles=4, soft_bubble_len=80)
     assert 2 <= len(cn_bubbles) <= 4
@@ -69,7 +69,7 @@ def test_prompts_enforce_autonomy_gates_and_untrusted_boundary() -> None:
         sender_id="u1",
         sender_name="Alex",
         create_time="10:00:00",
-        clean_text="Bay 2 failed again",
+        clean_text="Worker 2 failed again",
     )
     for mode, expected in (
         (AutonomyMode.assistant_only, "Channel Autonomy Gate (`assistant_only`)"),
