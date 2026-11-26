@@ -6,6 +6,8 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 [![Website](https://img.shields.io/badge/website-watchpost.popcornnn.xyz-0f172a)](https://watchpost.popcornnn.xyz)
 
+**English** · [简体中文](README.zh-CN.md)
+
 **Website:** [watchpost.popcornnn.xyz](https://watchpost.popcornnn.xyz)
 
 **Headless local background bridge for your coding agent (`Apache-2.0`).**
