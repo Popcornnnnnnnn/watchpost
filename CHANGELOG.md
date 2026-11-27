@@ -2,6 +2,12 @@
 
 All notable changes to Watchpost (`watchpost-agent`) are documented in this file.
 
+## v0.4.1 — Thread & Approval Lifecycle Hardening
+
+- **Per-Thread & Workspace Concurrency Safety:** Serialize per-thread turns (`_get_thread_lock`) and enforce writer-preferring shared/exclusive workspace turn locking (`_AsyncRWLock`) so approved writable `"go"` turns never overlap with read-only follow-ups and inbound batches never steer placeholder `pending_<id>` refs.
+- **Atomic Approval Claims & Crash Recovery:** Make `claim_pending_go` atomically transition `pending_go = 0` and `status = 'active'`, format owner-action payloads before claiming with post-claim error recovery in `handle_owner_action`, prevent placeholder refs from overwriting committed non-placeholder refs in `create_or_update_thread`, and recover orphaned `awaiting_go` rows in `recover_stale_active_threads` and `dismiss_all_pending_go`.
+- **Formal Verification & Tests:** Add TLA+/TLC thread-lifecycle verification (`formal/WatchpostThread.tla` + `.agents/skills/verify-thread-lifecycle`) and regression coverage (`tests/test_formal_state_regressions.py`).
+
 ## v0.4.0 — Launch Readiness & Security Hardening
 
 ### Security & Agent Safety
