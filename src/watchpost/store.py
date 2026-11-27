@@ -482,7 +482,13 @@ class WatchpostStore:
                     status, root_msg_id, message_ids_json, triage_mode, pending_go, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    backend_thread_ref=excluded.backend_thread_ref,
+                    backend_thread_ref = CASE
+                        WHEN substr(excluded.backend_thread_ref, 1, 8) = 'pending_'
+                         AND threads.backend_thread_ref != ''
+                         AND substr(threads.backend_thread_ref, 1, 8) != 'pending_'
+                        THEN threads.backend_thread_ref
+                        ELSE excluded.backend_thread_ref
+                    END,
                     title=excluded.title,
                     status=excluded.status,
                     message_ids_json=excluded.message_ids_json,
@@ -535,13 +541,14 @@ class WatchpostStore:
         return _row_to_thread(updated) if updated else None
 
     def claim_pending_go(self, thread_id: str) -> bool:
-        """Atomically consume pending_go=1 so concurrent/duplicate 'go' taps execute once."""
+        """Atomically consume pending_go=1 and mark status='active' so duplicate 'go' taps execute once."""
         now = time.time()
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 UPDATE threads
                 SET pending_go = 0,
+                    status = 'active',
                     updated_at = ?
                 WHERE id = ? AND pending_go = 1
                 """,
@@ -590,25 +597,25 @@ class WatchpostStore:
                 SET pending_go = 0,
                     status = CASE WHEN status = 'awaiting_go' THEN 'completed' ELSE status END,
                     updated_at = ?
-                WHERE pending_go = 1
+                WHERE pending_go = 1 OR status = 'awaiting_go'
                 """,
                 (now,),
             )
             return int(cur.rowcount or 0)
 
     def recover_stale_active_threads(self) -> int:
-        """Mark orphaned `active` threads from a prior crash/restart as `error` without altering `updated_at`."""
+        """Mark orphaned `active` (and zombie `awaiting_go` with `pending_go=0`) threads as `error` without altering `updated_at`."""
         now = time.time()
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id FROM threads WHERE status = ?",
-                (ThreadStatus.active.value,),
+                "SELECT id FROM threads WHERE status = ? OR (status = ? AND pending_go = 0)",
+                (ThreadStatus.active.value, ThreadStatus.awaiting_go.value),
             ).fetchall()
             if not rows:
                 return 0
             conn.execute(
-                "UPDATE threads SET status = ?, pending_go = 0 WHERE status = ?",
-                (ThreadStatus.error.value, ThreadStatus.active.value),
+                "UPDATE threads SET status = ?, pending_go = 0 WHERE status = ? OR (status = ? AND pending_go = 0)",
+                (ThreadStatus.error.value, ThreadStatus.active.value, ThreadStatus.awaiting_go.value),
             )
             for row in rows:
                 conn.execute(

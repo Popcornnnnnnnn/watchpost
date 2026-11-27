@@ -46,6 +46,51 @@ from watchpost.store import WatchpostStore
 logger = logging.getLogger("watchpost.engine")
 
 
+class _AsyncRWLock:
+    """Writer-preferring asyncio read/write lock for per-workspace turn serialization."""
+
+    def __init__(self) -> None:
+        self._cond = asyncio.Condition()
+        self._readers = 0
+        self._writer_active = False
+        self._waiting_writers = 0
+
+    @asynccontextmanager
+    async def read(self) -> AsyncIterator[None]:
+        async with self._cond:
+            while self._writer_active or self._waiting_writers > 0:
+                await self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @asynccontextmanager
+    async def write(self) -> AsyncIterator[None]:
+        async with self._cond:
+            self._waiting_writers += 1
+            acquired = False
+            try:
+                while self._writer_active or self._readers > 0:
+                    await self._cond.wait()
+                self._writer_active = True
+                acquired = True
+            finally:
+                self._waiting_writers -= 1
+                if not acquired and not self._writer_active and self._waiting_writers == 0:
+                    self._cond.notify_all()
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._writer_active = False
+                self._cond.notify_all()
+
+
 class WatchpostEngine:
     """Orchestrates Watchpost polling, debouncing, context assembly, agent execution, and notifications."""
 
@@ -70,7 +115,8 @@ class WatchpostEngine:
         self.media_dir = Path(media_dir) if media_dir else (self.store.db_path.parent / "media")
         self.background_owner_actions = bool(background_owner_actions)
         self._turn_semaphore = asyncio.Semaphore(max(1, int(getattr(self.config, "max_concurrent_turns", 3) or 3)))
-        self._workspace_locks: dict[str, asyncio.Lock] = {}
+        self._workspace_rw_locks: dict[str, _AsyncRWLock] = {}
+        self._thread_locks: dict[str, asyncio.Lock] = {}
         self._personal_direct_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self.debouncer: BurstDebouncer[NormalizedMessage] = BurstDebouncer(
@@ -80,18 +126,23 @@ class WatchpostEngine:
             on_error=self._on_debounced_error,
         )
 
+    def _get_thread_lock(self, thread_id: str) -> asyncio.Lock:
+        lock = self._thread_locks.get(thread_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._thread_locks[thread_id] = lock
+        return lock
+
     @asynccontextmanager
     async def _acquire_turn(self, cwd: Path, *, write_lock: bool = False) -> AsyncIterator[None]:
-        async with self._turn_semaphore:
-            if not write_lock:
-                yield
-                return
-            key = str(Path(cwd).expanduser().resolve())
-            lock = self._workspace_locks.get(key)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._workspace_locks[key] = lock
-            async with lock:
+        key = str(Path(cwd).expanduser().resolve())
+        rw_lock = self._workspace_rw_locks.get(key)
+        if rw_lock is None:
+            rw_lock = _AsyncRWLock()
+            self._workspace_rw_locks[key] = rw_lock
+        lock_cm = rw_lock.write() if write_lock else rw_lock.read()
+        async with lock_cm:
+            async with self._turn_semaphore:
                 yield
 
     async def _invoke_steer_thread(
@@ -781,180 +832,186 @@ class WatchpostEngine:
         )
         original_preview, image_paths, topic = self._summarize_batch_for_notice(batch)
         title = f"[{channel.adapter}] {display_name}: {topic}"
-        is_steer = matched_thread is not None
         thread_id = matched_thread.id if matched_thread is not None else f"th_{uuid.uuid4().hex[:12]}"
-        created_at = matched_thread.created_at if matched_thread is not None else now_ts
         extra_ids = group_ctx.reply_chain_ids if (group_ctx and matched_thread is None) else []
-        mids = list(
-            dict.fromkeys(
-                [
-                    *(matched_thread.message_ids if matched_thread is not None else []),
-                    *(m.message_id for m in batch),
-                    *extra_ids,
-                ]
-            )
-        )
-        active_record = self.store.create_or_update_thread(
-            ThreadRecord(
-                id=thread_id,
-                channel_id=channel.id,
-                backend=self.backend.name,
-                backend_thread_ref=(
-                    matched_thread.backend_thread_ref if matched_thread is not None else f"pending_{thread_id}"
-                ),
-                sender_id=(matched_thread.sender_id if matched_thread is not None else sender.sender_id),
-                sender_name=(matched_thread.sender_name if matched_thread is not None else sender.sender_name),
-                title=topic,
-                status=ThreadStatus.active,
-                root_msg_id=(matched_thread.root_msg_id if matched_thread is not None else sender.message_id),
-                message_ids=mids,
-                triage_mode=(matched_thread.triage_mode if matched_thread is not None else TriageMode.mode_1_qa),
-                pending_go=False,
-                created_at=created_at,
-                updated_at=time.time(),
-            )
-        )
-        quiet_state = self.get_quiet_status(now_ts=now_ts)
-        suppress_notify = bool(quiet_state["active"] and not self._batch_matches_urgent_keywords(batch))
-        if not suppress_notify:
-            start_tokens = await self._notify_start_all(
-                channel,
-                active_record,
-                original_preview,
-                is_steer=is_steer,
-                attachments=image_paths,
-            )
-            self._bind_tokens(thread_id, start_tokens)
-
         target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
-        try:
-            async with self._typing_indicator(enabled=not suppress_notify):
-                async with self._acquire_turn(
-                    target_cwd,
-                    write_lock=(channel.autonomy_mode == AutonomyMode.auto_fix),
-                ):
-                    if matched_thread is not None:
-                        steer_msg = build_steer_prompt(
-                            channel,
-                            recent_messages,
-                            batch,
-                            group_context=group_ctx,
-                            language=self.config.language,
-                        )
-                        result = await self._invoke_steer_thread(
-                            matched_thread.backend_thread_ref,
-                            title,
-                            steer_msg,
-                            cwd=target_cwd,
-                            channel=channel,
-                            approved_go=False,
-                        )
-                        backend_ref = matched_thread.backend_thread_ref
-                    else:
-                        cross_memory = (
-                            self.store.get_recent_cross_channel_context(
-                                exclude_channel_id=channel.id,
-                                workspace_dir=str(target_cwd),
-                                window_s=self.config.cross_channel_window_s,
-                                limit=self.config.cross_channel_max_items,
-                                now_ts=now_ts,
-                            )
-                            if self.config.cross_channel_window_s > 0 and self.config.cross_channel_max_items > 0
-                            else []
-                        )
-                        prompt = build_new_thread_prompt(
-                            channel,
-                            channel.persona_text,
-                            recent_messages,
-                            batch,
-                            group_context=group_ctx,
-                            cross_channel_memory=cross_memory,
-                            language=self.config.language,
-                        )
-                        backend_ref, result = await self.backend.start_thread(
-                            title,
-                            prompt,
-                            cwd=target_cwd,
-                            channel=channel,
-                        )
-        except Exception:
-            self.store.create_or_update_thread(
-                active_record.model_copy(
-                    update={"status": ThreadStatus.error, "pending_go": False, "updated_at": time.time()}
+
+        async with self._get_thread_lock(thread_id):
+            if matched_thread is not None:
+                latest = self.store.get_thread(thread_id)
+                if latest is not None:
+                    matched_thread = latest
+
+            cur_ref = matched_thread.backend_thread_ref if matched_thread is not None else ""
+            should_steer = matched_thread is not None and bool(cur_ref) and not cur_ref.startswith("pending_")
+            is_steer = should_steer
+            created_at = matched_thread.created_at if matched_thread is not None else now_ts
+            mids = list(
+                dict.fromkeys(
+                    [
+                        *(matched_thread.message_ids if matched_thread is not None else []),
+                        *(m.message_id for m in batch),
+                        *extra_ids,
+                    ]
                 )
             )
-            raise
-
-        completion_label = self._completion_channel_label(
-            channel,
-            sender_name=matched_thread.sender_name if matched_thread else sender.sender_name,
-        )
-        all_bubbles, draft_reply = format_completion_bubbles(
-            completion_label,
-            result.raw_text,
-            error=result.error,
-            language=self.config.language,
-        )
-        pending_go = (
-            channel.autonomy_mode in {AutonomyMode.diagnose_only, AutonomyMode.auto_fix}
-            and result.triage_mode == TriageMode.mode_4_bug
-            and bool(result.needs_attention)
-            and not result.error
-        )
-        status = (
-            ThreadStatus.error
-            if result.error
-            else ThreadStatus.awaiting_go
-            if pending_go
-            else ThreadStatus.completed
-        )
-
-        record = active_record.model_copy(
-            update={
-                "backend_thread_ref": backend_ref or thread_id,
-                "status": status,
-                "triage_mode": result.triage_mode,
-                "pending_go": pending_go,
-                "updated_at": time.time(),
-            }
-        )
-        record = self.store.create_or_update_thread(record)
-        self.store.add_thread_event(
-            ThreadEvent(
-                thread_id=record.id,
-                kind="inbound",
-                raw_text="\n".join(m.clean_text or f"[{m.msg_type}]" for m in batch),
+            active_record = self.store.create_or_update_thread(
+                ThreadRecord(
+                    id=thread_id,
+                    channel_id=channel.id,
+                    backend=self.backend.name,
+                    backend_thread_ref=(cur_ref if should_steer else f"pending_{thread_id}"),
+                    sender_id=(matched_thread.sender_id if matched_thread is not None else sender.sender_id),
+                    sender_name=(matched_thread.sender_name if matched_thread is not None else sender.sender_name),
+                    title=topic,
+                    status=ThreadStatus.active,
+                    root_msg_id=(matched_thread.root_msg_id if matched_thread is not None else sender.message_id),
+                    message_ids=mids,
+                    triage_mode=(matched_thread.triage_mode if matched_thread is not None else TriageMode.mode_1_qa),
+                    pending_go=False,
+                    created_at=created_at,
+                    updated_at=time.time(),
+                )
             )
-        )
-        self.store.add_thread_event(
-            ThreadEvent(
-                thread_id=record.id,
-                kind="error" if result.error else "agent_reply",
-                summary_bubbles=result.summary_bubbles or all_bubbles[:1],
-                suggested_reply=draft_reply or result.suggested_reply,
-                needs_attention=result.needs_attention,
-                raw_text=result.raw_text,
-            )
-        )
+            quiet_state = self.get_quiet_status(now_ts=now_ts)
+            suppress_notify = bool(quiet_state["active"] and not self._batch_matches_urgent_keywords(batch))
+            if not suppress_notify:
+                start_tokens = await self._notify_start_all(
+                    channel,
+                    active_record,
+                    original_preview,
+                    is_steer=is_steer,
+                    attachments=image_paths,
+                )
+                self._bind_tokens(thread_id, start_tokens)
 
-        if suppress_notify:
-            quiet_summary = (
-                " ".join(result.summary_bubbles[:2]).strip()
-                or strip_markdown(result.raw_text)
-                or result.error
-            )
-            self._queue_quiet_digest_item(
+            try:
+                async with self._typing_indicator(enabled=not suppress_notify):
+                    async with self._acquire_turn(
+                        target_cwd,
+                        write_lock=(channel.autonomy_mode == AutonomyMode.auto_fix),
+                    ):
+                        if should_steer:
+                            steer_msg = build_steer_prompt(
+                                channel,
+                                recent_messages,
+                                batch,
+                                group_context=group_ctx,
+                                language=self.config.language,
+                            )
+                            result = await self._invoke_steer_thread(
+                                cur_ref,
+                                title,
+                                steer_msg,
+                                cwd=target_cwd,
+                                channel=channel,
+                                approved_go=False,
+                            )
+                            backend_ref = cur_ref
+                        else:
+                            cross_memory = (
+                                self.store.get_recent_cross_channel_context(
+                                    exclude_channel_id=channel.id,
+                                    workspace_dir=str(target_cwd),
+                                    window_s=self.config.cross_channel_window_s,
+                                    limit=self.config.cross_channel_max_items,
+                                    now_ts=now_ts,
+                                )
+                                if self.config.cross_channel_window_s > 0 and self.config.cross_channel_max_items > 0
+                                else []
+                            )
+                            prompt = build_new_thread_prompt(
+                                channel,
+                                channel.persona_text,
+                                recent_messages,
+                                batch,
+                                group_context=group_ctx,
+                                cross_channel_memory=cross_memory,
+                                language=self.config.language,
+                            )
+                            backend_ref, result = await self.backend.start_thread(
+                                title,
+                                prompt,
+                                cwd=target_cwd,
+                                channel=channel,
+                            )
+            except BaseException:
+                self.store.create_or_update_thread(
+                    active_record.model_copy(
+                        update={"status": ThreadStatus.error, "pending_go": False, "updated_at": time.time()}
+                    )
+                )
+                raise
+
+            completion_label = self._completion_channel_label(
                 channel,
-                record,
-                quiet_summary,
-                draft_reply or result.suggested_reply,
-                now_ts=now_ts,
+                sender_name=matched_thread.sender_name if matched_thread else sender.sender_name,
             )
-        else:
-            await self._notify_completion_all(channel, record, all_bubbles)
+            all_bubbles, draft_reply = format_completion_bubbles(
+                completion_label,
+                result.raw_text,
+                error=result.error,
+                language=self.config.language,
+            )
+            pending_go = (
+                channel.autonomy_mode in {AutonomyMode.diagnose_only, AutonomyMode.auto_fix}
+                and result.triage_mode == TriageMode.mode_4_bug
+                and bool(result.needs_attention)
+                and not result.error
+            )
+            status = (
+                ThreadStatus.error
+                if result.error
+                else ThreadStatus.awaiting_go
+                if pending_go
+                else ThreadStatus.completed
+            )
 
-        del is_steer
-        return record
+            record = active_record.model_copy(
+                update={
+                    "backend_thread_ref": backend_ref or f"pending_{thread_id}",
+                    "status": status,
+                    "triage_mode": result.triage_mode,
+                    "pending_go": pending_go,
+                    "updated_at": time.time(),
+                }
+            )
+            record = self.store.create_or_update_thread(record)
+            self.store.add_thread_event(
+                ThreadEvent(
+                    thread_id=record.id,
+                    kind="inbound",
+                    raw_text="\n".join(m.clean_text or f"[{m.msg_type}]" for m in batch),
+                )
+            )
+            self.store.add_thread_event(
+                ThreadEvent(
+                    thread_id=record.id,
+                    kind="error" if result.error else "agent_reply",
+                    summary_bubbles=result.summary_bubbles or all_bubbles[:1],
+                    suggested_reply=draft_reply or result.suggested_reply,
+                    needs_attention=result.needs_attention,
+                    raw_text=result.raw_text,
+                )
+            )
+
+            if suppress_notify:
+                quiet_summary = (
+                    " ".join(result.summary_bubbles[:2]).strip()
+                    or strip_markdown(result.raw_text)
+                    or result.error
+                )
+                self._queue_quiet_digest_item(
+                    channel,
+                    record,
+                    quiet_summary,
+                    draft_reply or result.suggested_reply,
+                    now_ts=now_ts,
+                )
+            else:
+                await self._notify_completion_all(channel, record, all_bubbles)
+
+            return record
 
     async def steer_from_owner(
         self,
@@ -967,103 +1024,133 @@ class WatchpostEngine:
         thread = self.store.get_thread(thread_id)
         if thread is None:
             raise KeyError(f"Unknown thread: {thread_id}")
-        if approved_go:
-            if not _go_already_claimed and not self.store.claim_pending_go(thread_id):
+        marked_active = bool(approved_go and _go_already_claimed)
+        if approved_go and not _go_already_claimed:
+            if not self.store.claim_pending_go(thread_id):
                 raise ValueError("Thread has no pending go approval")
-            thread = thread.model_copy(update={"pending_go": False})
-        channel = self.store.get_channel(thread.channel_id)
-        if channel is None:
-            raise KeyError(f"Unknown channel: {thread.channel_id}")
-
-        self.store.add_thread_event(
-            ThreadEvent(
-                thread_id=thread.id,
-                kind="owner_approve" if approved_go else "owner_steer",
-                raw_text=owner_message,
-            )
-        )
-        is_personal = channel.adapter == "owner_direct" or channel.id == "personal_direct"
-        target_cwd = Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
-        if is_personal:
-            default_notifier = self.notifiers[0].name if self.notifiers else "imessage"
-            steer_prompt = build_personal_direct_prompt(
-                owner_message,
-                notifier=thread.sender_id or default_notifier,
-                workspace_dir=target_cwd,
-                is_steer=True,
-                language=self.config.language,
-            )
-            steer_title = f"[direct] {channel.name}: {thread.title}"
-        else:
-            steer_prompt = build_owner_steer_prompt(
-                owner_message,
-                approved_go=approved_go,
-                language=self.config.language,
-            )
-            steer_title = f"[{channel.adapter}] {channel.name}: {thread.title}"
-        active_thread = (
-            self.store.set_thread_status(
-                thread.id,
-                status=ThreadStatus.active,
-                clear_pending_go=False,
-            )
-            or thread
-        )
-        write_lock = bool(is_personal or approved_go or channel.autonomy_mode == AutonomyMode.auto_fix)
+            marked_active = True
+            thread = thread.model_copy(update={"pending_go": False, "status": ThreadStatus.active})
         try:
-            async with self._typing_indicator():
-                async with self._acquire_turn(target_cwd, write_lock=write_lock):
-                    result = await self._invoke_steer_thread(
-                        active_thread.backend_thread_ref,
-                        steer_title,
-                        steer_prompt,
-                        cwd=target_cwd,
-                        channel=channel,
-                        approved_go=approved_go,
+            channel = self.store.get_channel(thread.channel_id)
+            if channel is None:
+                raise KeyError(f"Unknown channel: {thread.channel_id}")
+
+            async with self._get_thread_lock(thread_id):
+                latest = self.store.get_thread(thread_id)
+                if latest is not None:
+                    thread = latest
+                self.store.add_thread_event(
+                    ThreadEvent(
+                        thread_id=thread.id,
+                        kind="owner_approve" if approved_go else "owner_steer",
+                        raw_text=owner_message,
                     )
+                )
+                is_personal = channel.adapter == "owner_direct" or channel.id == "personal_direct"
+                target_cwd = (
+                    Path(channel.workspace_dir).expanduser() if channel.workspace_dir else self.config.workspace_dir
+                )
+                if is_personal:
+                    default_notifier = self.notifiers[0].name if self.notifiers else "imessage"
+                    steer_prompt = build_personal_direct_prompt(
+                        owner_message,
+                        notifier=thread.sender_id or default_notifier,
+                        workspace_dir=target_cwd,
+                        is_steer=True,
+                        language=self.config.language,
+                    )
+                    steer_title = f"[direct] {channel.name}: {thread.title}"
+                else:
+                    steer_prompt = build_owner_steer_prompt(
+                        owner_message,
+                        approved_go=approved_go,
+                        language=self.config.language,
+                    )
+                    steer_title = f"[{channel.adapter}] {channel.name}: {thread.title}"
+                active_thread = (
+                    self.store.set_thread_status(
+                        thread.id,
+                        status=ThreadStatus.active,
+                        clear_pending_go=False,
+                    )
+                    or thread
+                )
+                marked_active = True
+                write_lock = bool(is_personal or approved_go or channel.autonomy_mode == AutonomyMode.auto_fix)
+                cur_ref = active_thread.backend_thread_ref
+                has_real_ref = bool(cur_ref) and not cur_ref.startswith("pending_")
+                async with self._typing_indicator():
+                    async with self._acquire_turn(target_cwd, write_lock=write_lock):
+                        if has_real_ref:
+                            result = await self._invoke_steer_thread(
+                                cur_ref,
+                                steer_title,
+                                steer_prompt,
+                                cwd=target_cwd,
+                                channel=channel,
+                                approved_go=approved_go,
+                            )
+                            new_backend_ref = cur_ref
+                        else:
+                            new_backend_ref, result = await self.backend.start_thread(
+                                steer_title,
+                                steer_prompt,
+                                cwd=target_cwd,
+                                channel=channel,
+                            )
+
+                if not has_real_ref and new_backend_ref:
+                    self.store.create_or_update_thread(
+                        active_thread.model_copy(
+                            update={"backend_thread_ref": new_backend_ref, "updated_at": time.time()}
+                        )
+                    )
+
+                all_bubbles, draft_reply = format_completion_bubbles(
+                    self._completion_channel_label(channel, sender_name=thread.sender_name),
+                    result.raw_text,
+                    error=result.error,
+                    language=self.config.language,
+                    include_header=not is_personal,
+                )
+                next_status = ThreadStatus.error if result.error else ThreadStatus.completed
+                updated = (
+                    self.store.set_thread_status(
+                        thread.id,
+                        status=next_status,
+                        clear_pending_go=False,
+                    )
+                    or thread.model_copy(
+                        update={
+                            "backend_thread_ref": new_backend_ref or cur_ref,
+                            "status": next_status,
+                            "pending_go": False if approved_go else thread.pending_go,
+                            "updated_at": time.time(),
+                        }
+                    )
+                )
+                self.store.add_thread_event(
+                    ThreadEvent(
+                        thread_id=thread.id,
+                        kind="error" if result.error else "agent_reply",
+                        summary_bubbles=result.summary_bubbles or all_bubbles[:1],
+                        suggested_reply=draft_reply or result.suggested_reply,
+                        needs_attention=result.needs_attention,
+                        raw_text=result.raw_text,
+                    )
+                )
+                if is_personal:
+                    self.store.set_kv("personal_direct_active_thread_id", updated.id)
+                await self._notify_completion_all(channel, updated, all_bubbles)
+                return updated
         except BaseException:
-            self.store.set_thread_status(
-                thread.id,
-                status=ThreadStatus.error,
-                clear_pending_go=False,
-            )
+            if marked_active:
+                self.store.set_thread_status(
+                    thread.id,
+                    status=ThreadStatus.error,
+                    clear_pending_go=False,
+                )
             raise
-        all_bubbles, draft_reply = format_completion_bubbles(
-            self._completion_channel_label(channel, sender_name=thread.sender_name),
-            result.raw_text,
-            error=result.error,
-            language=self.config.language,
-            include_header=not is_personal,
-        )
-        next_status = ThreadStatus.error if result.error else ThreadStatus.completed
-        updated = (
-            self.store.set_thread_status(
-                thread.id,
-                status=next_status,
-                clear_pending_go=False,
-            )
-            or thread.model_copy(
-                update={
-                    "status": next_status,
-                    "pending_go": False if approved_go else thread.pending_go,
-                    "updated_at": time.time(),
-                }
-            )
-        )
-        self.store.add_thread_event(
-            ThreadEvent(
-                thread_id=thread.id,
-                kind="error" if result.error else "agent_reply",
-                summary_bubbles=result.summary_bubbles or all_bubbles[:1],
-                suggested_reply=draft_reply or result.suggested_reply,
-                needs_attention=result.needs_attention,
-                raw_text=result.raw_text,
-            )
-        )
-        if is_personal:
-            self.store.set_kv("personal_direct_active_thread_id", updated.id)
-        await self._notify_completion_all(channel, updated, all_bubbles)
-        return updated
 
     def dismiss_go(self, thread_id: str) -> ThreadRecord:
         updated = self.store.dismiss_thread_go(thread_id)
@@ -1188,17 +1275,18 @@ class WatchpostEngine:
                 )
             )
             try:
-                async with self._typing_indicator():
-                    async with self._acquire_turn(target_cwd, write_lock=True):
-                        result = await self._invoke_steer_thread(
-                            active_thread.backend_thread_ref,
-                            f"[direct] {ch.name}: {active_thread.title}",
-                            prompt,
-                            cwd=target_cwd,
-                            channel=ch,
-                            approved_go=True,
-                        )
-            except Exception:
+                async with self._get_thread_lock(active_thread.id):
+                    async with self._typing_indicator():
+                        async with self._acquire_turn(target_cwd, write_lock=True):
+                            result = await self._invoke_steer_thread(
+                                active_thread.backend_thread_ref,
+                                f"[direct] {ch.name}: {active_thread.title}",
+                                prompt,
+                                cwd=target_cwd,
+                                channel=ch,
+                                approved_go=True,
+                            )
+            except BaseException:
                 self.store.create_or_update_thread(
                     active_thread.model_copy(update={"status": ThreadStatus.error, "updated_at": time.time()})
                 )
@@ -1581,11 +1669,7 @@ class WatchpostEngine:
 
         target_thread = self.store.get_thread(target_id)
         approved_go = action.kind == "approve_go"
-        if approved_go and (
-            target_thread is None
-            or not target_thread.pending_go
-            or not self.store.claim_pending_go(target_id)
-        ):
+        if approved_go and (target_thread is None or not target_thread.pending_go):
             await self._send_owner_reply(
                 action.notifier,
                 "该会话当前没有待确认执行（go）的变更。" if is_zh else "That thread has no pending go approval.",
@@ -1594,24 +1678,48 @@ class WatchpostEngine:
 
         target_ch = self.store.get_channel(target_thread.channel_id) if target_thread else None
         steer_text = (await self._format_owner_action_message(action, channel=target_ch)) or ("go" if approved_go else "")
-        if self.background_owner_actions:
-            self._spawn_background(
-                self.steer_from_owner(
+
+        if approved_go and not self.store.claim_pending_go(target_id):
+            await self._send_owner_reply(
+                action.notifier,
+                "该会话当前没有待确认执行（go）的变更。" if is_zh else "That thread has no pending go approval.",
+            )
+            return None
+
+        async def _run_steer() -> ThreadRecord:
+            try:
+                return await self.steer_from_owner(
                     target_id,
                     steer_text,
                     approved_go=approved_go,
                     _go_already_claimed=approved_go,
-                ),
-                notifier_name=action.notifier,
-                label=target_thread.title if target_thread else target_id,
-            )
-            return target_thread
-        return await self.steer_from_owner(
-            target_id,
-            steer_text,
-            approved_go=approved_go,
-            _go_already_claimed=approved_go,
-        )
+                )
+            except BaseException:
+                if approved_go:
+                    self.store.set_thread_status(
+                        target_id,
+                        status=ThreadStatus.error,
+                        clear_pending_go=False,
+                    )
+                raise
+
+        if self.background_owner_actions:
+            try:
+                self._spawn_background(
+                    _run_steer(),
+                    notifier_name=action.notifier,
+                    label=target_thread.title if target_thread else target_id,
+                )
+            except BaseException:
+                if approved_go:
+                    self.store.set_thread_status(
+                        target_id,
+                        status=ThreadStatus.error,
+                        clear_pending_go=False,
+                    )
+                raise
+            return self.store.get_thread(target_id) or target_thread
+        return await _run_steer()
 
     async def poll_all_channels(self, *, seed_if_empty: bool = False, debounced: bool = True) -> int:
         """Poll every enabled channel whose adapter is registered; return channels polled cleanly."""

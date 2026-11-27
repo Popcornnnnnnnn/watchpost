@@ -1021,13 +1021,21 @@ def test_pr2_interleaved_steer_cannot_restore_go_and_orphan_descendant_killed(tm
         t_steer = asyncio.create_task(eng.steer_from_owner(th.id, "check extra info", approved_go=False))
         await be.steer_entered.wait()
 
-        # Approve while ordinary steer is waiting in backend
-        await eng.steer_from_owner(th.id, "go", approved_go=True)
+        # Approve while ordinary steer is waiting in backend:
+        # claim_pending_go clears pending_go immediately while thread/workspace
+        # serialization holds the writable turn until t_steer finishes.
+        t_go = asyncio.create_task(eng.steer_from_owner(th.id, "go", approved_go=True))
+        await asyncio.sleep(0.02)
         assert store.get_thread(th.id).pending_go is False
+        assert be.go_count == 0
 
         # Finish ordinary steer — must NOT write pending_go=True back
         be.release_steer.set()
         await t_steer
+        assert store.get_thread(th.id).pending_go is False
+
+        # Now the queued approved_go turn runs cleanly once
+        await t_go
         assert store.get_thread(th.id).pending_go is False
 
         with pytest.raises(ValueError, match="no pending go"):
