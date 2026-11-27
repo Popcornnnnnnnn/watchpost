@@ -10,37 +10,49 @@ export const colors = {
 };
 
 const classify = (v) => {
-  const phBug = v.inb2 === "running_steer_ph" || (v.inb1 === "done" && v.backendRef === "placeholder");
+  const phBug = v.inb2 === "running_steer_ph" || (v.hadRealRef && v.backendRef === "placeholder");
   const rwBug =
     v.ownerGo === "running_write" &&
-    (v.ownerSteer === "running_ro" || v.inb2 === "running_steer_ph" || v.inb2 === "running_steer_real");
-  const zombieBug = v.status === "awaiting_go" && !v.pendingGo && v.ownerGo !== "claimed_gap";
-  return { phBug, rwBug, zombieBug };
+    (v.ownerSteer === "running_ro" ||
+      v.inb2 === "running_steer_ph" ||
+      v.inb2 === "running_steer_real" ||
+      v.inb2 === "running_start_fresh");
+  const zombieBug = v.status === "awaiting_go" && !v.pendingGo;
+  const dupGoBug = v.goExecCount > 1;
+  return { phBug, rwBug, zombieBug, dupGoBug };
 };
 
 export const state = (v) => {
-  const { phBug, rwBug, zombieBug } = classify(v);
+  const { phBug, rwBug, zombieBug, dupGoBug } = classify(v);
 
-  if (phBug && rwBug) return "Placeholder steer + read/write race";
+  if (phBug && rwBug) return "Placeholder steer plus read/write race";
   if (phBug) return "Placeholder ref steered or saved";
-  if (rwBug) return "Writable go + read-only turn running together";
+  if (rwBug) return "Writable go plus read-only turn running together";
   if (zombieBug) return "Zombie awaiting_go (pending_go cleared)";
+  if (dupGoBug) return "Duplicate go execution";
 
   if (v.status === "none") return "No thread yet";
   if (v.inb1 === "running_start") return "Initial triage running";
-  if (v.ownerGo === "claimed_gap") return "Go claimed, preparing turn";
+  if (v.ownerGo === "claimed_gap") {
+    if (v.ownerSteer === "running_ro") return "Follow-up turn running (go queued)";
+    if (v.inb2 === "running_steer_real" || v.inb2 === "running_start_fresh") {
+      return "Inbound follow-up running (go queued)";
+    }
+    return "Go claimed, preparing turn";
+  }
   if (v.ownerGo === "running_write") return "Approved fix running";
+  if (v.inb2 === "running_start_fresh") return "Follow-up starting fresh thread";
   if (v.ownerSteer === "running_ro" || v.inb2 === "running_steer_real") {
     return v.pendingGo ? "Follow-up turn (go still pending)" : "Follow-up turn running";
   }
   if (v.status === "awaiting_go") return "Awaiting go approval";
-  if (v.status === "error") return "Error after restart";
+  if (v.status === "error") return "Error after failure or restart";
   return "Completed";
 };
 
 export const group = (v) => {
-  const { phBug, rwBug, zombieBug } = classify(v);
-  if (phBug || rwBug || zombieBug) return "broken";
+  const { phBug, rwBug, zombieBug, dupGoBug } = classify(v);
+  if (phBug || rwBug || zombieBug || dupGoBug) return "broken";
   if (v.status === "none") return "setup";
   if (v.inb1 === "running_start") return "triage";
   if (v.status === "awaiting_go" || v.ownerGo === "claimed_gap") return "approval";
@@ -52,11 +64,8 @@ export const step = (action, from, to) => {
   const fromS = state(from);
   const toS = state(to);
   if (action === "Done") return null;
-  if (action === "DaemonRestart" && toS === "Error after restart" && fromS !== "Approved fix running") {
-    return null;
-  }
   if (action === "DaemonRestart" && toS === "Completed") return null;
-  if (fromS === "Placeholder steer + read/write race" && toS === "Error after restart") return null;
+  if (fromS === "Placeholder steer plus read/write race" && toS === "Error after failure or restart") return null;
 
   switch (action) {
     case "Batch1Start":
@@ -75,8 +84,8 @@ export const step = (action, from, to) => {
       return "owner taps go";
     case "OwnerGoStartWrite":
       return "fix turn starts";
-    case "OwnerGoFailInGap":
-      return "prep fails before turn";
+    case "OwnerGoFailAfterClaim":
+      return "post-claim prep fails";
     case "OwnerGoFinishWrite":
       return "fix turn finishes";
     case "OwnerDismissGo":

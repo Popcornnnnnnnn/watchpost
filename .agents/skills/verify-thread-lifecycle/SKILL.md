@@ -5,43 +5,40 @@ description: Formally verify Watchpost thread lifecycle, pending_go approval gat
 
 # Verify Watchpost Thread Lifecycle
 
-Checks the TLA+ model in `formal/WatchpostThread.tla` against the invariants governing inbound message steering, owner `go` approval gating, workspace read/write locking, and crash recovery.
+Checks the TLA+ model in `formal/WatchpostThread.tla` against the invariants governing inbound message steering, owner `go` approval gating, per-thread and workspace read/write locking, and crash recovery.
 
 ## Coverage & Sync Record
 
-- `sync_commit`: `c54ddfb`
+- `sync_commit`: `131b853`
 - **Covered files & symbols:**
-  - `src/watchpost/engine.py`: `_acquire_turn`, `_process_trigger_batch`, `steer_from_owner`, `dismiss_go`, `handle_owner_action`
+  - `src/watchpost/engine.py`: `_AsyncRWLock`, `_get_thread_lock`, `_acquire_turn`, `_process_trigger_batch`, `steer_from_owner`, `dismiss_go`, `handle_owner_action`
   - `src/watchpost/store.py`: `create_or_update_thread`, `dismiss_thread_go`, `claim_pending_go`, `set_thread_status`, `dismiss_all_pending_go`, `recover_stale_active_threads`
 - **Check for code drift since last sync:**
   ```sh
-  git diff c54ddfb..HEAD -- src/watchpost/engine.py src/watchpost/store.py
+  git diff 131b853..HEAD -- src/watchpost/engine.py src/watchpost/store.py
   ```
 
 If covered files changed after `sync_commit`, follow the installed `maintain-formal-verification-skill` before interpreting a pass. Only move `sync_commit` forward after confirming `formal/WatchpostThread.tla` accurately describes `HEAD` and passes a mutation check.
 
 ## Verified Properties (Invariants)
 
-1. **`NoPlaceholderSteer`:** A follow-up batch never invokes `steer_thread` with an initial `pending_<id>` placeholder ref, and a finished initial thread never ends up persisted with a placeholder ref.
+1. **`NoPlaceholderSteer`:** A follow-up batch never invokes `steer_thread` with an initial `pending_<id>` placeholder ref, and a committed non-placeholder ref is never overwritten back to a placeholder.
 2. **`NoConcurrentWriteAndRead`:** A writable `approved_go` turn never runs concurrently with a read-only owner steer or inbound follow-up turn on the same thread/workspace.
-3. **`NoZombieAwaitingGo`:** A thread never stays in `status = awaiting_go` once `pending_go` has been cleared outside the normal handoff into `steer_from_owner`.
+3. **`NoZombieAwaitingGo`:** A thread never stays in `status = awaiting_go` once `pending_go` has been cleared at any point, including immediately upon `claim_pending_go` (which atomically transitions `status` to `active`).
 4. **`AtMostOneApprovedGo`:** Concurrent or repeated `go` taps trigger at most one writable `approved_go` execution.
 
 ## Bounds, Assumptions & Out-of-Scope
 
-- **Bounds:** Single thread, 2 inbound channel batches (`inb1`, `inb2`), 1 owner `go` attempt (`ownerGo`, `goExecCount <= 2`) plus duplicate tap check (`SecondGoAttempt`), 1 owner follow-up steer (`ownerSteer`), and at most 1 daemon crash/restart (`restarted`).
+- **Bounds:** Single thread, 2 inbound channel batches (`inb1`, `inb2` covering placeholder steer check, real steer, and fresh start), `hadRealRef` tracking, 1 owner `go` attempt (`OwnerClaimGo`, `OwnerGoFailAfterClaim`, `OwnerGoStartWrite`, `goExecCount <= 2`) plus duplicate tap check (`SecondGoAttempt`), 1 owner follow-up steer (`ownerSteer`), and at most 1 daemon crash/restart (`restarted`).
 - **Out of scope:** Quiet-hours digest queuing (`quiet_digest_queue`), external adapter cursor/debouncer timing (`BurstDebouncer`), personal direct-chat threads (`personal_direct`), and `FallbackBackend` failover internals.
 
-## Known Baseline Findings at `c54ddfb`
+## Verified Status at `131b853`
 
-At `sync_commit` `c54ddfb`, TLC explores **170 states / 416 transitions**:
-- **Holds:** `AtMostOneApprovedGo`, `NoDeadlock`
-- **Baseline bugs (reproduced against `WatchpostEngine` + `WatchpostStore`):**
-  - `NoPlaceholderSteer` (2 steps): `_process_trigger_batch` stores `pending_<thread_id>` before `start_thread` and a concurrent follow-up batch steers with it and overwrites the real ref.
-  - `NoZombieAwaitingGo` (4 steps): `claim_pending_go` clears `pending_go` in `handle_owner_action` before `_format_owner_action_message`; an error or restart before `steer_from_owner` leaves `status = awaiting_go` with `pending_go = 0`, ignored by `recover_stale_active_threads` and `dismiss_all_pending_go`.
-  - `NoConcurrentWriteAndRead` (5 steps): `_acquire_turn` leaves `write_lock=False` on read-only turns, allowing concurrent read/write backend execution in the same workspace.
+- **Model check (`WatchpostThread`):** TLC explores **75 states / 149 steps** (12 chart states, 29 arrows). All 4 invariants (`NoPlaceholderSteer`, `NoConcurrentWriteAndRead`, `NoZombieAwaitingGo`, `AtMostOneApprovedGo`) and `NoDeadlock` **hold** (`exit 0`).
+- **Mutation proof:** Removing `ThreadLockFree` / `WorkspaceReadAllowed` from `OwnerSteerStart` fails `NoConcurrentWriteAndRead` in 5 steps (`exit 1`).
+- **History:** Baseline violations discovered at `c54ddfb` (`NoPlaceholderSteer`, `NoConcurrentWriteAndRead`, `NoZombieAwaitingGo`) were fixed in `131b853` with regression tests in `tests/test_formal_state_regressions.py` and `tests/test_v040_launch_readiness.py`.
 
-Treat new failures or regressions in `AtMostOneApprovedGo` or `NoDeadlock` as immediate blockers; confirm whether baseline bugs were fixed before updating the expected outcome.
+Treat any failure in these invariants or `NoDeadlock` as an immediate release blocker.
 
 ## How to Run
 
